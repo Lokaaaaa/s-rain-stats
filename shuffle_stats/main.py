@@ -236,6 +236,32 @@ async def get_stats():
     }
 
 
+@app.post("/api/clear")
+async def clear_database(body: dict, x_api_key: str = Header(default="")):
+    """
+    Полная очистка таблицы events.
+    Требует X-API-Key в заголовке, совпадающий с API_KEY.
+    Body: {"confirm": "DELETE_ALL"}  — защита от случайного вызова
+    """
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    if body.get("confirm") != "DELETE_ALL":
+        raise HTTPException(status_code=400, detail="Подтверждение обязательно (confirm=DELETE_ALL)")
+
+    if USE_POSTGRES:
+        execute("TRUNCATE TABLE events RESTART IDENTITY CASCADE;")
+    else:
+        # SQLite: TRUNCATE нет, используем DELETE + сброс AUTOINCREMENT
+        execute("DELETE FROM events;")
+        try:
+            execute("DELETE FROM sqlite_sequence WHERE name='events';")
+        except:
+            pass
+
+    print("[ADMIN] 🗑 База очищена")
+    return {"ok": True, "message": "Все данные удалены"}
+
+
 @app.get("/api/user/{nickname}")
 async def get_user(nickname: str):
     sent = query_one("""
@@ -472,6 +498,133 @@ async def page_user(nickname: str):
     </div>"""
     return BASE_HTML.format(title=f"Shuffle — {nickname}", active_home="",
                              active_amount="", active_wins="", active_tips="", content=content)
+
+
+ADMIN_HTML = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin — Shuffle Rain</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0e1116; color: #e6e9ef;
+         font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+         display: flex; justify-content: center; align-items: center;
+         min-height: 100vh; padding: 20px; }
+  .box { background: #161b22; border: 1px solid #26303a; border-radius: 12px;
+         padding: 32px 40px; max-width: 520px; width: 100%; }
+  h1 { margin: 0 0 8px; font-size: 22px; }
+  .sub { color: #8b949e; margin-bottom: 24px; font-size: 14px; }
+  label { display: block; color: #8b949e; font-size: 13px;
+          margin-bottom: 6px; }
+  input[type=password], input[type=text] {
+    width: 100%; background: #0d1117; border: 1px solid #30363d;
+    color: #e6e9ef; padding: 10px 12px; border-radius: 8px;
+    font-size: 14px; margin-bottom: 16px; font-family: monospace;
+  }
+  input:focus { outline: none; border-color: #7cc4ff; }
+  button { width: 100%; padding: 12px; border: none; border-radius: 8px;
+           font-size: 15px; font-weight: 600; cursor: pointer; }
+  .btn-clear { background: #dc2626; color: #fff; }
+  .btn-clear:hover { background: #b91c1c; }
+  .btn-clear:disabled { background: #4b5563; cursor: not-allowed; }
+  .result { margin-top: 16px; padding: 12px; border-radius: 8px;
+            font-size: 13px; display: none; white-space: pre-wrap; }
+  .result.ok { background: #052e16; color: #4ade80; border: 1px solid #14532d; display: block; }
+  .result.err { background: #2d0f0f; color: #f87171; border: 1px solid #7f1d1d; display: block; }
+  .warn { background: #2d2410; border: 1px solid #78350f; color: #fbbf24;
+          padding: 12px; border-radius: 8px; margin-bottom: 20px; font-size: 13px; }
+  a { color: #7cc4ff; text-decoration: none; font-size: 13px; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>⚙️ Админ-панель</h1>
+  <div class="sub">Shuffle Rain Stats — управление БД</div>
+
+  <div class="warn">
+    ⚠️ Кнопка ниже <b>удалит ВСЕ события</b> (rain + tips) из базы.
+    Действие необратимо.
+  </div>
+
+  <label for="apiKey">API-ключ</label>
+  <input id="apiKey" type="password" placeholder="X-API-Key" />
+
+  <label for="confirm">Введите <b>DELETE_ALL</b> для подтверждения</label>
+  <input id="confirm" type="text" placeholder="DELETE_ALL" autocomplete="off" />
+
+  <button id="clearBtn" class="btn-clear" onclick="clearDb()">🗑 Очистить базу данных</button>
+
+  <div id="result" class="result"></div>
+
+  <div style="margin-top:20px; text-align:center">
+    <a href="/">← На главную</a>
+  </div>
+</div>
+
+<script>
+async function clearDb() {
+  const apiKey = document.getElementById('apiKey').value.trim();
+  const confirm = document.getElementById('confirm').value.trim();
+  const result = document.getElementById('result');
+  const btn = document.getElementById('clearBtn');
+
+  result.className = 'result';
+  result.textContent = '';
+
+  if (!apiKey) {
+    result.className = 'result err';
+    result.textContent = 'Введите API-ключ';
+    return;
+  }
+  if (confirm !== 'DELETE_ALL') {
+    result.className = 'result err';
+    result.textContent = 'Для подтверждения введите DELETE_ALL (заглавными буквами)';
+    return;
+  }
+
+  if (!window.confirm('Точно удалить ВСЕ данные? Это необратимо!')) return;
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Очистка...';
+
+  try {
+    const r = await fetch('/api/clear', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': apiKey
+      },
+      body: JSON.stringify({ confirm: 'DELETE_ALL' })
+    });
+    const data = await r.json();
+    if (r.ok) {
+      result.className = 'result ok';
+      result.textContent = '✅ ' + (data.message || 'База очищена');
+    } else {
+      result.className = 'result err';
+      result.textContent = '❌ ' + (data.detail || 'Ошибка');
+    }
+  } catch (e) {
+    result.className = 'result err';
+    result.textContent = '❌ Ошибка сети: ' + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🗑 Очистить базу данных';
+  }
+}
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    return ADMIN_HTML
 
 
 if __name__ == "__main__":
