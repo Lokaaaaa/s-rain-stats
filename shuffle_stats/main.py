@@ -17,9 +17,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 USE_POSTGRES = bool(DATABASE_URL)
 API_KEY = os.environ.get("API_KEY", "CHANGE_ME_SECRET_KEY")
 
-# SCREENSHOT_DIR: пытаемся использовать env-переменную, но если путь
-# недоступен (например, /var/data без Persistent Disk) — откатываемся
-# на локальную папку рядом с main.py
+# SCREENSHOT_DIR: если путь недоступен — откатываемся на папку рядом с main.py
 _default_screenshots = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", _default_screenshots)
 try:
@@ -35,10 +33,9 @@ if USE_POSTGRES:
 
 app = FastAPI(title="Shuffle Rain & Tips Stats")
 
-# In-memory состояние (для скриншотов и статуса вкладок)
 _state_lock = threading.Lock()
-INSTANCE_STATES = {}          # iid -> dict
-SCREENSHOT_REQUESTS = {}      # iid -> {"requested_at", "done", "path"}
+INSTANCE_STATES = {}
+SCREENSHOT_REQUESTS = {}
 
 
 # ==================== БАЗА ====================
@@ -106,7 +103,6 @@ def _try(sql):
 
 
 def init_db():
-    # --- events (existing) ---
     if USE_POSTGRES:
         execute("""
             CREATE TABLE IF NOT EXISTS events (
@@ -139,7 +135,6 @@ def init_db():
                 ts REAL
             )
         """)
-    # На случай, если таблица уже была без ts — добавим
     _try("ALTER TABLE events ADD COLUMN ts DOUBLE PRECISION" if USE_POSTGRES
          else "ALTER TABLE events ADD COLUMN ts REAL")
 
@@ -148,7 +143,6 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
     execute("CREATE INDEX IF NOT EXISTS idx_events_chat ON events(chat)")
 
-    # --- bulk_alerts (NEW) ---
     if USE_POSTGRES:
         execute("""
             CREATE TABLE IF NOT EXISTS bulk_alerts (
@@ -180,7 +174,6 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_bulk_ts ON bulk_alerts(ts)")
     execute("CREATE INDEX IF NOT EXISTS idx_bulk_sender ON bulk_alerts(sender)")
 
-    # --- player_activity (NEW) ---
     if USE_POSTGRES:
         execute("""
             CREATE TABLE IF NOT EXISTS player_activity (
@@ -258,7 +251,7 @@ class StatusPayload(BaseModel):
     screenshot_requests: List[int] = []
 
 
-# ==================== API ДЛЯ СКРИПТА (post) ====================
+# ==================== API ДЛЯ СКРИПТА ====================
 @app.post("/api/event")
 async def add_event(event: EventIn, x_api_key: str = Header(default="")):
     if x_api_key != API_KEY:
@@ -430,7 +423,6 @@ async def api_chart(
     since: Optional[float] = None,
     until: Optional[float] = None,
 ):
-    # Гистограмма по часам суток
     if USE_POSTGRES:
         hour_expr = "CAST(EXTRACT(HOUR FROM to_timestamp(ts)) AS INTEGER)"
     else:
@@ -495,7 +487,6 @@ async def api_player(
     p.append(limit)
     rows = query_all(q, tuple(p))
 
-    # Гистограмма по часам
     if USE_POSTGRES:
         hour_expr = "CAST(EXTRACT(HOUR FROM to_timestamp(ts)) AS INTEGER)"
     else:
@@ -518,7 +509,7 @@ async def health():
     return {"ok": True}
 
 
-# ==================== СУЩЕСТВУЮЩИЕ API (stats, clear, user) ====================
+# ==================== СТАРЫЕ API ====================
 @app.get("/api/stats")
 async def get_stats():
     total_rains = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='rain'") or {}).get("c", 0)
@@ -639,7 +630,7 @@ async def get_user(nickname: str):
     }
 
 
-# ==================== HTML: MONITOR DASHBOARD (NEW) ====================
+# ==================== MONITOR DASHBOARD ====================
 MONITOR_HTML = r"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -939,7 +930,7 @@ async def monitor_page():
     return MONITOR_HTML
 
 
-# ==================== СУЩЕСТВУЮЩИЕ HTML-СТРАНИЦЫ ====================
+# ==================== БАЗОВЫЙ HTML ====================
 BASE_HTML = """<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -980,9 +971,8 @@ tr:hover td {{ background: #1c222b; }}
   <div class="brand">🌧 SHUFFLE RAIN <small>статистика</small></div>
   <nav>
     <a href="/" class="{active_home}">Главная</a>
-    <a href="/rating/amount" class="{active_amount}">По сумме</a>
-    <a href="/rating/wins" class="{active_wins}">По победам</a>
-    <a href="/rating/tips" class="{active_tips}">По чаевым</a>
+    <a href="/hosts" class="{active_hosts}">Раздающие</a>
+    <a href="/receivers" class="{active_receivers}">Получатели</a>
     <a href="/monitor">Мониторинг</a>
   </nav>
   <div style="margin-left:auto"><span class="live-dot"></span><span class="muted">LIVE</span></div>
@@ -1007,6 +997,49 @@ def fmt_rub(x):
         return "0 ₽"
 
 
+def render_rank_table(rows, cnt_header="Кол-во"):
+    """Универсальная таблица: # | ник | cnt | сумма."""
+    if not rows:
+        return "<tr><td colspan='4' class='muted'>Пока нет данных</td></tr>"
+    html = ""
+    for i, r in enumerate(rows, 1):
+        rank_cls = "g" if i == 1 else "s" if i == 2 else "b" if i == 3 else ""
+        html += f"""<tr>
+            <td><span class="rank {rank_cls}">{i}</span></td>
+            <td><b>{r['nickname']}</b></td>
+            <td>{r['cnt']}</td>
+            <td class="amount">{fmt_rub(r['total'])}</td>
+        </tr>"""
+    return html
+
+
+def compute_receiver_stats(etype):
+    """{ник: {cnt, total}} для получателей событий типа etype."""
+    stats = defaultdict(lambda: {"cnt": 0, "total": 0.0})
+    for row in query_all(f"SELECT amount_rub, receivers FROM events WHERE type='{etype}'"):
+        try:
+            rcs = json.loads(row["receivers"] or "[]")
+        except Exception:
+            continue
+        if not rcs:
+            continue
+        share = (row["amount_rub"] or 0) / len(rcs)
+        for r in rcs:
+            if not r:
+                continue
+            stats[r]["cnt"] += 1
+            stats[r]["total"] += share
+    return stats
+
+
+def sort_receiver_stats(stats, by="total", limit=50):
+    arr = [{"nickname": k, "cnt": v["cnt"], "total": v["total"]}
+           for k, v in stats.items()]
+    arr.sort(key=lambda x: x[by], reverse=True)
+    return arr[:limit]
+
+
+# ==================== ГЛАВНАЯ ====================
 @app.get("/", response_class=HTMLResponse)
 async def page_home():
     t = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='rain'") or {}).get("c", 0)
@@ -1042,10 +1075,100 @@ async def page_home():
       loadOnce();
     </script>"""
     return BASE_HTML.format(title="Shuffle Rain Stats", active_home="active",
-                             active_amount="", active_wins="", active_tips="", content=content)
+                             active_hosts="", active_receivers="", content=content)
 
 
-def render_table(rows, kind):
+# ==================== /hosts ====================
+@app.get("/hosts", response_class=HTMLResponse)
+async def page_hosts():
+    rain_by_amount = query_all("""
+        SELECT sender AS nickname, COUNT(*) AS cnt,
+               COALESCE(SUM(amount_rub),0) AS total
+        FROM events WHERE type='rain'
+        GROUP BY sender ORDER BY total DESC LIMIT 50
+    """)
+    rain_by_count = query_all("""
+        SELECT sender AS nickname, COUNT(*) AS cnt,
+               COALESCE(SUM(amount_rub),0) AS total
+        FROM events WHERE type='rain'
+        GROUP BY sender ORDER BY cnt DESC LIMIT 50
+    """)
+    tip_by_amount = query_all("""
+        SELECT sender AS nickname, COUNT(*) AS cnt,
+               COALESCE(SUM(amount_rub),0) AS total
+        FROM events WHERE type='tip'
+        GROUP BY sender ORDER BY total DESC LIMIT 50
+    """)
+    tip_by_count = query_all("""
+        SELECT sender AS nickname, COUNT(*) AS cnt,
+               COALESCE(SUM(amount_rub),0) AS total
+        FROM events WHERE type='tip'
+        GROUP BY sender ORDER BY cnt DESC LIMIT 50
+    """)
+
+    content = f"""
+    <div class="grid" style="grid-template-columns: 1fr 1fr">
+      <div class="card"><h3>🌧 Раздал дождей — по сумме</h3>
+        <table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead>
+        <tbody>{render_rank_table(rain_by_amount)}</tbody></table></div>
+
+      <div class="card"><h3>🌧 Раздал дождей — по количеству</h3>
+        <table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead>
+        <tbody>{render_rank_table(rain_by_count)}</tbody></table></div>
+
+      <div class="card"><h3>💸 Отправил чаевых — по сумме</h3>
+        <table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead>
+        <tbody>{render_rank_table(tip_by_amount)}</tbody></table></div>
+
+      <div class="card"><h3>💸 Отправил чаевых — по количеству</h3>
+        <table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead>
+        <tbody>{render_rank_table(tip_by_count)}</tbody></table></div>
+    </div>"""
+    return BASE_HTML.format(
+        title="Shuffle — Раздающие",
+        active_home="", active_hosts="active", active_receivers="",
+        content=content,
+    )
+
+
+# ==================== /receivers ====================
+@app.get("/receivers", response_class=HTMLResponse)
+async def page_receivers():
+    rain_stats = compute_receiver_stats("rain")
+    tip_stats = compute_receiver_stats("tip")
+
+    rain_by_amount = sort_receiver_stats(rain_stats, by="total")
+    rain_by_count = sort_receiver_stats(rain_stats, by="cnt")
+    tip_by_amount = sort_receiver_stats(tip_stats, by="total")
+    tip_by_count = sort_receiver_stats(tip_stats, by="cnt")
+
+    content = f"""
+    <div class="grid" style="grid-template-columns: 1fr 1fr">
+      <div class="card"><h3>🏆 Выиграл дождей — по сумме</h3>
+        <table><thead><tr><th>#</th><th>Ник</th><th>Выигрышей</th><th>Сумма</th></tr></thead>
+        <tbody>{render_rank_table(rain_by_amount)}</tbody></table></div>
+
+      <div class="card"><h3>🎯 Выиграл дождей — по частоте</h3>
+        <table><thead><tr><th>#</th><th>Ник</th><th>Выигрышей</th><th>Сумма</th></tr></thead>
+        <tbody>{render_rank_table(rain_by_count)}</tbody></table></div>
+
+      <div class="card"><h3>💰 Получил чаевых — по сумме</h3>
+        <table><thead><tr><th>#</th><th>Ник</th><th>Получено</th><th>Сумма</th></tr></thead>
+        <tbody>{render_rank_table(tip_by_amount)}</tbody></table></div>
+
+      <div class="card"><h3>📬 Получил чаевых — по количеству</h3>
+        <table><thead><tr><th>#</th><th>Ник</th><th>Получено</th><th>Сумма</th></tr></thead>
+        <tbody>{render_rank_table(tip_by_count)}</tbody></table></div>
+    </div>"""
+    return BASE_HTML.format(
+        title="Shuffle — Получатели",
+        active_home="", active_hosts="", active_receivers="active",
+        content=content,
+    )
+
+
+# ==================== СТАРЫЕ /rating/* ====================
+def render_table_legacy(rows, kind):
     if not rows:
         return "<tr><td colspan='4' class='muted'>Пока нет данных</td></tr>"
     html = ""
@@ -1069,9 +1192,9 @@ async def page_amount():
     """)
     content = f"""<div class="card"><h3>Топ по сумме дождей</h3>
     <table><thead><tr><th>#</th><th>Ник</th><th>Побед</th><th>Сумма</th></tr></thead>
-    <tbody>{render_table(rows, 'amount')}</tbody></table></div>"""
+    <tbody>{render_table_legacy(rows, 'amount')}</tbody></table></div>"""
     return BASE_HTML.format(title="Shuffle — По сумме", active_home="",
-                             active_amount="active", active_wins="", active_tips="", content=content)
+                             active_hosts="", active_receivers="", content=content)
 
 
 @app.get("/rating/wins", response_class=HTMLResponse)
@@ -1082,9 +1205,9 @@ async def page_wins():
     """)
     content = f"""<div class="card"><h3>Топ по количеству дождей</h3>
     <table><thead><tr><th>#</th><th>Ник</th><th>Побед</th><th>Сумма</th></tr></thead>
-    <tbody>{render_table(rows, 'wins')}</tbody></table></div>"""
+    <tbody>{render_table_legacy(rows, 'wins')}</tbody></table></div>"""
     return BASE_HTML.format(title="Shuffle — По победам", active_home="",
-                             active_amount="", active_wins="active", active_tips="", content=content)
+                             active_hosts="", active_receivers="", content=content)
 
 
 @app.get("/rating/tips", response_class=HTMLResponse)
@@ -1110,13 +1233,13 @@ async def page_tips():
     <div class="grid" style="grid-template-columns: 1fr 1fr">
       <div class="card"><h3>Кто больше отправил</h3>
         <table><thead><tr><th>#</th><th>Ник</th><th>Отправлено</th><th>Сумма</th></tr></thead>
-        <tbody>{render_table(sent, 'tips')}</tbody></table></div>
+        <tbody>{render_table_legacy(sent, 'tips')}</tbody></table></div>
       <div class="card"><h3>Кто больше получил</h3>
         <table><thead><tr><th>#</th><th>Ник</th><th>Получено</th><th>Сумма</th></tr></thead>
-        <tbody>{render_table(recv_sorted, 'tips')}</tbody></table></div>
+        <tbody>{render_table_legacy(recv_sorted, 'tips')}</tbody></table></div>
     </div>"""
     return BASE_HTML.format(title="Shuffle — По чаевым", active_home="",
-                             active_amount="", active_wins="", active_tips="active", content=content)
+                             active_hosts="", active_receivers="", content=content)
 
 
 @app.get("/user/{nickname}", response_class=HTMLResponse)
@@ -1133,9 +1256,10 @@ async def page_user(nickname: str):
       <div class="card"><h3>Получил чаевых</h3><div class="big">{to['count']}</div><div class="sub">{fmt_rub(to['total_rub'])}</div></div>
     </div>"""
     return BASE_HTML.format(title=f"Shuffle — {nickname}", active_home="",
-                             active_amount="", active_wins="", active_tips="", content=content)
+                             active_hosts="", active_receivers="", content=content)
 
 
+# ==================== ADMIN ====================
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
