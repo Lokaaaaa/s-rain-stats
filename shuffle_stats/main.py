@@ -16,8 +16,18 @@ DB_PATH = os.environ.get("DB_PATH", "shuffle.db")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 USE_POSTGRES = bool(DATABASE_URL)
 API_KEY = os.environ.get("API_KEY", "CHANGE_ME_SECRET_KEY")
-SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", "screenshots")
-os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+# SCREENSHOT_DIR: пытаемся использовать env-переменную, но если путь
+# недоступен (например, /var/data без Persistent Disk) — откатываемся
+# на локальную папку рядом с main.py
+_default_screenshots = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
+SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", _default_screenshots)
+try:
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+except (PermissionError, OSError) as e:
+    print(f"[WARN] Не могу создать {SCREENSHOT_DIR} ({e}). Использую {_default_screenshots}")
+    SCREENSHOT_DIR = _default_screenshots
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 if USE_POSTGRES:
     import psycopg2
