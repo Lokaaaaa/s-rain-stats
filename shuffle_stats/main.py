@@ -136,6 +136,11 @@ def init_db():
         """)
     _try("ALTER TABLE events ADD COLUMN ts DOUBLE PRECISION" if USE_POSTGRES
          else "ALTER TABLE events ADD COLUMN ts REAL")
+    # Поля для контекста дождей
+    _try("ALTER TABLE events ADD COLUMN context_messages TEXT" if USE_POSTGRES
+         else "ALTER TABLE events ADD COLUMN context_messages TEXT")
+    _try("ALTER TABLE events ADD COLUMN context_bets TEXT" if USE_POSTGRES
+         else "ALTER TABLE events ADD COLUMN context_bets TEXT")
 
     execute("CREATE INDEX IF NOT EXISTS idx_type ON events(type)")
     execute("CREATE INDEX IF NOT EXISTS idx_sender ON events(sender)")
@@ -249,17 +254,13 @@ def meta_set(k, v):
         execute("INSERT OR REPLACE INTO meta (k,v) VALUES (?,?)", (k, str(v)))
 
 
-# ==================== МИГРАЦИЯ ts для старых записей ====================
 def migrate_ts_once():
-    """Заполняет ts для старых записей, где ts IS NULL, из created_at.
-    Запускается однократно — отмечается флагом в meta."""
     try:
         done = meta_get("ts_migrated_v1")
         if done:
             print("[DB] Миграция ts уже выполнена, пропускаю")
             return
         print("[DB] Миграция ts — заполняю для старых записей...")
-
         if USE_POSTGRES:
             execute("""
                 UPDATE events
@@ -274,7 +275,6 @@ def migrate_ts_once():
                 WHERE ts IS NULL AND created_at IS NOT NULL
             """)
             print("[DB] events — обновлено")
-
         meta_set("ts_migrated_v1", "1")
         print("[DB] ✅ Миграция ts завершена")
     except Exception as e:
@@ -298,6 +298,8 @@ class EventIn(BaseModel):
     amount_rub: float = 0.0
     created_at: Optional[str] = None
     ts: Optional[float] = None
+    context_messages: List[str] = []
+    context_bets: List[dict] = []
 
 
 class BulkAlertIn(BaseModel):
@@ -359,7 +361,6 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
     ts_val = event.ts if event.ts else time.time()
     created = event.created_at or datetime.fromtimestamp(ts_val, tz=timezone.utc).isoformat()
 
-    # Защита от дублей (±2 сек)
     dup = query_one("""
         SELECT id FROM events
         WHERE type=? AND chat=? AND sender=? AND receivers=? AND amount_text=?
@@ -372,15 +373,19 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
         return {"ok": True, "dup": True}
 
     p = ph()
+    ctx_msg_json = json.dumps(event.context_messages or [], ensure_ascii=False)
+    ctx_bets_json = json.dumps(event.context_bets or [], ensure_ascii=False)
     execute(f"""
         INSERT INTO events (type, chat, sender, receivers, amount_text, amount_type,
-                            crypto_symbol, amount_rub, created_at, ts)
-        VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p})
+                            crypto_symbol, amount_rub, created_at, ts,
+                            context_messages, context_bets)
+        VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p})
     """, (
         event.type, event.chat, event.sender,
         json.dumps(event.receivers or [], ensure_ascii=False),
         event.amount_text, event.amount_type, event.crypto_symbol,
-        event.amount_rub, created, ts_val
+        event.amount_rub, created, ts_val,
+        ctx_msg_json, ctx_bets_json
     ))
     return {"ok": True}
 
@@ -581,7 +586,6 @@ async def api_events(
     if chat: q += " AND chat = ?"; p.append(chat)
     if sender: q += " AND sender LIKE ?"; p.append(f"%{sender}%")
     if min_rub is not None: q += " AND amount_rub >= ?"; p.append(min_rub)
-    # NULLS LAST — старые записи с ts=NULL в самом низу, свежие всегда сверху
     if USE_POSTGRES:
         q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?"
     else:
@@ -649,6 +653,35 @@ async def api_days():
 async def api_chats():
     rows = query_all("SELECT DISTINCT chat FROM events WHERE chat IS NOT NULL ORDER BY chat")
     return {"chats": [r["chat"] for r in rows]}
+
+
+@app.get("/api/contexts")
+async def api_contexts(
+    chat: Optional[str] = None,
+    limit: int = 30,
+):
+    """Последние дожди с контекстом (сообщения + ставки до дождя)."""
+    q = "SELECT id, ts, created_at, chat, sender, receivers, amount_text, amount_rub, crypto_symbol, context_messages, context_bets FROM events WHERE type='rain'"
+    p = []
+    if chat:
+        q += " AND chat = ?"
+        p.append(chat)
+    if USE_POSTGRES:
+        q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?"
+    else:
+        q += " ORDER BY ts DESC, id DESC LIMIT ?"
+    p.append(limit)
+    rows = query_all(q, tuple(p))
+    out = []
+    for r in rows:
+        try: r["receivers"] = json.loads(r.get("receivers") or "[]")
+        except: r["receivers"] = []
+        try: r["context_messages"] = json.loads(r.get("context_messages") or "[]")
+        except: r["context_messages"] = []
+        try: r["context_bets"] = json.loads(r.get("context_bets") or "[]")
+        except: r["context_bets"] = []
+        out.append(r)
+    return {"contexts": out}
 
 
 @app.get("/api/bulk")
@@ -965,10 +998,13 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     <span class="hint-btn" data-hint="Срабатывает, когда один отправитель шлёт одинаковую сумму 3+ людям за 20 мин.&#10;&#10;Фильтр:&#10;• Введи ник → Enter → добавится чип&#10;• Крестик на чипе — удалить&#10;• Несколько чипов = OR-фильтр">?</span>
   </button>
   <button data-tab="bets">Ставки
-    <span class="hint-btn" data-hint="Только ВЫИГРЫШНЫЕ ставки ≥50$.&#10;&#10;Скрипт парсит таблицу «Последние ставки» на странице игры.&#10;&#10;Фильтр:&#10;• All — все чаты&#10;• ENGLISH/RUSSIAN/… — конкретный чат&#10;• Sender — поиск по нику&#10;&#10;Кнопка 📊 показывает статистику по чатам за 24ч.">?</span>
+    <span class="hint-btn" data-hint="Только ВЫИГРЫШНЫЕ ставки.&#10;&#10;Порог зависит от множителя:&#10;• >10x → от $30&#10;• ≤10x → от $100&#10;&#10;Скрытые игроки показываются как Anonymous.&#10;&#10;Кнопка 📊 показывает статистику по чатам за 24ч.">?</span>
   </button>
   <button data-tab="player">Активность
     <span class="hint-btn" data-hint="Сообщения конкретных игроков во всех чатах.&#10;&#10;Watch-лист синхронизируется со скриптом:&#10;• Введи ник → Add → скрипт подхватит через 15 сек&#10;• X на вкладке игрока — удалить из слежки&#10;&#10;График показывает, в какие часы игрок обычно пишет.">?</span>
+  </button>
+  <button data-tab="contexts">Контексты дождей
+    <span class="hint-btn" data-hint="Последние 30 дождей с контекстом.&#10;&#10;Для каждого дождя показаны:&#10;• Сам дождь (кто разлил, сумму)&#10;• 15 последних сообщений перед ним&#10;• 5 последних выигрышных ставок перед ним&#10;&#10;Позволяет понять что было до дождя:&#10;обещания залить, крупные выигрыши и т.д.">?</span>
   </button>
 </div>
 <main>
@@ -1046,6 +1082,15 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     <table><thead><tr><th>Время</th><th>Игрок</th><th>Чат</th><th>Сообщение</th></tr></thead>
     <tbody id="plBody"></tbody></table>
   </div>
+
+  <div id="tab-contexts" style="display:none">
+    <div class="row-flex">
+      <select id="ctxChat"><option value="">Все чаты</option></select>
+      <input type="number" id="ctxLimit" value="30" placeholder="Кол-во" style="width:80px">
+      <button class="btn" onclick="loadContexts()">Обновить</button>
+    </div>
+    <div id="ctxList"></div>
+  </div>
 </main>
 
 <div class="modal" id="imgModal" onclick="this.classList.remove('on')">
@@ -1063,7 +1108,7 @@ let currentPlayer = null;
 
 function switchTab(name){
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
-  ['status','events','chart','bulk','bets','player'].forEach(t=>{
+  ['status','events','chart','bulk','bets','player','contexts'].forEach(t=>{
     $('tab-'+t).style.display = (t===name) ? '' : 'none';
   });
   if(name==='events') { loadDays(); loadEvents(); }
@@ -1071,6 +1116,7 @@ function switchTab(name){
   if(name==='bulk') loadBulk();
   if(name==='bets') { loadChats(); loadBets(); }
   if(name==='player') loadPlayers();
+  if(name==='contexts') { loadChats(); loadContexts(); }
 }
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 
@@ -1086,7 +1132,7 @@ async function refreshStatus(){
       <div>Всего событий<b>${r.total||0}</b></div>
       <div>Tips<b>${r.tips||0}</b></div>
       <div>Rains<b>${r.rains||0}</b></div>
-      <div>Bets ≥50$<b>${r.bets||0}</b></div>
+      <div>Bets<b>${r.bets||0}</b></div>
       <div>Вкладок онлайн<b>${(r.instances||[]).filter(i=>now - (i.updated_at||0) < 40).length}</b></div>`;
     const body = $('instBody'); body.innerHTML = '';
     (r.instances||[]).forEach(i=>{
@@ -1129,7 +1175,7 @@ async function reqShot(iid){
 
 async function loadChats(){
   const r = await fetch('/api/chats').then(r=>r.json());
-  ['fChat','cChat','pChat','betChat'].forEach(id=>{
+  ['fChat','cChat','pChat','betChat','ctxChat'].forEach(id=>{
     const sel = $(id); if(!sel) return;
     const cur = sel.value;
     sel.innerHTML = '<option value="">Все чаты</option>' +
@@ -1277,7 +1323,7 @@ async function loadBets(){
   const r = await fetch('/api/bets?'+p).then(r=>r.json());
   const body = $('betsBody'); body.innerHTML='';
   if(!r.bets.length){
-    body.innerHTML = '<tr><td colspan="8" class="hint">Нет выигрышных ставок ≥50$</td></tr>';
+    body.innerHTML = '<tr><td colspan="8" class="hint">Нет выигрышных ставок по фильтру</td></tr>';
     return;
   }
   r.bets.forEach(b=>{
@@ -1299,7 +1345,7 @@ async function loadBetsStats(){
   const r = await fetch('/api/bets_stats').then(r=>r.json());
   const el = $('betStats');
   if(!r.stats.length){
-    el.innerHTML = '<p class="hint">За последние 24ч выигрышных ставок ≥50$ не было</p>';
+    el.innerHTML = '<p class="hint">За последние 24ч выигрышных ставок не было</p>';
     return;
   }
   el.innerHTML = '<div class="kpi">' + r.stats.map(s => `
@@ -1312,7 +1358,7 @@ async function loadBetsTop(){
   const r = await fetch('/api/bets_top_senders').then(r=>r.json());
   const el = $('betStats');
   if(!r.senders.length){
-    el.innerHTML = '<p class="hint">За последние 7 дней выигрышных ставок ≥50$ не было</p>';
+    el.innerHTML = '<p class="hint">За последние 7 дней выигрышных ставок не было</p>';
     return;
   }
   el.innerHTML = '<div class="kpi">' + r.senders.map(s => `
@@ -1395,6 +1441,66 @@ async function loadPlayerActivity(){
 }
 
 $('pChat') && $('pChat').addEventListener('change', loadPlayerActivity);
+
+// ---------- Contexts ----------
+async function loadContexts(){
+  const p = new URLSearchParams();
+  if($('ctxChat').value) p.set('chat',$('ctxChat').value);
+  if($('ctxLimit').value) p.set('limit',$('ctxLimit').value);
+  const r = await fetch('/api/contexts?'+p).then(r=>r.json());
+  const el = $('ctxList');
+  if(!r.contexts.length){
+    el.innerHTML = '<p class="hint">Нет сохранённых контекстов. Дожди пока не было или контекст не передавался.</p>';
+    return;
+  }
+  el.innerHTML = r.contexts.map(c => {
+    const rub = c.amount_rub ? fmtMoney(c.amount_rub) + ' ₽' : '';
+    const recs = (c.receivers||[]).slice(0, 10).join(', ');
+    const msgs = (c.context_messages||[]).slice(-15);
+    const bets = (c.context_bets||[]).slice(-5);
+
+    const msgsHtml = msgs.length ? msgs.map((m, i) =>
+      `<div style="padding:4px 8px;border-left:3px solid #2a2f3a;margin:4px 0;color:#aab;font-size:12px">
+        <span style="color:#666">${i+1}.</span> ${esc(m)}
+      </div>`
+    ).join('') : '<div class="hint">Нет сообщений в контексте</div>';
+
+    const betsHtml = bets.length ? bets.map(b => {
+      const bMult = b.multiplier || '';
+      const bAmt = b.amount_text || '';
+      const bRub = b.amount_rub ? ' (~' + fmtMoney(b.amount_rub) + '₽)' : '';
+      const bUsd = b.amount_usd ? ' (~$' + fmtMoney(b.amount_usd) + ')' : '';
+      return `<div style="padding:4px 8px;border-left:3px solid #71d68a;margin:4px 0;color:#71d68a;font-size:12px">
+        🎰 <b>${esc(b.sender||'?')}</b> · ${esc(b.game||'')} · ${esc(bMult)} · ${esc(bAmt)}${bRub}${bUsd}
+      </div>`;
+    }).join('') : '<div class="hint">Нет выигрышных ставок в контексте</div>';
+
+    return `
+    <div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px;margin-bottom:12px">
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+        <span class="pill">🌧 RAIN</span>
+        <b>${esc(c.chat)}</b>
+        <span style="color:#8b93a7;font-size:12px">${c.ts?fmtTime(c.ts):esc(c.created_at)}</span>
+        <span style="margin-left:auto;color:#71d68a;font-weight:bold">
+          ${esc(c.amount_text)} ${esc(c.crypto_symbol||'')} ${rub?'· '+rub:''}
+        </span>
+      </div>
+      <div style="color:#aab;font-size:12px;margin-bottom:6px">
+        👤 <b>${esc(c.sender)}</b> → ${(c.receivers||[]).length} получателей: ${esc(recs)}
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+        <div>
+          <div style="color:#8b93a7;font-size:11px;text-transform:uppercase;margin-bottom:6px">Последние сообщения</div>
+          ${msgsHtml}
+        </div>
+        <div>
+          <div style="color:#8b93a7;font-size:11px;text-transform:uppercase;margin-bottom:6px">Выигрышные ставки до дождя</div>
+          ${betsHtml}
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
 
 renderBulkChips();
 loadChats();
