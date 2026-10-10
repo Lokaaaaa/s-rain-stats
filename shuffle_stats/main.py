@@ -21,7 +21,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 USE_POSTGRES = bool(DATABASE_URL)
 API_KEY = os.environ.get("API_KEY", "CHANGE_ME_SECRET_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "openai/gpt-oss-20b"
 
 _default_screenshots = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", _default_screenshots)
