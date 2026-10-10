@@ -1934,4 +1934,665 @@ async function loadEvents(){
   if($('fChat').value) p.set('chat',$('fChat').value);
   if($('fType').value) p.set('type',$('fType').value);
   if($('fMinRub').value) p.set('min_rub',$('fMinRub').value);
- 
+  const day = $('fDay').value;
+  if(day){
+    const start = Math.floor(new Date(day+'T00:00:00').getTime()/1000);
+    p.set('since', start); p.set('until', start + 86400);
+  }
+  const r = await fetch('/api/events?'+p).then(r=>r.json());
+  const body = $('evBody'); body.innerHTML = '';
+  r.events.forEach(e=>{
+    const tr = document.createElement('tr');
+    const per = e.per_person_rub || 0;
+    tr.innerHTML = `<td>${e.ts?fmtTime(e.ts):esc(e.created_at)}</td>
+      <td><span class="pill">${esc(e.type)}</span></td><td>${esc(e.chat)}</td>
+      <td>${esc(e.sender)}</td><td>${(e.receivers||[]).map(esc).join(', ')}</td>
+      <td>${esc(e.amount_text)}</td><td>${fmtMoney(e.amount_rub)}</td>
+      <td style="color:#8ab4f8">${per?fmtMoney(per):'—'}</td>
+      <td style="color:#71d68a">$${fmtMoney(e.amount_usd||0)}</td>`;
+    body.appendChild(tr);
+  });
+}
+function resetEvents(){
+  ['fSender','fMinRub'].forEach(id=>$(id).value='');
+  $('fChat').value=''; $('fType').value=''; $('fDay').value='';
+  loadEvents();
+}
+
+let chart1=null, chart2=null, chartPlayer=null;
+async function loadChart(){
+  const p = new URLSearchParams();
+  if($('cType').value) p.set('type',$('cType').value);
+  if($('cChat').value) p.set('chat',$('cChat').value);
+  const r = await fetch('/api/chart?'+p).then(r=>r.json());
+  const labels = [...Array(24).keys()].map(h=>String(h).padStart(2,'0')+':00');
+  const counts = labels.map((_,h)=>r.buckets[h]?.count||0);
+  const sums   = labels.map((_,h)=>r.buckets[h]?.sum||0);
+  if(chart1) chart1.destroy();
+  if(chart2) chart2.destroy();
+  const tl = $('cType').value ? ($('cType').value === 'tip' ? 'Tip' : 'Rain') : 'Все';
+  chart1 = new Chart($('hourCount'), {type:'bar',
+    data:{labels, datasets:[{label:`Кол-во (${tl})`, data:counts, backgroundColor:'#4a7ce0'}]},
+    options:{plugins:{legend:{labels:{color:'#e6e6e6'}}, title:{display:true,text:`События — ${tl}`,color:'#e6e6e6'}},
+             scales:{x:{ticks:{color:'#8b93a7'}}, y:{ticks:{color:'#8b93a7'}}}}});
+  chart2 = new Chart($('hourSum'), {type:'bar',
+    data:{labels, datasets:[{label:`Сумма ₽ (${tl})`, data:sums, backgroundColor:'#71d68a'}]},
+    options:{plugins:{legend:{labels:{color:'#e6e6e6'}}, title:{display:true,text:`Сумма — ${tl}`,color:'#e6e6e6'}},
+             scales:{x:{ticks:{color:'#8b93a7'}}, y:{ticks:{color:'#8b93a7'}}}}});
+}
+
+function renderBulkChips(){
+  const el = $('bulkChips');
+  el.innerHTML = bulkChips.length ? bulkChips.map(n =>
+    `<span class="chip">${esc(n)}<span class="x" onclick="removeBulkChip('${esc(n)}')">×</span></span>`
+  ).join('') : '<span class="hint">Фильтр не задан</span>';
+}
+function addBulkChip(){
+  const v = $('bSenderInput').value.trim();
+  if(!v) return;
+  if(!bulkChips.includes(v)) bulkChips.push(v);
+  $('bSenderInput').value='';
+  renderBulkChips(); loadBulk();
+}
+function removeBulkChip(n){ bulkChips = bulkChips.filter(x=>x!==n); renderBulkChips(); loadBulk(); }
+function clearBulkChips(){ bulkChips = []; renderBulkChips(); loadBulk(); }
+$('bSenderInput') && $('bSenderInput').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); addBulkChip(); }});
+
+async function loadBulk(){
+  const p = new URLSearchParams();
+  if(bulkChips.length) p.set('senders', bulkChips.join(','));
+  const r = await fetch('/api/bulk?'+p).then(r=>r.json());
+  const body = $('bulkBody'); body.innerHTML='';
+  if(!r.alerts.length){ body.innerHTML = '<tr><td colspan="8" class="hint">Нет данных</td></tr>'; return; }
+  r.alerts.forEach(a=>{
+    const recCount = (a.receivers||[]).length;
+    const rubEach = a.amount_rub || 0;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${fmtTime(a.ts)}</td><td>${esc(a.chat)}</td><td>${esc(a.sender)}</td>
+      <td>${esc(a.amount_text)}</td><td>${fmtMoney(rubEach)} ₽</td>
+      <td style="color:#71d68a;font-weight:bold">${fmtMoney(rubEach*recCount)} ₽</td>
+      <td>${recCount}</td><td>${(a.receivers||[]).map(esc).join(', ')}</td>`;
+    body.appendChild(tr);
+  });
+}
+
+async function loadBets(){
+  const p = new URLSearchParams();
+  if($('betSender').value) p.set('sender',$('betSender').value);
+  if($('betChat').value) p.set('chat',$('betChat').value);
+  if($('betMinUsd').value) p.set('min_usd',$('betMinUsd').value);
+  const r = await fetch('/api/bets?'+p).then(r=>r.json());
+  const body = $('betsBody'); body.innerHTML='';
+  if(!r.bets.length){ body.innerHTML = '<tr><td colspan="8" class="hint">Нет ставок</td></tr>'; return; }
+  r.bets.forEach(b=>{
+    const tr = document.createElement('tr'); tr.className='bet-row';
+    tr.innerHTML = `<td>${fmtTime(b.ts)}</td><td>${esc(b.chat)}</td><td><b>${esc(b.sender)}</b></td>
+      <td>${esc(b.game)}</td><td>${esc(b.multiplier)}</td>
+      <td>${esc(b.amount_text)} ${esc(b.crypto)}</td>
+      <td style="color:#71d68a;font-weight:bold">$${fmtMoney(b.amount_usd)}</td>
+      <td>${fmtMoney(b.amount_rub)}</td>`;
+    body.appendChild(tr);
+  });
+}
+
+async function loadBetsStats(){
+  const r = await fetch('/api/bets_stats').then(r=>r.json());
+  const el = $('betStats');
+  if(!r.stats.length){ el.innerHTML = '<p class="hint">Пусто</p>'; return; }
+  el.innerHTML = '<div class="kpi">' + r.stats.map(s=>`<div>${esc(s.chat)}<b>${s.cnt} шт.</b>
+    <span class="hint">$${fmtMoney(s.total_usd)} (avg $${fmtMoney(s.avg_usd)})</span></div>`).join('') + '</div>';
+}
+async function loadBetsTop(){
+  const r = await fetch('/api/bets_top_senders').then(r=>r.json());
+  const el = $('betStats');
+  if(!r.senders.length){ el.innerHTML = '<p class="hint">Пусто</p>'; return; }
+  el.innerHTML = '<div class="kpi">' + r.senders.map(s=>`<div>${esc(s.nickname)}<b>${s.cnt} шт.</b>
+    <span class="hint">$${fmtMoney(s.total_usd)}</span></div>`).join('') + '</div>';
+}
+
+async function loadBetsToRains(){
+  const w = $('b2rWindow').value || 900;
+  const r = await fetch('/api/bets_to_rains?window_sec='+w).then(r=>r.json());
+  const body = $('b2rBody'); body.innerHTML='';
+  $('b2rStats').innerHTML = `<div class="kpi">
+    <div>Окно<b>${r.window_sec}с</b></div>
+    <div>Всего игроков<b>${r.stats.length}</b></div>
+    <div>Всего сработавших<b>${r.stats.reduce((a,x)=>a+x.triggered,0)}</b></div>
+  </div>`;
+  if(!r.stats.length){ body.innerHTML = '<tr><td colspan="6" class="hint">Нет данных</td></tr>'; return; }
+  r.stats.forEach((s, i)=>{
+    const cls = s.percent >= 50 ? 'ok' : (s.percent >= 25 ? 'warn' : 'err');
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${i+1}</td><td><b>${esc(s.nickname)}</b></td>
+      <td>${s.bets}</td><td>${s.triggered}</td>
+      <td><span class="pill ${cls}">${s.percent}%</span></td>
+      <td>${fmtMoney(s.rain_rub)}</td>`;
+    body.appendChild(tr);
+  });
+}
+
+async function loadPlayers(){
+  const wl = await fetch('/api/watchlist').then(r=>r.json());
+  const names = wl.players || [];
+  const el = $('playerTabs');
+  if(!names.length){ el.innerHTML = '<span class="hint">Пусто</span>'; $('plBody').innerHTML = ''; return; }
+  if(!currentPlayer || !names.includes(currentPlayer)) currentPlayer = names[0];
+  el.innerHTML = names.map(n =>
+    `<div class="player-tab ${n===currentPlayer?'active':''}" onclick="selectPlayer('${esc(n)}')">
+      ${esc(n)} <span class="rm" onclick="event.stopPropagation();removePlayer('${esc(n)}')">×</span></div>`
+  ).join('');
+  loadPlayerActivity();
+}
+async function selectPlayer(n){ currentPlayer = n; await loadPlayers(); }
+async function addPlayer(){
+  const v = $('pNewPlayer').value.trim(); if(!v) return;
+  await fetch('/api/watchlist/add', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:v})});
+  $('pNewPlayer').value=''; currentPlayer = v; await loadPlayers();
+}
+async function removePlayer(name){
+  if(!confirm(`Удалить ${name}?`)) return;
+  await fetch('/api/watchlist/remove', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
+  if(currentPlayer === name) currentPlayer = null; await loadPlayers();
+}
+async function loadPlayerActivity(){
+  if(!currentPlayer) return;
+  const p = new URLSearchParams(); p.set('username', currentPlayer);
+  if($('pChat').value) p.set('chat', $('pChat').value);
+  const r = await fetch('/api/player?'+p).then(r=>r.json());
+  const body = $('plBody'); body.innerHTML='';
+  r.rows.forEach(x=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${fmtTime(x.ts)}</td><td><b>${esc(x.username)}</b></td><td>${esc(x.chat)}</td><td>${esc(x.text)}</td>`;
+    body.appendChild(tr);
+  });
+  const labels = [...Array(24).keys()].map(h=>String(h).padStart(2,'0')+':00');
+  const vals = labels.map((_,h)=>r.hourly[h]||0);
+  if(chartPlayer) chartPlayer.destroy();
+  chartPlayer = new Chart($('playerHour'), {type:'bar',
+    data:{labels, datasets:[{label:`Сообщений — ${currentPlayer}`, data:vals, backgroundColor:'#c58af9'}]},
+    options:{plugins:{legend:{labels:{color:'#e6e6e6'}}}, scales:{x:{ticks:{color:'#8b93a7'}},y:{ticks:{color:'#8b93a7'}}}}});
+}
+$('pChat') && $('pChat').addEventListener('change', loadPlayerActivity);
+
+async function loadContexts(){
+  const p = new URLSearchParams();
+  if($('ctxChat').value) p.set('chat',$('ctxChat').value);
+  if($('ctxLimit').value) p.set('limit',$('ctxLimit').value);
+  const r = await fetch('/api/contexts?'+p).then(r=>r.json());
+  const el = $('ctxList');
+  if(!r.contexts.length){ el.innerHTML = '<p class="hint">Нет контекстов</p>'; return; }
+  el.innerHTML = r.contexts.map(c => {
+    const rub = c.amount_rub ? fmtMoney(c.amount_rub) + ' ₽' : '';
+    const recs = (c.receivers||[]).slice(0,10).join(', ');
+    const msgs = (c.context_messages||[]).slice(-15);
+    const bets = (c.context_bets||[]).slice(-5);
+    const msgsHtml = msgs.length ? msgs.map((m,i)=>`<div style="padding:4px 8px;border-left:3px solid #2a2f3a;margin:4px 0;color:#aab;font-size:12px"><span style="color:#666">${i+1}.</span> ${esc(m)}</div>`).join('') : '<div class="hint">Пусто</div>';
+    const betsHtml = bets.length ? bets.map(b=>`<div style="padding:4px 8px;border-left:3px solid #71d68a;margin:4px 0;color:#71d68a;font-size:12px">🎰 <b>${esc(b.sender||'?')}</b> · ${esc(b.game||'')} · ${esc(b.multiplier||'')} · ${esc(b.amount_text||'')}</div>`).join('') : '<div class="hint">Пусто</div>';
+    return `<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px;margin-bottom:12px">
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+        <span class="pill">🌧 RAIN</span><b>${esc(c.chat)}</b>
+        <span style="color:#8b93a7;font-size:12px">${c.ts?fmtTime(c.ts):esc(c.created_at)}</span>
+        <span style="margin-left:auto;color:#71d68a;font-weight:bold">${esc(c.amount_text)} ${esc(c.crypto_symbol||'')} ${rub?'· '+rub:''}</span>
+      </div>
+      <div style="color:#aab;font-size:12px;margin-bottom:6px">👤 <b>${esc(c.sender)}</b> → ${(c.receivers||[]).length} получ.: ${esc(recs)}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+        <div><div style="color:#8b93a7;font-size:11px;text-transform:uppercase;margin-bottom:6px">Сообщения до</div>${msgsHtml}</div>
+        <div><div style="color:#8b93a7;font-size:11px;text-transform:uppercase;margin-bottom:6px">Ставки до</div>${betsHtml}</div>
+      </div></div>`;
+  }).join('');
+}
+
+async function loadIntents(){
+  const p = new URLSearchParams();
+  if($('intChat').value) p.set('chat',$('intChat').value);
+  if($('intSender').value) p.set('sender',$('intSender').value);
+  if($('intOnly').value !== '') p.set('only_matched',$('intOnly').value);
+  const r = await fetch('/api/intents?'+p).then(r=>r.json());
+  const body = $('intBody'); body.innerHTML='';
+  if(!r.intents.length){ body.innerHTML = '<tr><td colspan="7" class="hint">Нет</td></tr>'; return; }
+  r.intents.forEach(x=>{
+    const matched = !!x.matched_rain_id;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${fmtTime(x.ts)}</td><td>${esc(x.chat)}</td><td><b>${esc(x.sender)}</b></td>
+      <td>${esc(x.text)}</td>
+      <td><span class="pill ${x.percent>=70?'ok':'warn'}">${x.percent||100}%</span></td>
+      <td><span class="pill ${matched?'ok':'err'}">${matched?'✅ сбылось':'❌ не сбылось'}</span></td>
+      <td>${x.matched_delta_sec ? Math.round(x.matched_delta_sec)+'с' : '—'}</td>`;
+    body.appendChild(tr);
+  });
+}
+async function loadIntentsStats(){
+  const r = await fetch('/api/intents_stats').then(r=>r.json());
+  const el = $('intStats');
+  if(!r.stats.length){ el.innerHTML = '<p class="hint">Нет данных</p>'; return; }
+  el.innerHTML = '<div class="kpi">' + r.stats.map(s=>{
+    const cls = s.percent >= 50 ? 'ok' : (s.percent >= 25 ? 'warn' : 'err');
+    return `<div>${esc(s.nickname)}<b>${s.percent}%</b><span class="hint"><span class="pill ${cls}">${s.matched}/${s.total}</span> AI:${s.avg_percent||'—'}%</span></div>`;
+  }).join('') + '</div>';
+}
+
+async function loadPromos(){
+  const filter = $('promoFilter').value;
+  const p = new URLSearchParams();
+  if(filter === '0') p.set('only_unused', '1');
+  const r = await fetch('/api/promocodes?'+p).then(r=>r.json());
+  const stats = await fetch('/api/promocodes/stats').then(r=>r.json());
+  $('promoStats').textContent = `Всего: ${stats.total} | Исп: ${stats.used} | Осталось: ${stats.unused}`;
+  const el = $('promoList');
+  if(!r.promos.length){ el.innerHTML = '<p class="hint">Пусто. Нажми «🔍 Проверить сейчас».</p>'; return; }
+  const filtered = filter === '1' ? r.promos.filter(x=>x.used) : r.promos;
+  if(!filtered.length){ el.innerHTML = '<p class="hint">Пусто по фильтру</p>'; return; }
+  el.innerHTML = filtered.map(x=>`<div class="promo-card ${x.used?'used':''}">
+    <input type="checkbox" class="promo-cb" ${x.used?'checked':''} onchange="togglePromo(${x.id})">
+    <div class="promo-body"><div class="promo-text">${esc(x.text)}</div>
+    <div class="promo-meta">${x.message_date?'📅 '+esc(x.message_date):''}${x.link?' · <a href="'+esc(x.link)+'" target="_blank">TG</a>':''}${x.used&&x.used_at?' · ✅ '+fmtTime(x.used_at):''}</div>
+    </div></div>`).join('');
+}
+async function togglePromo(id){ await fetch('/api/promo/toggle/'+id,{method:'POST'}); loadPromos(); }
+async function testPromo(){
+  const btn = event.target; btn.disabled=true; btn.textContent='⏳';
+  try { const r = await fetch('/api/promo/test',{method:'POST'}).then(r=>r.json());
+    alert(`Найдено: ${r.found}, новых: ${r.new}`); loadPromos();
+  } catch(e){ alert('Ошибка'); } finally { btn.disabled=false; btn.textContent='🔍 Проверить сейчас'; }
+}
+
+async function runAI(){
+  const chat = $('aiChat').value;
+  if(!chat){ alert('Выбери чат'); return; }
+  const btn = event.target; btn.disabled=true; btn.textContent='⏳ Читаю чат...';
+  $('aiStatus').textContent = 'Отправляю задачу...';
+  $('aiTopic').innerHTML = '';
+  $('aiResult').innerHTML = '';
+  try {
+    const r = await fetch('/api/chat/request', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({chat})}).then(r=>r.json());
+    const taskId = r.task_id;
+    if(!taskId){ alert('Не удалось создать задачу'); return; }
+    if(aiPollTimer) clearInterval(aiPollTimer);
+    let tries = 0;
+    aiPollTimer = setInterval(async () => {
+      tries++;
+      const t = await fetch('/api/chat/task/'+taskId).then(r=>r.json());
+      if(t.status === 'pending' || t.status === 'reading'){
+        $('aiStatus').textContent = `Ожидаю чтения чата клиентом... (${tries*2}с)`;
+      } else if(t.status === 'completed'){
+        clearInterval(aiPollTimer); aiPollTimer = null;
+        $('aiStatus').textContent = '✅ Готово';
+        btn.disabled=false; btn.textContent='🤖 Получить сообщения';
+        renderAIResult(t.result, chat);
+      } else if(t.status === 'failed'){
+        clearInterval(aiPollTimer); aiPollTimer = null;
+        $('aiStatus').textContent = '❌ Ошибка';
+        $('aiTopic').innerHTML = `<div class="ai-topic" style="color:#f87171">Ошибка: ${esc(t.error||'неизвестная')}</div>`;
+        btn.disabled=false; btn.textContent='🤖 Получить сообщения';
+      }
+      if(tries > 60){ clearInterval(aiPollTimer); aiPollTimer = null; $('aiStatus').textContent = '⏱ Таймаут'; btn.disabled=false; btn.textContent='🤖 Получить сообщения'; }
+    }, 2000);
+  } catch(e){ alert('Ошибка: '+e.message); btn.disabled=false; btn.textContent='🤖 Получить сообщения'; }
+}
+
+function renderAIResult(result, chat){
+  if(!result){ $('aiResult').innerHTML = '<p class="hint">Нет результата</p>'; return; }
+  const topic = result.topic || '';
+  const msgs = result.messages || [];
+  const phrases = result.phrases || [];
+  $('aiTopic').innerHTML = topic ? `<div class="ai-topic"><b>Тема беседы (${esc(chat)}):</b> ${esc(topic)}</div>` : '';
+  $('aiResult').innerHTML = `<div class="ai-grid">
+    <div class="ai-col">
+      <h3>💬 5 сообщений по контексту (клик = копировать)</h3>
+      ${msgs.map((m,i)=>`<div class="ai-msg" onclick="copyMsg(this, '${esc(m).replace(/'/g,"&#39;")}')">${esc(m)}</div>`).join('')}
+    </div>
+    <div class="ai-col">
+      <h3>🙋 5 безопасных фраз</h3>
+      ${phrases.map((p,i)=>`<div class="ai-phrase" onclick="copyMsg(this, '${esc(p).replace(/'/g,"&#39;")}')">${esc(p)}</div>`).join('')}
+    </div>
+  </div>`;
+}
+
+function copyMsg(el, text){
+  const doCopy = async () => {
+    if(navigator.clipboard && window.isSecureContext){
+      try { await navigator.clipboard.writeText(text); return true; } catch(e){}
+    }
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try { document.execCommand('copy'); return true; } catch(e){ return false; }
+    finally { document.body.removeChild(ta); }
+  };
+  doCopy().then(() => {
+    el.classList.add('copied');
+    const orig = el.textContent;
+    el.textContent = '✅ ' + orig;
+    setTimeout(()=>{ el.classList.remove('copied'); el.textContent = orig; }, 1200);
+  });
+}
+
+async function loadAILatest(){
+  const chat = $('aiChat').value || null;
+  const p = new URLSearchParams();
+  if(chat) p.set('chat', chat);
+  const r = await fetch('/api/chat/latest?'+p).then(r=>r.json());
+  if(!r.task){
+    $('aiTopic').innerHTML = '';
+    $('aiResult').innerHTML = '<p class="hint">Нет сохранённых результатов</p>';
+    return;
+  }
+  renderAIResult(r.task.result, r.task.chat);
+  $('aiStatus').textContent = `Последний: ${fmtTime(r.task.completed_at)}`;
+}
+
+async function loadPlayersTab(){
+  const sum = await fetch('/api/players_by_chat').then(r=>r.json());
+  const sEl = $('plChatsSummary');
+  if(sum.chats && sum.chats.length){
+    sEl.innerHTML = '<div class="kpi">' + sum.chats.map(c=>`
+      <div>${esc(c.chat)}<b>${c.total_players} игроков</b>
+        <span class="hint">🟢 ${c.online_players} онлайн · ${fmtMoney(c.total_messages)} сообщений</span>
+      </div>`).join('') + '</div>';
+  } else {
+    sEl.innerHTML = '<p class="hint">Пока нет данных</p>';
+  }
+  const p = new URLSearchParams();
+  if($('plChatFilter').value) p.set('chat', $('plChatFilter').value);
+  if($('plUserFilter').value) p.set('username', $('plUserFilter').value);
+  if($('plOnlineOnly').checked) p.set('online_only', '1');
+  if($('plMinMsgs').value) p.set('min_msgs', $('plMinMsgs').value);
+  p.set('limit', '1000');
+  const r = await fetch('/api/players?'+p).then(r=>r.json());
+  const body = $('plPlayersBody'); body.innerHTML='';
+  if(!r.players.length){
+    body.innerHTML = '<tr><td colspan="6" class="hint">Нет данных по фильтру</td></tr>';
+    return;
+  }
+  const now = Date.now()/1000;
+  r.players.forEach(x=>{
+    const online = (now - (x.last_seen||0)) < 300;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><b>${esc(x.chat)}</b></td><td>${esc(x.username)}</td>
+      <td style="color:#8ab4f8;font-weight:bold">${x.msg_count}</td>
+      <td>${x.first_seen?fmtTime(x.first_seen):'—'}</td>
+      <td>${x.last_seen?fmtTime(x.last_seen):'—'}</td>
+      <td>${online?'<span class="pill ok">🟢 online</span>':'<span class="pill">offline</span>'}</td>`;
+    body.appendChild(tr);
+  });
+}
+
+async function loadLanguages(){
+  const r = await fetch('/api/players_by_language').then(r=>r.json());
+  const f = ($('langFilter').value || '').toLowerCase();
+  const players = (r.players||[]).filter(p => !f || (p.username||'').toLowerCase().includes(f));
+  const el = $('langGrid');
+  if(!players.length){ el.innerHTML = '<p class="hint">Нет данных</p>'; return; }
+  el.innerHTML = players.map(p => `
+    <div class="lang-card">
+      <h4>${esc(p.username)}</h4>
+      <div class="hint">Всего сообщений: ${p.total_msgs||0} · чатов: ${p.chat_count||0}</div>
+      ${(p.chats||[]).map(c=>`<div class="player-row"><span>${esc(c)}</span></div>`).join('')}
+    </div>`).join('');
+}
+
+renderBulkChips();
+loadChats();
+refreshStatus();
+setInterval(refreshStatus, 3000);
+</script></body></html>
+"""
+
+
+@app.get("/monitor", response_class=HTMLResponse)
+async def monitor_page():
+    return MONITOR_HTML
+
+
+# ==================== BASE HTML (главная, /hosts, /receivers) ====================
+BASE_HTML = """<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: #0e1116; color: #e6e9ef; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
+a {{ color: #7cc4ff; text-decoration: none; }}
+a:hover {{ text-decoration: underline; }}
+header {{ background: #161b22; border-bottom: 1px solid #26303a; padding: 14px 24px; display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }}
+.brand {{ font-weight: 700; font-size: 18px; color: #fff; }}
+.brand small {{ color: #8b949e; font-weight: 400; margin-left: 8px; }}
+nav a {{ margin-right: 16px; color: #c9d1d9; }}
+nav a.active {{ color: #7cc4ff; font-weight: 600; }}
+main {{ max-width: 1200px; margin: 0 auto; padding: 24px; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap: 16px; }}
+.card {{ background: #161b22; border: 1px solid #26303a; border-radius: 12px; padding: 16px 20px; }}
+.card h3 {{ margin: 0 0 8px; color: #8b949e; font-weight: 500; font-size: 13px; text-transform: uppercase; letter-spacing: .5px; }}
+.card .big {{ font-size: 26px; font-weight: 700; color: #fff; }}
+.card .sub {{ color: #6e7681; font-size: 12px; margin-top: 4px; }}
+table {{ width: 100%; border-collapse: collapse; }}
+th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid #26303a; }}
+th {{ color: #8b949e; font-weight: 500; font-size: 13px; }}
+td.amount {{ color: #4ade80; font-weight: 600; }}
+tr:hover td {{ background: #1c222b; }}
+.rank {{ display: inline-block; width: 28px; text-align: center; color: #8b949e; }}
+.rank.g {{ color: #f5c542; }} .rank.s {{ color: #c0c0c0; }} .rank.b {{ color: #cd7f32; }}
+.tag {{ display: inline-block; background: #21262d; padding: 2px 8px; border-radius: 6px; font-size: 11px; color: #8b949e; margin-left: 6px; }}
+.tag.rain {{ color: #7cc4ff; }} .tag.tip {{ color: #f5c542; }}
+.live-dot {{ display: inline-block; width: 8px; height: 8px; background: #4ade80; border-radius: 50%; margin-right: 6px; animation: pulse 1.5s infinite; }}
+@keyframes pulse {{ 0%,100% {{ opacity: 1; }} 50% {{ opacity: 0.3; }} }}
+.recent-row {{ padding: 8px 0; border-bottom: 1px solid #26303a; font-size: 13px; }}
+.recent-row:last-child {{ border-bottom: none; }}
+.muted {{ color: #8b949e; }}
+.chat-pill {{ display:inline-block; background:#21262d; padding:2px 8px; border-radius:6px; font-size:11px; color:#7cc4ff; }}
+.per-person {{ color: #8ab4f8; font-size: 11px; margin-left: 4px; }}
+</style></head><body>
+<header>
+  <div class="brand">🌧 SHUFFLE RAIN <small>статистика</small></div>
+  <nav>
+    <a href="/" class="{active_home}">Главная</a>
+    <a href="/hosts" class="{active_hosts}">Раздающие</a>
+    <a href="/receivers" class="{active_receivers}">Получатели</a>
+    <a href="/monitor">Мониторинг</a>
+  </nav>
+  <div style="margin-left:auto"><span class="live-dot"></span><span class="muted">LIVE</span></div>
+</header>
+<main>{content}</main>
+<script>
+setInterval(async () => {{
+  try {{
+    const r = await fetch('/api/stats');
+    const data = await r.json();
+    document.dispatchEvent(new CustomEvent('stats-updated', {{ detail: data }}));
+  }} catch(e) {{}}
+}}, 10000);
+</script>
+</body></html>"""
+
+
+def fmt_rub(x):
+    try: return f"{x:,.2f}".replace(",", " ").replace(".", ",") + " ₽"
+    except: return "0 ₽"
+
+
+def render_rank_table(rows):
+    if not rows:
+        return "<tr><td colspan='4' class='muted'>Пока нет данных</td></tr>"
+    html = ""
+    for i, r in enumerate(rows, 1):
+        rank_cls = "g" if i == 1 else "s" if i == 2 else "b" if i == 3 else ""
+        html += f"""<tr><td><span class="rank {rank_cls}">{i}</span></td>
+            <td><b>{r['nickname']}</b></td><td>{r['cnt']}</td>
+            <td class="amount">{fmt_rub(r['total'])}</td></tr>"""
+    return html
+
+
+def compute_receiver_stats(etype):
+    stats = defaultdict(lambda: {"cnt": 0, "total": 0.0})
+    for row in query_all(f"SELECT amount_rub, receivers FROM events WHERE type='{etype}'"):
+        try: rcs = json.loads(row["receivers"] or "[]")
+        except: continue
+        if not rcs: continue
+        share = (row["amount_rub"] or 0) / len(rcs)
+        for r in rcs:
+            if r:
+                stats[r]["cnt"] += 1
+                stats[r]["total"] += share
+    return stats
+
+
+def sort_receiver_stats(stats, by="total", limit=50):
+    arr = [{"nickname": k, "cnt": v["cnt"], "total": v["total"]} for k, v in stats.items()]
+    arr.sort(key=lambda x: x[by], reverse=True)
+    return arr[:limit]
+
+
+@app.get("/", response_class=HTMLResponse)
+async def page_home():
+    t = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='rain'") or {}).get("c", 0)
+    tips = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='tip'") or {}).get("c", 0)
+    tr = (query_one("SELECT COALESCE(SUM(amount_rub),0) AS s FROM events WHERE type='rain'") or {}).get("s", 0)
+    ttr = (query_one("SELECT COALESCE(SUM(amount_rub),0) AS s FROM events WHERE type='tip'") or {}).get("s", 0)
+    content = f"""
+    <div class="grid">
+      <div class="card"><h3>Дождей</h3><div class="big">{t}</div></div>
+      <div class="card"><h3>Раздали всего</h3><div class="big">{fmt_rub(tr or 0)}</div></div>
+      <div class="card"><h3>Чаевых</h3><div class="big">{tips}</div></div>
+      <div class="card"><h3>Чаевых сумма</h3><div class="big">{fmt_rub(ttr or 0)}</div></div>
+    </div>
+    <div class="card" style="margin-top:16px"><h3>Последние события</h3><div id="recent"></div></div>
+    <script>
+      document.addEventListener('stats-updated', (e) => renderRecent(e.detail.recent));
+      async function loadOnce() {{ const r = await fetch('/api/stats'); const d = await r.json(); renderRecent(d.recent); }}
+      function renderRecent(rows) {{
+        const el = document.getElementById('recent'); if (!rows) return;
+        el.innerHTML = rows.map(r => {{
+          const cls = r.type === 'rain' ? 'rain' : 'tip';
+          const tag = r.type === 'rain' ? 'RAIN' : 'TIP';
+          const amt = r.amount_text || '';
+          const rub = r.amount_rub ? ' (' + Number(r.amount_rub).toFixed(0) + ' ₽)' : '';
+          const per = r.per_person_rub ? ' <span class="per-person">по ' + Number(r.per_person_rub).toFixed(0) + ' ₽</span>' : '';
+          let recs = ''; try {{ recs = (r.receivers || []).slice(0,5).join(', '); }} catch(e) {{}}
+          return `<div class="recent-row"><span class="tag ${{cls}}">${{tag}}</span> <span class="chat-pill">${{r.chat}}</span> <b style="margin-left:6px">${{r.sender}}</b><span class="muted"> → ${{recs}}</span>${{per}}<span style="float:right" class="amount">${{amt}}${{rub}}</span></div>`;
+        }}).join('');
+      }}
+      loadOnce();
+    </script>"""
+    return BASE_HTML.format(title="Shuffle Rain Stats", active_home="active",
+                             active_hosts="", active_receivers="", content=content)
+
+
+@app.get("/hosts", response_class=HTMLResponse)
+async def page_hosts():
+    r1 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='rain' GROUP BY sender ORDER BY total DESC LIMIT 50")
+    r2 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='rain' GROUP BY sender ORDER BY cnt DESC LIMIT 50")
+    t1 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY total DESC LIMIT 50")
+    t2 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY cnt DESC LIMIT 50")
+    content = f"""
+    <div class="grid" style="grid-template-columns: 1fr 1fr">
+      <div class="card"><h3>🌧 Раздал дождей — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(r1)}</tbody></table></div>
+      <div class="card"><h3>🌧 Раздал дождей — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(r2)}</tbody></table></div>
+      <div class="card"><h3>💸 Отправил чаевых — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(t1)}</tbody></table></div>
+      <div class="card"><h3>💸 Отправил чаевых — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(t2)}</tbody></table></div>
+    </div>"""
+    return BASE_HTML.format(title="Shuffle — Раздающие", active_home="", active_hosts="active", active_receivers="", content=content)
+
+
+@app.get("/receivers", response_class=HTMLResponse)
+async def page_receivers():
+    rain_stats = compute_receiver_stats("rain")
+    tip_stats = compute_receiver_stats("tip")
+    ra = sort_receiver_stats(rain_stats, by="total")
+    rc = sort_receiver_stats(rain_stats, by="cnt")
+    ta = sort_receiver_stats(tip_stats, by="total")
+    tc = sort_receiver_stats(tip_stats, by="cnt")
+    content = f"""
+    <div class="grid" style="grid-template-columns: 1fr 1fr">
+      <div class="card"><h3>🏆 Выиграл дождей — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Выигрышей</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(ra)}</tbody></table></div>
+      <div class="card"><h3>🎯 Выиграл дождей — по частоте</h3><table><thead><tr><th>#</th><th>Ник</th><th>Выигрышей</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(rc)}</tbody></table></div>
+      <div class="card"><h3>💰 Получил чаевых — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Получено</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(ta)}</tbody></table></div>
+      <div class="card"><h3>📬 Получил чаевых — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Получено</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(tc)}</tbody></table></div>
+    </div>"""
+    return BASE_HTML.format(title="Shuffle — Получатели", active_home="", active_hosts="", active_receivers="active", content=content)
+
+
+# ==================== ADMIN ====================
+ADMIN_HTML = """
+<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Admin</title>
+<style>
+body{margin:0;background:#0e1116;color:#e6e9ef;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}
+.box{background:#161b22;border:1px solid #26303a;border-radius:12px;padding:32px 40px;max-width:520px;width:100%}
+h1{margin:0 0 8px;font-size:22px}.sub{color:#8b949e;margin-bottom:24px;font-size:14px}
+input{width:100%;background:#0d1117;border:1px solid #30363d;color:#e6e9ef;padding:10px 12px;border-radius:8px;font-size:14px;margin-bottom:16px;font-family:monospace}
+button{width:100%;padding:12px;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;background:#dc2626;color:#fff}
+button:disabled{background:#4b5563;cursor:not-allowed}
+.result{margin-top:16px;padding:12px;border-radius:8px;font-size:13px;display:none}
+.result.ok{background:#052e16;color:#4ade80;border:1px solid #14532d;display:block}
+.result.err{background:#2d0f0f;color:#f87171;border:1px solid #7f1d1d;display:block}
+.warn{background:#2d2410;border:1px solid #78350f;color:#fbbf24;padding:12px;border-radius:8px;margin-bottom:20px;font-size:13px}
+a{color:#7cc4ff;text-decoration:none;font-size:13px}
+</style></head><body>
+<div class="box">
+  <h1>⚙️ Админ-панель</h1>
+  <div class="sub">Shuffle Rain Stats</div>
+  <div class="warn">⚠️ Удалит ВСЕ события. Необратимо.</div>
+  <input id="apiKey" type="password" placeholder="X-API-Key">
+  <input id="confirm" type="text" placeholder="DELETE_ALL" autocomplete="off">
+  <button id="clearBtn" onclick="clearDb()">🗑 Очистить базу данных</button>
+  <div id="result" class="result"></div>
+  <div style="margin-top:20px;text-align:center"><a href="/">← На главную</a></div>
+</div>
+<script>
+async function clearDb() {
+  const apiKey = document.getElementById('apiKey').value.trim();
+  const confirm = document.getElementById('confirm').value.trim();
+  const result = document.getElementById('result');
+  const btn = document.getElementById('clearBtn');
+  result.className='result'; result.textContent='';
+  if(!apiKey){ result.className='result err'; result.textContent='Введите API-ключ'; return; }
+  if(confirm !== 'DELETE_ALL'){ result.className='result err'; result.textContent='Введите DELETE_ALL'; return; }
+  if(!window.confirm('Точно удалить ВСЕ данные?')) return;
+  btn.disabled=true; btn.textContent='⏳';
+  try {
+    const r = await fetch('/api/clear', { method:'POST', headers:{'Content-Type':'application/json','X-API-Key':apiKey}, body: JSON.stringify({confirm:'DELETE_ALL'}) });
+    const data = await r.json();
+    if(r.ok){ result.className='result ok'; result.textContent='✅ '+(data.message||'Готово'); }
+    else { result.className='result err'; result.textContent='❌ '+(data.detail||'Ошибка'); }
+  } catch(e){ result.className='result err'; result.textContent='❌ '+e.message; }
+  finally { btn.disabled=false; btn.textContent='🗑 Очистить базу данных'; }
+}
+</script></body></html>
+"""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    return ADMIN_HTML
+
+
+# ==================== STARTUP ====================
+@app.on_event("startup")
+async def startup_event():
+    # 1) Курсы валют
+    _load_server_rates()
+    threading.Thread(target=rates_refresh_thread, daemon=True).start()
+    print("[RATES] Поток обновления курсов запущен")
+
+    # 2) Один проход дедупликации + пересчёта нулевых сумм
+    threading.Thread(target=dedup_events, daemon=True).start()
+    # 3) Регулярный дедуп каждые 10 минут
+    threading.Thread(target=dedup_thread, daemon=True).start()
+
+    # 4) Промокоды
+    threading.Thread(target=promo_parser_thread, daemon=True).start()
+    print(f"[PROMO] Поток мониторинга @{PROMO_CHANNEL} запущен")
+
+    if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
+        print(f"[AI] ✅ GROQ_API_KEY задан, модель: {GROQ_MODEL}")
+    else:
+        print("[AI] ⚠️ GROQ_API_KEY не задан")
+
+
+init_db()
+print(f"[DB] Using {'PostgreSQL' if USE_POSTGRES else 'SQLite'}")
+migrate_ts_once()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
