@@ -418,7 +418,10 @@ async def get_screenshot_req(x_api_key: str = Header(default="")):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     with _state_lock:
-        pending = [{"iid": iid} for iid, r in SCREENSHOT_REQUESTS.items() if not r.get("done")]
+        pending = [
+            {"iid": iid, "requested_at": r.get("requested_at", 0)}
+            for iid, r in SCREENSHOT_REQUESTS.items() if not r.get("done")
+        ]
     return {"requests": pending}
 
 
