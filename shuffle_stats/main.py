@@ -196,7 +196,7 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_player_ts ON player_activity(ts)")
     execute("CREATE INDEX IF NOT EXISTS idx_player_user ON player_activity(username)")
 
-        # --- bets (выигрышные ставки ≥50$) ---
+    # --- bets: выигрышные ставки ≥50$ ---
     if USE_POSTGRES:
         execute("""
             CREATE TABLE IF NOT EXISTS bets (
@@ -233,7 +233,7 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_bets_chat ON bets(chat)")
     execute("CREATE INDEX IF NOT EXISTS idx_bets_sender ON bets(sender)")
 
-    # meta (для watchlist и прочего)
+    # meta
     execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
 
 
@@ -272,6 +272,7 @@ class PlayerActivityIn(BaseModel):
     chat: str
     text: str = ""
 
+
 class BetIn(BaseModel):
     ts: Optional[float] = None
     chat: str
@@ -309,9 +310,11 @@ def meta_get(k, default=None):
 
 
 def meta_set(k, v):
-    execute("INSERT OR REPLACE INTO meta (k,v) VALUES (?,?)" if not USE_POSTGRES
-            else "INSERT INTO meta (k,v) VALUES (%s,%s) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v",
-            (k, str(v)))
+    if USE_POSTGRES:
+        execute("INSERT INTO meta (k,v) VALUES (%s,%s) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v",
+                (k, str(v)))
+    else:
+        execute("INSERT OR REPLACE INTO meta (k,v) VALUES (?,?)", (k, str(v)))
 
 
 # ==================== API ДЛЯ СКРИПТА ====================
@@ -325,9 +328,7 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
     ts_val = event.ts if event.ts else time.time()
     created = event.created_at or datetime.fromtimestamp(ts_val, tz=timezone.utc).isoformat()
 
-    # Защита от дублей: sender + receivers + amount + округлённый ts (±2 сек)
-    ts_round = int(ts_val)
-    recv_str = ",".join(sorted(event.receivers or []))
+    # Защита от дублей (±2 сек)
     dup = query_one("""
         SELECT id FROM events
         WHERE type=? AND chat=? AND sender=? AND receivers=? AND amount_text=?
@@ -335,7 +336,7 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
         LIMIT 1
     """, (event.type, event.chat, event.sender,
           json.dumps(event.receivers or [], ensure_ascii=False),
-          event.amount_text, ts_round))
+          event.amount_text, ts_val))
     if dup:
         return {"ok": True, "dup": True}
 
@@ -444,13 +445,12 @@ async def upload_screenshot(
     return {"ok": True}
 
 
-# ==================== WATCHLIST (двусторонняя) ====================
+# ==================== WATCHLIST ====================
 DEFAULT_WATCHLIST = ["Fab", "Fab434", "fab434"]
 
 
 @app.get("/api/watchlist")
 async def get_watchlist():
-    """Скрипт опрашивает. Возвращает список из meta."""
     v = meta_get("watchlist")
     if not v:
         return {"players": DEFAULT_WATCHLIST}
@@ -499,11 +499,13 @@ async def get_status():
     tips = query_one("SELECT COUNT(*) AS c FROM events WHERE type='tip'") or {"c": 0}
     rains = query_one("SELECT COUNT(*) AS c FROM events WHERE type='rain'") or {"c": 0}
     first = query_one("SELECT MIN(ts) AS m FROM events") or {"m": None}
+    bets_count = query_one("SELECT COUNT(*) AS c FROM bets") or {"c": 0}
     return {
         "first_ts": first.get("m"),
         "total": s.get("c", 0),
         "tips": tips.get("c", 0),
         "rains": rains.get("c", 0),
+        "bets": bets_count.get("c", 0),
         "instances": instances,
     }
 
@@ -586,7 +588,6 @@ async def api_chart(
 
 @app.get("/api/days")
 async def api_days():
-    """Список дней с событиями + хеш дня (короткий) для идентификации."""
     if USE_POSTGRES:
         day_expr = "to_char(to_timestamp(ts), 'YYYY-MM-DD')"
     else:
@@ -600,7 +601,6 @@ async def api_days():
     out = []
     for r in rows:
         d = r["day"]
-        # короткий хеш — первые 6 символов md5 от даты + кол-ва событий
         import hashlib
         h = hashlib.md5(f"{d}|{r['cnt']}".encode()).hexdigest()[:6]
         out.append({"day": d, "count": r["cnt"], "rains": r["rains"], "tips": r["tips"], "hash": h})
@@ -617,7 +617,7 @@ async def api_chats():
 async def api_bulk(
     since: Optional[float] = None,
     until: Optional[float] = None,
-    senders: Optional[str] = None,   # comma-separated
+    senders: Optional[str] = None,
     limit: int = 500,
 ):
     q = "SELECT * FROM bulk_alerts WHERE 1=1"
@@ -672,9 +672,17 @@ async def api_player(
     return {"rows": rows, "hourly": hourly}
 
 
+@app.get("/api/player_names")
+async def api_player_names():
+    rows = query_all("SELECT DISTINCT username FROM player_activity ORDER BY username")
+    return {"names": [r["username"] for r in rows]}
+
+
+# ==================== BETS API ====================
 @app.get("/api/bets")
 async def api_bets(
     since: Optional[float] = None,
+    until: Optional[float] = None,
     chat: Optional[str] = None,
     sender: Optional[str] = None,
     min_usd: Optional[float] = None,
@@ -683,6 +691,7 @@ async def api_bets(
     q = "SELECT * FROM bets WHERE 1=1"
     p = []
     if since is not None: q += " AND ts >= ?"; p.append(since)
+    if until is not None: q += " AND ts <= ?"; p.append(until)
     if chat: q += " AND chat = ?"; p.append(chat)
     if sender: q += " AND sender LIKE ?"; p.append(f"%{sender}%")
     if min_usd is not None: q += " AND amount_usd >= ?"; p.append(min_usd)
@@ -693,7 +702,6 @@ async def api_bets(
 
 @app.get("/api/bets_stats")
 async def api_bets_stats():
-    """Статистика: сколько выигрышных ставок было в каждом чате за последние 24ч."""
     since = time.time() - 86400
     rows = query_all("""
         SELECT chat, COUNT(*) AS cnt, COALESCE(SUM(amount_usd),0) AS total_usd,
@@ -703,11 +711,14 @@ async def api_bets_stats():
     return {"stats": rows}
 
 
-@app.get("/api/player_names")
-async def api_player_names():
-    """Список ников, которые есть в player_activity (для вкладок)."""
-    rows = query_all("SELECT DISTINCT username FROM player_activity ORDER BY username")
-    return {"names": [r["username"] for r in rows]}
+@app.get("/api/bets_top_senders")
+async def api_bets_top_senders():
+    since = time.time() - 7 * 86400
+    rows = query_all("""
+        SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_usd),0) AS total_usd
+        FROM bets WHERE ts >= ? GROUP BY sender ORDER BY total_usd DESC LIMIT 30
+    """, (since,))
+    return {"senders": rows}
 
 
 @app.get("/api/health")
@@ -832,7 +843,7 @@ async def get_user(nickname: str):
     }
 
 
-# ==================== MONITOR DASHBOARD (полностью новый) ====================
+# ==================== MONITOR DASHBOARD ====================
 MONITOR_HTML = r"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -881,12 +892,11 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
   display:inline-flex;align-items:center;gap:6px}
 .chip .x{color:#f87171;cursor:pointer;font-weight:bold;padding:0 2px}
 .chip .x:hover{color:#ef4444}
-.tab-head{display:flex;align-items:center;margin-bottom:8px}
-.tab-head h2{font-size:15px;margin:0;color:#e6e6e6}
 .player-tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:12px;border-bottom:1px solid #2a2f3a;padding-bottom:8px}
 .player-tab{background:#1a1f28;border:1px solid #2a2f3a;color:#aab;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;position:relative}
 .player-tab.active{background:#202633;color:#fff;border-color:#2f3d55}
 .player-tab .rm{color:#f87171;margin-left:8px;cursor:pointer;font-weight:bold}
+.bet-row{color:#71d68a}
 </style></head><body>
 <header>
   <h1>🎰 Shuffle Monitor</h1>
@@ -899,7 +909,7 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     <span class="hint-btn" data-hint="Статус всех Chrome-инстансов на Windows-сервере.&#10;&#10;• Зелёный (ok) — работает&#10;• Жёлтый (waiting/rotating) — ждёт или переключает чат&#10;• Красный (verify_error/error/timeout) — смотри текст ошибки&#10;• Серый (offline) — нет связи с скриптом >40 сек&#10;&#10;Кнопка 📸 делает скриншот текущей вкладки (5-15 сек).">?</span>
   </button>
   <button data-tab="events">События
-    <span class="hint-btn" data-hint="Все tips и rains из БД.&#10;&#10;Фильтры:&#10;• Отправитель — поиск по подстроке&#10;• Чат, тип, мин. сумма&#10;• Дни — выбери конкретный день из списка или Today&#10;&#10;Хеш дня (короткий) помогает идентифицировать дату если пересылаешь в ТГ.">?</span>
+    <span class="hint-btn" data-hint="Все tips и rains из БД.&#10;&#10;Фильтры:&#10;• Отправитель — поиск по подстроке&#10;• Чат, тип, мин. сумма&#10;• Дни — выбери конкретный день из списка&#10;&#10;Хеш дня помогает идентифицировать дату.">?</span>
   </button>
   <button data-tab="chart">График
     <span class="hint-btn" data-hint="Распределение событий по часам суток.&#10;&#10;Переключи тип события (Все / Rain / Tip) и чат.&#10;Верхний график — количество, нижний — сумма в рублях.">?</span>
@@ -907,11 +917,11 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
   <button data-tab="bulk">Bulk-раздачи
     <span class="hint-btn" data-hint="Срабатывает, когда один отправитель шлёт одинаковую сумму 3+ людям за 20 мин.&#10;&#10;Фильтр:&#10;• Введи ник → Enter → добавится чип&#10;• Крестик на чипе — удалить&#10;• Несколько чипов = OR-фильтр">?</span>
   </button>
-  <button data-tab="player">Активность
-    <span class="hint-btn" data-hint="Сообщения конкретных игроков во всех чатах.&#10;&#10;Watch-лист синхронизируется со скриптом:&#10;• Введи ник → Add → скрипт подхватит через 30 сек&#10;• X на вкладке игрока — удалить из слежки&#10;&#10;График показывает, в какие часы игрок обычно пишет.">?</span>
-  </button>
   <button data-tab="bets">Ставки
-    <span class="hint-btn" data-hint="Только ВЫИГРЫШНЫЕ ставки ≥50$.&#10;&#10;Скрипт парсит сообщения «Поделился ставкой» в чате,&#10;проверяет зелёный цвет суммы = выигрыш,&#10;и если она ≥50$ — сохраняет здесь.&#10;&#10;Фильтр:&#10;• All — все чаты&#10;• ENGLISH/RUSSIAN/… — конкретный чат&#10;• Sender — поиск по нику&#10;&#10;Кнопка 📊 вверху показывает статистику по чатам.">?</span>
+    <span class="hint-btn" data-hint="Только ВЫИГРЫШНЫЕ ставки ≥50$.&#10;&#10;Скрипт парсит сообщения «Поделился ставкой» в чате,&#10;проверяет зелёный цвет суммы = выигрыш,&#10;и если она ≥50$ — сохраняет здесь.&#10;&#10;Фильтр:&#10;• All — все чаты&#10;• ENGLISH/RUSSIAN/… — конкретный чат&#10;• Sender — поиск по нику&#10;&#10;Кнопка 📊 показывает статистику по чатам за 24ч.">?</span>
+  </button>
+  <button data-tab="player">Активность
+    <span class="hint-btn" data-hint="Сообщения конкретных игроков во всех чатах.&#10;&#10;Watch-лист синхронизируется со скриптом:&#10;• Введи ник → Add → скрипт подхватит через 15 сек&#10;• X на вкладке игрока — удалить из слежки&#10;&#10;График показывает, в какие часы игрок обычно пишет.">?</span>
   </button>
 </div>
 <main>
@@ -957,18 +967,6 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     <tbody id="bulkBody"></tbody></table>
   </div>
 
-  <div id="tab-player" style="display:none">
-    <div class="row-flex">
-      <input type="text" id="pNewPlayer" placeholder="Новый ник для слежки">
-      <button class="btn" onclick="addPlayer()">+ Add</button>
-      <select id="pChat"><option value="">Все чаты</option></select>
-      <span class="hint">Скрипт подхватит изменения за ≤30 сек</span>
-    </div>
-    <div class="player-tabs" id="playerTabs"></div>
-    <div class="chart-wrap"><canvas id="playerHour" height="60"></canvas></div>
-    <table><thead><tr><th>Время</th><th>Игрок</th><th>Чат</th><th>Сообщение</th></tr></thead>
-    <tbody id="plBody"></tbody></table>
-  </div>
   <div id="tab-bets" style="display:none">
     <div class="row-flex">
       <input type="text" id="betSender" placeholder="Отправитель">
@@ -976,6 +974,7 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
       <input type="number" id="betMinUsd" placeholder="Мин. $ (по умолч. 50)" value="50">
       <button class="btn" onclick="loadBets()">Фильтр</button>
       <button class="btn" onclick="loadBetsStats()">📊 По чатам (24ч)</button>
+      <button class="btn" onclick="loadBetsTop()">🏆 Топ игроков (7д)</button>
     </div>
     <div id="betStats" style="margin-bottom:16px"></div>
     <table><thead><tr>
@@ -983,6 +982,19 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
       <th>Множитель</th><th>Сумма</th><th>$</th><th>₽</th>
     </tr></thead>
     <tbody id="betsBody"></tbody></table>
+  </div>
+
+  <div id="tab-player" style="display:none">
+    <div class="row-flex">
+      <input type="text" id="pNewPlayer" placeholder="Новый ник для слежки">
+      <button class="btn" onclick="addPlayer()">+ Add</button>
+      <select id="pChat"><option value="">Все чаты</option></select>
+      <span class="hint">Скрипт подхватит изменения за ≤15 сек</span>
+    </div>
+    <div class="player-tabs" id="playerTabs"></div>
+    <div class="chart-wrap"><canvas id="playerHour" height="60"></canvas></div>
+    <table><thead><tr><th>Время</th><th>Игрок</th><th>Чат</th><th>Сообщение</th></tr></thead>
+    <tbody id="plBody"></tbody></table>
   </div>
 </main>
 
@@ -1001,14 +1013,14 @@ let currentPlayer = null;
 
 function switchTab(name){
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
-  ['status','events','chart','bulk','player'].forEach(t=>{
+  ['status','events','chart','bulk','bets','player'].forEach(t=>{
     $('tab-'+t).style.display = (t===name) ? '' : 'none';
   });
   if(name==='events') { loadDays(); loadEvents(); }
   if(name==='chart') loadChart();
   if(name==='bulk') loadBulk();
+  if(name==='bets') { loadChats(); loadBets(); }
   if(name==='player') loadPlayers();
-  if(name==='bets') { loadBets(); loadChats(); }
 }
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 
@@ -1018,12 +1030,13 @@ async function refreshStatus(){
     $('uptime').textContent = r.first_ts
       ? 'Мониторинг с ' + new Date(r.first_ts*1000).toLocaleString('ru-RU')
       : 'Мониторинг только запущен';
-    $('kpiTotal').textContent = `Всего: ${r.total||0} | Tips: ${r.tips||0} | Rains: ${r.rains||0}`;
+    $('kpiTotal').textContent = `Всего: ${r.total||0} | Tips: ${r.tips||0} | Rains: ${r.rains||0} | Bets: ${r.bets||0}`;
     const now = Date.now()/1000;
     $('kpiRow').innerHTML = `
       <div>Всего событий<b>${r.total||0}</b></div>
       <div>Tips<b>${r.tips||0}</b></div>
       <div>Rains<b>${r.rains||0}</b></div>
+      <div>Bets ≥50$<b>${r.bets||0}</b></div>
       <div>Вкладок онлайн<b>${(r.instances||[]).filter(i=>now - (i.updated_at||0) < 40).length}</b></div>`;
     const body = $('instBody'); body.innerHTML = '';
     (r.instances||[]).forEach(i=>{
@@ -1067,7 +1080,8 @@ async function reqShot(iid){
 async function loadChats(){
   const r = await fetch('/api/chats').then(r=>r.json());
   ['fChat','cChat','pChat','betChat'].forEach(id=>{
-    const sel = $(id); const cur = sel.value;
+    const sel = $(id); if(!sel) return;
+    const cur = sel.value;
     sel.innerHTML = '<option value="">Все чаты</option>' +
       r.chats.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
     sel.value = cur;
@@ -1199,6 +1213,59 @@ async function loadBulk(){
   });
 }
 
+// ---------- Bets ----------
+async function loadBets(){
+  const p = new URLSearchParams();
+  if($('betSender').value) p.set('sender',$('betSender').value);
+  if($('betChat').value) p.set('chat',$('betChat').value);
+  if($('betMinUsd').value) p.set('min_usd',$('betMinUsd').value);
+  const r = await fetch('/api/bets?'+p).then(r=>r.json());
+  const body = $('betsBody'); body.innerHTML='';
+  if(!r.bets.length){
+    body.innerHTML = '<tr><td colspan="8" class="hint">Нет выигрышных ставок ≥50$</td></tr>';
+    return;
+  }
+  r.bets.forEach(b=>{
+    const tr = document.createElement('tr');
+    tr.className = 'bet-row';
+    tr.innerHTML = `<td>${fmtTime(b.ts)}</td>
+      <td>${esc(b.chat)}</td>
+      <td><b>${esc(b.sender)}</b></td>
+      <td>${esc(b.game)}</td>
+      <td>${esc(b.multiplier)}</td>
+      <td>${esc(b.amount_text)} ${esc(b.crypto)}</td>
+      <td style="color:#71d68a;font-weight:bold">$${fmtMoney(b.amount_usd)}</td>
+      <td>${fmtMoney(b.amount_rub)}</td>`;
+    body.appendChild(tr);
+  });
+}
+
+async function loadBetsStats(){
+  const r = await fetch('/api/bets_stats').then(r=>r.json());
+  const el = $('betStats');
+  if(!r.stats.length){
+    el.innerHTML = '<p class="hint">За последние 24ч выигрышных ставок ≥50$ не было</p>';
+    return;
+  }
+  el.innerHTML = '<div class="kpi">' + r.stats.map(s => `
+    <div>${esc(s.chat)}<b>${s.cnt} шт.</b>
+      <span class="hint">$${fmtMoney(s.total_usd)} (avg $${fmtMoney(s.avg_usd)})</span>
+    </div>`).join('') + '</div>';
+}
+
+async function loadBetsTop(){
+  const r = await fetch('/api/bets_top_senders').then(r=>r.json());
+  const el = $('betStats');
+  if(!r.senders.length){
+    el.innerHTML = '<p class="hint">За последние 7 дней выигрышных ставок ≥50$ не было</p>';
+    return;
+  }
+  el.innerHTML = '<div class="kpi">' + r.senders.map(s => `
+    <div>${esc(s.nickname)}<b>${s.cnt} шт.</b>
+      <span class="hint">$${fmtMoney(s.total_usd)}</span>
+    </div>`).join('') + '</div>';
+}
+
 // ---------- Players ----------
 async function loadPlayers(){
   const wl = await fetch('/api/watchlist').then(r=>r.json());
@@ -1227,10 +1294,10 @@ async function selectPlayer(name){
 async function addPlayer(){
   const v = $('pNewPlayer').value.trim();
   if(!v) return;
-  const r = await fetch('/api/watchlist/add', {
+  await fetch('/api/watchlist/add', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({name: v})
-  }).then(r=>r.json());
+  });
   $('pNewPlayer').value = '';
   currentPlayer = v;
   await loadPlayers();
@@ -1272,47 +1339,8 @@ async function loadPlayerActivity(){
   });
 }
 
-async function loadBets(){
-  const p = new URLSearchParams();
-  if($('betSender').value) p.set('sender',$('betSender').value);
-  if($('betChat').value) p.set('chat',$('betChat').value);
-  if($('betMinUsd').value) p.set('min_usd',$('betMinUsd').value);
-  const r = await fetch('/api/bets?'+p).then(r=>r.json());
-  const body = $('betsBody'); body.innerHTML='';
-  if(!r.bets.length){
-    body.innerHTML = '<tr><td colspan="8" class="hint">Нет выигрышных ставок ≥50$</td></tr>';
-    return;
-  }
-  r.bets.forEach(b=>{
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${fmtTime(b.ts)}</td>
-      <td>${esc(b.chat)}</td>
-      <td><b>${esc(b.sender)}</b></td>
-      <td>${esc(b.game)}</td>
-      <td>${esc(b.multiplier)}</td>
-      <td>${esc(b.amount_text)} ${esc(b.crypto)}</td>
-      <td style="color:#71d68a;font-weight:bold">$${fmtMoney(b.amount_usd)}</td>
-      <td>${fmtMoney(b.amount_rub)}</td>`;
-    body.appendChild(tr);
-  });
-}
-
-async function loadBetsStats(){
-  const r = await fetch('/api/bets_stats').then(r=>r.json());
-  const el = $('betStats');
-  if(!r.stats.length){
-    el.innerHTML = '<p class="hint">За последние 24ч выигрышных ставок не было</p>';
-    return;
-  }
-  el.innerHTML = '<div class="kpi">' + r.stats.map(s => `
-    <div>${esc(s.chat)}<b>${s.cnt} шт.</b>
-      <span class="hint">$${fmtMoney(s.total_usd)} (avg $${fmtMoney(s.avg_usd)})</span>
-    </div>`).join('') + '</div>';
-}
-
 $('pChat') && $('pChat').addEventListener('change', loadPlayerActivity);
 
-// init
 renderBulkChips();
 loadChats();
 refreshStatus();
@@ -1326,7 +1354,7 @@ async def monitor_page():
     return MONITOR_HTML
 
 
-# ==================== БАЗОВЫЙ HTML ====================
+# ==================== BASE HTML ====================
 BASE_HTML = """<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
