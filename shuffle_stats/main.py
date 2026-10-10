@@ -3,6 +3,7 @@ import json
 import sqlite3
 import time
 import threading
+import re
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import List, Optional
@@ -10,6 +11,9 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from pydantic import BaseModel
+
+import requests
+from bs4 import BeautifulSoup
 
 # ==================== КОНФИГ ====================
 DB_PATH = os.environ.get("DB_PATH", "shuffle.db")
@@ -35,6 +39,10 @@ app = FastAPI(title="Shuffle Rain & Tips Stats")
 _state_lock = threading.Lock()
 INSTANCE_STATES = {}
 SCREENSHOT_REQUESTS = {}
+
+# --- Промокоды ---
+PROMO_CHANNEL = os.environ.get("PROMO_CHANNEL", "anyclaimershuffle")
+PROMO_PARSE_INTERVAL = 5 * 60
 
 
 # ==================== БАЗА ====================
@@ -236,7 +244,6 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_bets_chat ON bets(chat)")
     execute("CREATE INDEX IF NOT EXISTS idx_bets_sender ON bets(sender)")
 
-    # --- intents: обещания сделать дождь (детект через Groq) ---
     if USE_POSTGRES:
         execute("""
             CREATE TABLE IF NOT EXISTS intents (
@@ -264,6 +271,36 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_intents_ts ON intents(ts)")
     execute("CREATE INDEX IF NOT EXISTS idx_intents_chat ON intents(chat)")
     execute("CREATE INDEX IF NOT EXISTS idx_intents_sender ON intents(sender)")
+
+    # --- promocodes ---
+    if USE_POSTGRES:
+        execute("""
+            CREATE TABLE IF NOT EXISTS promocodes (
+                id SERIAL PRIMARY KEY,
+                tg_msg_id TEXT UNIQUE,
+                text TEXT NOT NULL,
+                link TEXT,
+                message_date TEXT,
+                discovered_at DOUBLE PRECISION,
+                used INTEGER DEFAULT 0,
+                used_at DOUBLE PRECISION
+            )
+        """)
+    else:
+        execute("""
+            CREATE TABLE IF NOT EXISTS promocodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_msg_id TEXT UNIQUE,
+                text TEXT NOT NULL,
+                link TEXT,
+                message_date TEXT,
+                discovered_at REAL,
+                used INTEGER DEFAULT 0,
+                used_at REAL
+            )
+        """)
+    execute("CREATE INDEX IF NOT EXISTS idx_promo_used ON promocodes(used)")
+    execute("CREATE INDEX IF NOT EXISTS idx_promo_date ON promocodes(discovered_at)")
 
     execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
 
@@ -471,7 +508,6 @@ async def add_intent(body: IntentIn, x_api_key: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Invalid API key")
     ts_val = body.ts if body.ts else time.time()
 
-    # Защита от дублей: тот же sender + text в том же чате за 60 сек
     dup = query_one("""
         SELECT id FROM intents
         WHERE chat=? AND sender=? AND text=? AND ABS(ts - ?) < 60
@@ -486,7 +522,6 @@ async def add_intent(body: IntentIn, x_api_key: str = Header(default="")):
         VALUES ({p},{p},{p},{p},NULL,NULL)
     """, (ts_val, body.chat, body.sender, body.text))
 
-    # Пытаемся найти дождь этим же игроком в течение 5 минут после интента
     WINDOW = 300
     rain = query_one("""
         SELECT id, ts FROM events
@@ -601,6 +636,122 @@ async def watchlist_remove(body: dict):
     players = [p for p in players if p != name]
     meta_set("watchlist", json.dumps(players, ensure_ascii=False))
     return {"ok": True, "players": players}
+
+
+# ==================== МОНИТОРИНГ ПРОМОКОДОВ ====================
+def fetch_promo_channel():
+    url = f"https://t.me/s/{PROMO_CHANNEL}"
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        }
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            print(f"[PROMO] ⚠️ HTTP {r.status_code}")
+            return []
+        soup = BeautifulSoup(r.text, "html.parser")
+        messages = []
+        for wrap in soup.select(".tgme_widget_message_wrap"):
+            msg_el = wrap.select_one(".tgme_widget_message")
+            if not msg_el:
+                continue
+            data_post = msg_el.get("data-post", "")
+            if not data_post:
+                continue
+            tg_msg_id = data_post
+            time_el = wrap.select_one("time")
+            msg_date = time_el.get("datetime", "") if time_el else ""
+            text_el = wrap.select_one(".tgme_widget_message_text")
+            text = text_el.get_text("\n", strip=True) if text_el else ""
+            if not text:
+                continue
+            link = f"https://t.me/{data_post}"
+            messages.append({
+                "tg_msg_id": tg_msg_id,
+                "text": text,
+                "link": link,
+                "message_date": msg_date,
+            })
+        return messages
+    except Exception as e:
+        print(f"[PROMO] ❌ {type(e).__name__}: {e}")
+        return []
+
+
+def promo_parser_thread():
+    time.sleep(10)
+    while True:
+        try:
+            messages = fetch_promo_channel()
+            new_count = 0
+            for m in messages:
+                exists = query_one(
+                    "SELECT id FROM promocodes WHERE tg_msg_id=?",
+                    (m["tg_msg_id"],)
+                )
+                if exists:
+                    continue
+                p = ph()
+                execute(f"""
+                    INSERT INTO promocodes (tg_msg_id, text, link, message_date, discovered_at, used)
+                    VALUES ({p},{p},{p},{p},{p},0)
+                """, (m["tg_msg_id"], m["text"], m["link"], m["message_date"], time.time()))
+                new_count += 1
+            if new_count > 0:
+                print(f"[PROMO] ✅ +{new_count} новых сообщений из @{PROMO_CHANNEL}")
+            else:
+                print(f"[PROMO] Проверено, новых нет ({len(messages)} в канале)")
+        except Exception as e:
+            print(f"[PROMO] ❌ {type(e).__name__}: {e}")
+        time.sleep(PROMO_PARSE_INTERVAL)
+
+
+@app.get("/api/promocodes")
+async def api_promocodes(only_unused: Optional[int] = None, limit: int = 200):
+    q = "SELECT * FROM promocodes WHERE 1=1"
+    p = []
+    if only_unused == 1:
+        q += " AND used = 0"
+    q += " ORDER BY discovered_at DESC LIMIT ?"
+    p.append(limit)
+    return {"promos": query_all(q, tuple(p))}
+
+
+@app.post("/api/promo/toggle/{promo_id}")
+async def api_promo_toggle(promo_id: int):
+    row = query_one("SELECT id, used FROM promocodes WHERE id=?", (promo_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="not found")
+    new_used = 0 if row["used"] else 1
+    used_at = time.time() if new_used else None
+    execute("UPDATE promocodes SET used=?, used_at=? WHERE id=?",
+            (new_used, used_at, promo_id))
+    return {"ok": True, "used": new_used}
+
+
+@app.get("/api/promocodes/stats")
+async def api_promocodes_stats():
+    total = (query_one("SELECT COUNT(*) AS c FROM promocodes") or {}).get("c", 0)
+    used = (query_one("SELECT COUNT(*) AS c FROM promocodes WHERE used=1") or {}).get("c", 0)
+    return {"total": total, "used": used, "unused": total - used}
+
+
+@app.post("/api/promo/test")
+async def api_promo_test():
+    messages = fetch_promo_channel()
+    new_count = 0
+    for m in messages:
+        exists = query_one("SELECT id FROM promocodes WHERE tg_msg_id=?", (m["tg_msg_id"],))
+        if exists:
+            continue
+        p = ph()
+        execute(f"""
+            INSERT INTO promocodes (tg_msg_id, text, link, message_date, discovered_at, used)
+            VALUES ({p},{p},{p},{p},{p},0)
+        """, (m["tg_msg_id"], m["text"], m["link"], m["message_date"], time.time()))
+        new_count += 1
+    return {"ok": True, "found": len(messages), "new": new_count}
 
 
 # ==================== API ДЛЯ UI ====================
@@ -1107,6 +1258,13 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
 .player-tab.active{background:#202633;color:#fff;border-color:#2f3d55}
 .player-tab .rm{color:#f87171;margin-left:8px;cursor:pointer;font-weight:bold}
 .bet-row{color:#71d68a}
+.promo-card{background:#151821;border:1px solid #232a37;border-radius:8px;padding:12px 16px;margin-bottom:10px;display:flex;gap:12px;align-items:flex-start}
+.promo-card.used{opacity:0.5}
+.promo-cb{width:22px;height:22px;margin-top:3px;cursor:pointer;accent-color:#71d68a}
+.promo-body{flex:1}
+.promo-text{white-space:pre-wrap;font-size:13px;line-height:1.5;color:#e6e6e6}
+.promo-meta{font-size:11px;color:#8b93a7;margin-top:6px}
+.promo-meta a{color:#7cc4ff;text-decoration:none}
 </style></head><body>
 <header>
   <h1>🎰 Shuffle Monitor</h1>
@@ -1138,6 +1296,9 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
   </button>
   <button data-tab="intents">Интенты
     <span class="hint-btn" data-hint="Обещания сделать дождь, найденные нейронкой Groq.&#10;&#10;Логика:&#10;• Groq анализирует каждое сообщение с ключевым словом (rain, залью, дождь...)&#10;• Если это интент — сохраняется здесь&#10;• Если в течение 5 минут после интента идёт rain от того же ника — считается СБЫЛОСЬ&#10;&#10;Кнопка 🏆 показывает рейтинг: % сбывшихся обещаний по игрокам.">?</span>
+  </button>
+  <button data-tab="promos">Промокоды
+    <span class="hint-btn" data-hint="Автоматически собирает последние сообщения из Telegram-канала.&#10;&#10;Каждое сообщение — с чекбоксом «использован».&#10;Отмечай когда активировал код, чтобы видеть что ещё не взял.&#10;&#10;Кнопка 🔍 Проверить сейчас — ручной запуск парсера.&#10;Обычно проверяется автоматически раз в 5 минут.">?</span>
   </button>
 </div>
 <main>
@@ -1243,6 +1404,20 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     </tr></thead>
     <tbody id="intBody"></tbody></table>
   </div>
+
+  <div id="tab-promos" style="display:none">
+    <div class="row-flex">
+      <select id="promoFilter">
+        <option value="">Все</option>
+        <option value="0">Только неиспользованные</option>
+        <option value="1">Только использованные</option>
+      </select>
+      <button class="btn" onclick="loadPromos()">Обновить</button>
+      <button class="btn" onclick="testPromo()">🔍 Проверить сейчас</button>
+      <span class="hint" id="promoStats"></span>
+    </div>
+    <div id="promoList"></div>
+  </div>
 </main>
 
 <div class="modal" id="imgModal" onclick="this.classList.remove('on')">
@@ -1260,7 +1435,7 @@ let currentPlayer = null;
 
 function switchTab(name){
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
-  ['status','events','chart','bulk','bets','player','contexts','intents'].forEach(t=>{
+  ['status','events','chart','bulk','bets','player','contexts','intents','promos'].forEach(t=>{
     $('tab-'+t).style.display = (t===name) ? '' : 'none';
   });
   if(name==='events') { loadDays(); loadEvents(); }
@@ -1270,6 +1445,7 @@ function switchTab(name){
   if(name==='player') loadPlayers();
   if(name==='contexts') { loadChats(); loadContexts(); }
   if(name==='intents') { loadChats(); loadIntents(); }
+  if(name==='promos') loadPromos();
 }
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 
@@ -1408,7 +1584,6 @@ async function loadChart(){
   });
 }
 
-// ---------- Bulk chips ----------
 function renderBulkChips(){
   const el = $('bulkChips');
   if(bulkChips.length === 0){
@@ -1468,7 +1643,6 @@ async function loadBulk(){
   });
 }
 
-// ---------- Bets ----------
 async function loadBets(){
   const p = new URLSearchParams();
   if($('betSender').value) p.set('sender',$('betSender').value);
@@ -1521,7 +1695,6 @@ async function loadBetsTop(){
     </div>`).join('') + '</div>';
 }
 
-// ---------- Players ----------
 async function loadPlayers(){
   const wl = await fetch('/api/watchlist').then(r=>r.json());
   const names = wl.players || [];
@@ -1596,7 +1769,6 @@ async function loadPlayerActivity(){
 
 $('pChat') && $('pChat').addEventListener('change', loadPlayerActivity);
 
-// ---------- Contexts ----------
 async function loadContexts(){
   const p = new URLSearchParams();
   if($('ctxChat').value) p.set('chat',$('ctxChat').value);
@@ -1604,7 +1776,7 @@ async function loadContexts(){
   const r = await fetch('/api/contexts?'+p).then(r=>r.json());
   const el = $('ctxList');
   if(!r.contexts.length){
-    el.innerHTML = '<p class="hint">Нет сохранённых контекстов. Дожди пока не было или контекст не передавался.</p>';
+    el.innerHTML = '<p class="hint">Нет сохранённых контекстов.</p>';
     return;
   }
   el.innerHTML = r.contexts.map(c => {
@@ -1627,7 +1799,7 @@ async function loadContexts(){
       return `<div style="padding:4px 8px;border-left:3px solid #71d68a;margin:4px 0;color:#71d68a;font-size:12px">
         🎰 <b>${esc(b.sender||'?')}</b> · ${esc(b.game||'')} · ${esc(bMult)} · ${esc(bAmt)}${bRub}${bUsd}
       </div>`;
-    }).join('') : '<div class="hint">Нет выигрышных ставок в контексте</div>';
+    }).join('') : '<div class="hint">Нет выигрышных ставок</div>';
 
     return `
     <div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px;margin-bottom:12px">
@@ -1656,7 +1828,6 @@ async function loadContexts(){
   }).join('');
 }
 
-// ---------- Intents ----------
 async function loadIntents(){
   const p = new URLSearchParams();
   if($('intChat').value) p.set('chat',$('intChat').value);
@@ -1699,6 +1870,56 @@ async function loadIntentsStats(){
       <span class="hint"><span class="pill ${cls}">${s.matched}/${s.total}</span></span>
     </div>`;
   }).join('') + '</div>';
+}
+
+// ---------- Promocodes ----------
+async function loadPromos(){
+  const filter = $('promoFilter').value;
+  const p = new URLSearchParams();
+  if(filter === '0') p.set('only_unused', '1');
+  const r = await fetch('/api/promocodes?'+p).then(r=>r.json());
+  const stats = await fetch('/api/promocodes/stats').then(r=>r.json());
+  $('promoStats').textContent = `Всего: ${stats.total} | Использовано: ${stats.used} | Осталось: ${stats.unused}`;
+
+  const el = $('promoList');
+  if(!r.promos.length){
+    el.innerHTML = '<p class="hint">Нет промокодов. Нажми «🔍 Проверить сейчас».</p>';
+    return;
+  }
+  const filtered = filter === '1' ? r.promos.filter(x => x.used) : r.promos;
+  if(!filtered.length){
+    el.innerHTML = '<p class="hint">Пусто по фильтру</p>';
+    return;
+  }
+  el.innerHTML = filtered.map(x => `
+    <div class="promo-card ${x.used ? 'used' : ''}">
+      <input type="checkbox" class="promo-cb" ${x.used ? 'checked' : ''} onchange="togglePromo(${x.id})">
+      <div class="promo-body">
+        <div class="promo-text">${esc(x.text)}</div>
+        <div class="promo-meta">
+          ${x.message_date ? '📅 ' + esc(x.message_date) : ''}
+          ${x.link ? ' · <a href="' + esc(x.link) + '" target="_blank">Открыть в TG</a>' : ''}
+          ${x.used && x.used_at ? ' · ✅ Использован ' + fmtTime(x.used_at) : ''}
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function togglePromo(id){
+  await fetch('/api/promo/toggle/'+id, {method:'POST'});
+  loadPromos();
+}
+
+async function testPromo(){
+  const btn = event.target;
+  btn.disabled = true; btn.textContent = '⏳ Парсинг...';
+  try {
+    const r = await fetch('/api/promo/test', {method:'POST'}).then(r=>r.json());
+    alert(`Найдено в канале: ${r.found}, новых: ${r.new}`);
+    loadPromos();
+  } catch(e){ alert('Ошибка: '+e.message); }
+  finally { btn.disabled = false; btn.textContent = '🔍 Проверить сейчас'; }
 }
 
 renderBulkChips();
@@ -1977,6 +2198,13 @@ async function clearDb() {
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page():
     return ADMIN_HTML
+
+
+# ==================== ЗАПУСК ФОНОВОГО ПОТОКА ====================
+@app.on_event("startup")
+async def startup_event():
+    threading.Thread(target=promo_parser_thread, daemon=True).start()
+    print(f"[PROMO] Поток мониторинга @{PROMO_CHANNEL} запущен (каждые {PROMO_PARSE_INTERVAL // 60} мин)")
 
 
 if __name__ == "__main__":
