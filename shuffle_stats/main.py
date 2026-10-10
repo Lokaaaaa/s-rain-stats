@@ -215,9 +215,25 @@ def init_db():
             created_at REAL, completed_at REAL)""")
     execute("CREATE INDEX IF NOT EXISTS idx_task_status ON chat_tasks(status)")
 
+    # --- chat_players: агрегированная статистика по игрокам ---
+    if USE_POSTGRES:
+        execute("""CREATE TABLE IF NOT EXISTS chat_players (
+            id SERIAL PRIMARY KEY, chat TEXT NOT NULL, username TEXT NOT NULL,
+            msg_count INTEGER DEFAULT 0, first_seen DOUBLE PRECISION, last_seen DOUBLE PRECISION,
+            UNIQUE(chat, username))""")
+    else:
+        execute("""CREATE TABLE IF NOT EXISTS chat_players (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT NOT NULL, username TEXT NOT NULL,
+            msg_count INTEGER DEFAULT 0, first_seen REAL, last_seen REAL,
+            UNIQUE(chat, username))""")
+    execute("CREATE INDEX IF NOT EXISTS idx_cp_chat ON chat_players(chat)")
+    execute("CREATE INDEX IF NOT EXISTS idx_cp_user ON chat_players(username)")
+    execute("CREATE INDEX IF NOT EXISTS idx_cp_last ON chat_players(last_seen)")
+
     execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
 
 
+# ==================== META ====================
 def meta_get(k, default=None):
     r = query_one("SELECT v FROM meta WHERE k=?", (k,))
     return r["v"] if r else default
@@ -235,6 +251,7 @@ def migrate_ts_once():
         done = meta_get("ts_migrated_v1")
         if done:
             return
+        print("[DB] Миграция ts...")
         if USE_POSTGRES:
             execute("""UPDATE events SET ts = EXTRACT(EPOCH FROM created_at::timestamptz)
                        WHERE ts IS NULL AND created_at IS NOT NULL""")
@@ -333,6 +350,17 @@ class ChatTaskCompleteIn(BaseModel):
     error: str = ""
 
 
+class PlayerStatItem(BaseModel):
+    name: str
+    msgs: int = 0
+    last_seen: float = 0.0
+
+
+class PlayersBatchIn(BaseModel):
+    chat: str
+    players: List[PlayerStatItem] = []
+
+
 # ==================== API ДЛЯ СКРИПТА ====================
 @app.post("/api/event")
 async def add_event(event: EventIn, x_api_key: str = Header(default="")):
@@ -415,6 +443,35 @@ async def add_intent(body: IntentIn, x_api_key: str = Header(default="")):
         execute("UPDATE intents SET matched_rain_id=?, matched_delta_sec=? WHERE chat=? AND sender=? AND text=? AND ABS(ts-?) < 60",
                 (rain["id"], delta, body.chat, body.sender, body.text, ts_val))
         print(f"[INTENT] ✅ {body.sender} обещал и залил через {delta}с ({body.chat})")
+    return {"ok": True}
+
+
+@app.post("/api/players_batch")
+async def add_players_batch(body: PlayersBatchIn, x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    now = time.time()
+    p = ph()
+    for pl in body.players:
+        name = (pl.name or "").strip()
+        if not name or name == "?":
+            continue
+        msgs = max(0, int(pl.msgs))
+        last_seen = float(pl.last_seen) or now
+        if USE_POSTGRES:
+            execute(f"""INSERT INTO chat_players (chat, username, msg_count, first_seen, last_seen)
+                VALUES ({p},{p},{p},{p},{p})
+                ON CONFLICT (chat, username) DO UPDATE
+                SET msg_count = chat_players.msg_count + EXCLUDED.msg_count,
+                    last_seen = GREATEST(chat_players.last_seen, EXCLUDED.last_seen)""",
+                (body.chat, name, msgs, last_seen, last_seen))
+        else:
+            execute(f"""INSERT INTO chat_players (chat, username, msg_count, first_seen, last_seen)
+                VALUES ({p},{p},{p},{p},{p})
+                ON CONFLICT (chat, username) DO UPDATE
+                SET msg_count = msg_count + excluded.msg_count,
+                    last_seen = MAX(last_seen, excluded.last_seen)""",
+                (body.chat, name, msgs, last_seen, last_seen))
     return {"ok": True}
 
 
@@ -648,42 +705,60 @@ def _process_chat_task_groq(task_id, chat_name, messages):
         f'"phrases": ["фраза 1", "фраза 2", "фраза 3", "фраза 4", "фраза 5"]}}'
     )
 
+    models_to_try = [GROQ_MODEL, "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+    content = None
+    last_error = ""
+    for model_name in models_to_try:
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": model_name,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Контекст чата:\n{context}"},
+                    ],
+                    "max_tokens": 800,
+                    "temperature": 0.8,
+                },
+                timeout=30,
+            )
+            if r.status_code == 200:
+                content = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                break
+            elif r.status_code == 404:
+                last_error = f"{model_name} not found"
+                print(f"[AI] ⚠️ Модель {model_name} недоступна, пробую следующую...")
+                continue
+            else:
+                last_error = f"HTTP {r.status_code}: {r.text[:150]}"
+                break
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {str(e)[:150]}"
+
+    if not content:
+        execute("UPDATE chat_tasks SET status='failed', error=?, completed_at=? WHERE id=?",
+                (last_error, time.time(), task_id))
+        print(f"[AI] ❌ Task #{task_id}: {last_error}")
+        return
+    m = re.search(r'\{[\s\S]*\}', content)
+    if not m:
+        execute("UPDATE chat_tasks SET status='failed', error='Groq вернул не-JSON', completed_at=? WHERE id=?",
+                (time.time(), task_id))
+        return
     try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Контекст чата:\n{context}"},
-                ],
-                "max_tokens": 800,
-                "temperature": 0.8,
-            },
-            timeout=30,
-        )
-        if r.status_code != 200:
-            execute("UPDATE chat_tasks SET status='failed', error=?, completed_at=? WHERE id=?",
-                    (f"Groq HTTP {r.status_code}: {r.text[:200]}", time.time(), task_id))
-            return
-        content = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-        m = re.search(r'\{[\s\S]*\}', content)
-        if not m:
-            execute("UPDATE chat_tasks SET status='failed', error='Groq вернул не-JSON', completed_at=? WHERE id=?",
-                    (time.time(), task_id))
-            return
         data = json.loads(m.group(0))
-        result = {"topic": data.get("topic", ""),
-                  "messages": data.get("messages", [])[:5],
-                  "phrases": data.get("phrases", [])[:5]}
-        execute("UPDATE chat_tasks SET status='completed', result=?, completed_at=? WHERE id=?",
-                (json.dumps(result, ensure_ascii=False), time.time(), task_id))
-        print(f"[AI] ✅ Task #{task_id} ({chat_name})")
     except Exception as e:
         execute("UPDATE chat_tasks SET status='failed', error=?, completed_at=? WHERE id=?",
-                (f"{type(e).__name__}: {str(e)[:200]}", time.time(), task_id))
-        print(f"[AI] ❌ Task #{task_id}: {e}")
+                (f"JSON parse: {e}", time.time(), task_id))
+        return
+    result = {"topic": data.get("topic", ""),
+              "messages": data.get("messages", [])[:5],
+              "phrases": data.get("phrases", [])[:5]}
+    execute("UPDATE chat_tasks SET status='completed', result=?, completed_at=? WHERE id=?",
+            (json.dumps(result, ensure_ascii=False), time.time(), task_id))
+    print(f"[AI] ✅ Task #{task_id} ({chat_name})")
 
 
 # ==================== AI ASSISTANT — для UI ====================
@@ -922,6 +997,50 @@ async def api_player_names():
     return {"names": [r["username"] for r in rows]}
 
 
+@app.get("/api/players")
+async def api_players(chat: Optional[str] = None, username: Optional[str] = None,
+                      online_only: Optional[int] = None, min_msgs: Optional[int] = None,
+                      limit: int = 500):
+    q = "SELECT chat, username, msg_count, first_seen, last_seen FROM chat_players WHERE 1=1"
+    p = []
+    if chat: q += " AND chat = ?"; p.append(chat)
+    if username: q += " AND username LIKE ?"; p.append(f"%{username}%")
+    if min_msgs is not None: q += " AND msg_count >= ?"; p.append(min_msgs)
+    if online_only == 1: q += " AND last_seen >= ?"; p.append(time.time() - 300)
+    q += " ORDER BY last_seen DESC NULLS LAST, msg_count DESC LIMIT ?" if USE_POSTGRES else " ORDER BY last_seen DESC, msg_count DESC LIMIT ?"
+    p.append(limit)
+    return {"players": query_all(q, tuple(p))}
+
+
+@app.get("/api/players_by_chat")
+async def api_players_by_chat():
+    cutoff = time.time() - 300
+    rows = query_all("""SELECT chat, COUNT(*) AS total_players,
+                        SUM(CASE WHEN last_seen >= ? THEN 1 ELSE 0 END) AS online_players,
+                        SUM(msg_count) AS total_messages
+                        FROM chat_players GROUP BY chat ORDER BY total_players DESC""", (cutoff,))
+    return {"chats": rows}
+
+
+@app.get("/api/players_stats")
+async def api_players_stats(chat: Optional[str] = None, limit: int = 50):
+    q_base = "SELECT chat, username, msg_count, first_seen, last_seen FROM chat_players WHERE 1=1"
+    p = []
+    if chat:
+        q_base += " AND chat = ?"; p.append(chat)
+    q_base += " ORDER BY msg_count DESC LIMIT ?"
+    p.append(limit)
+    top_by_msgs = query_all(q_base, tuple(p))
+    q_online = "SELECT chat, username, msg_count, first_seen, last_seen FROM chat_players WHERE last_seen >= ?"
+    p2 = [time.time() - 300]
+    if chat:
+        q_online += " AND chat = ?"; p2.append(chat)
+    q_online += " ORDER BY last_seen DESC LIMIT ?"
+    p2.append(limit)
+    recent_online = query_all(q_online, tuple(p2))
+    return {"top_by_msgs": top_by_msgs, "recent_online": recent_online}
+
+
 @app.get("/api/bets")
 async def api_bets(since: Optional[float] = None, until: Optional[float] = None,
                    chat: Optional[str] = None, sender: Optional[str] = None,
@@ -959,6 +1078,7 @@ async def health():
     return {"ok": True, "groq": bool(GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"))}
 
 
+# ==================== СТАРЫЕ API ====================
 @app.get("/api/stats")
 async def get_stats():
     total_rains = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='rain'") or {}).get("c", 0)
@@ -1134,13 +1254,13 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     <span class="hint-btn" data-hint="Одинаковая сумма 3+ людям за 20 мин.">?</span>
   </button>
   <button data-tab="bets">Ставки
-    <span class="hint-btn" data-hint="Выигрышные ставки. >10x → от $30. ≤10x → от $100.">?</span>
+    <span class="hint-btn" data-hint=">10x → от $30. ≤10x → от $100.">?</span>
   </button>
   <button data-tab="player">Активность
     <span class="hint-btn" data-hint="Сообщения watch-игроков.">?</span>
   </button>
   <button data-tab="contexts">Контексты дождей
-    <span class="hint-btn" data-hint="Последние дожди с 15 сообщениями и 5 ставками до.">?</span>
+    <span class="hint-btn" data-hint="Дожди с контекстом 15 сообщений + 5 ставок.">?</span>
   </button>
   <button data-tab="intents">Интенты
     <span class="hint-btn" data-hint="Обещания сделать дождь (Groq).">?</span>
@@ -1149,7 +1269,10 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     <span class="hint-btn" data-hint="Из Telegram-канала с чекбоксами.">?</span>
   </button>
   <button data-tab="ai">🤖 AI Ассистент
-    <span class="hint-btn" data-hint="AI прочитает 50 сообщений чата и предложит 5 живых фраз + 5 нейтральных. Клик по сообщению — копирует в буфер.">?</span>
+    <span class="hint-btn" data-hint="AI прочитает 50 сообщений чата и предложит 5 фраз.">?</span>
+  </button>
+  <button data-tab="players">👥 Игроки
+    <span class="hint-btn" data-hint="Активные игроки по чатам. Количество сообщений, время.&#10;'Только онлайн' — за последние 5 мин.">?</span>
   </button>
 </div>
 <main>
@@ -1175,7 +1298,7 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
 
   <div id="tab-chart" style="display:none">
     <div class="row-flex">
-      <select id="cType"><option value="">Всё</option><option value="tip">Только Tip</option><option value="rain">Только Rain</option></select>
+      <select id="cType"><option value="">Всё</option><option value="tip">Tip</option><option value="rain">Rain</option></select>
       <select id="cChat"><option value="">Все чаты</option></select>
       <button class="btn" onclick="loadChart()">Обновить</button>
     </div>
@@ -1270,6 +1393,23 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     <div id="aiTopic"></div>
     <div id="aiResult"></div>
   </div>
+
+  <div id="tab-players" style="display:none">
+    <div class="row-flex">
+      <select id="plChatFilter"><option value="">Все чаты</option></select>
+      <input type="text" id="plUserFilter" placeholder="Ник">
+      <label style="color:#aab;font-size:12px">
+        <input type="checkbox" id="plOnlineOnly"> Только онлайн
+      </label>
+      <input type="number" id="plMinMsgs" placeholder="Мин. сообщений" style="width:140px">
+      <button class="btn" onclick="loadPlayersTab()">Обновить</button>
+    </div>
+    <div id="plChatsSummary" style="margin-bottom:16px"></div>
+    <table><thead><tr>
+      <th>Чат</th><th>Игрок</th><th>Сообщений</th><th>Первый раз</th><th>Последний раз</th><th>Статус</th>
+    </tr></thead>
+    <tbody id="plPlayersBody"></tbody></table>
+  </div>
 </main>
 
 <div class="modal" id="imgModal" onclick="this.classList.remove('on')">
@@ -1288,7 +1428,7 @@ let aiPollTimer = null;
 
 function switchTab(name){
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
-  ['status','events','chart','bulk','bets','player','contexts','intents','promos','ai'].forEach(t=>{
+  ['status','events','chart','bulk','bets','player','contexts','intents','promos','ai','players'].forEach(t=>{
     $('tab-'+t).style.display = (t===name) ? '' : 'none';
   });
   if(name==='events') { loadDays(); loadEvents(); }
@@ -1300,6 +1440,7 @@ function switchTab(name){
   if(name==='intents') { loadChats(); loadIntents(); }
   if(name==='promos') loadPromos();
   if(name==='ai') { loadChats(); loadAILatest(); }
+  if(name==='players') { loadChats(); loadPlayersTab(); }
 }
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 
@@ -1355,7 +1496,7 @@ async function reqShot(iid){
 
 async function loadChats(){
   const r = await fetch('/api/chats').then(r=>r.json());
-  ['fChat','cChat','pChat','betChat','ctxChat','intChat','aiChat'].forEach(id=>{
+  ['fChat','cChat','pChat','betChat','ctxChat','intChat','aiChat','plChatFilter'].forEach(id=>{
     const sel = $(id); if(!sel) return;
     const cur = sel.value;
     const placeholder = id === 'aiChat' ? '<option value="">Выбери чат</option>' : '<option value="">Все чаты</option>';
@@ -1617,12 +1758,11 @@ async function testPromo(){
   } catch(e){ alert('Ошибка'); } finally { btn.disabled=false; btn.textContent='🔍 Проверить сейчас'; }
 }
 
-// ---------- AI Ассистент ----------
 async function runAI(){
   const chat = $('aiChat').value;
   if(!chat){ alert('Выбери чат'); return; }
   const btn = event.target; btn.disabled=true; btn.textContent='⏳ Читаю чат...';
-  $('aiStatus').textContent = 'Отправляю задачу на чтение...';
+  $('aiStatus').textContent = 'Отправляю задачу...';
   $('aiTopic').innerHTML = '';
   $('aiResult').innerHTML = '';
   try {
@@ -1701,6 +1841,42 @@ async function loadAILatest(){
   }
   renderAIResult(r.task.result, r.task.chat);
   $('aiStatus').textContent = `Последний: ${fmtTime(r.task.completed_at)}`;
+}
+
+async function loadPlayersTab(){
+  const sum = await fetch('/api/players_by_chat').then(r=>r.json());
+  const sEl = $('plChatsSummary');
+  if(sum.chats && sum.chats.length){
+    sEl.innerHTML = '<div class="kpi">' + sum.chats.map(c=>`
+      <div>${esc(c.chat)}<b>${c.total_players} игроков</b>
+        <span class="hint">🟢 ${c.online_players} онлайн · ${fmtMoney(c.total_messages)} сообщений</span>
+      </div>`).join('') + '</div>';
+  } else {
+    sEl.innerHTML = '<p class="hint">Пока нет данных — ждём сообщения из чатов</p>';
+  }
+  const p = new URLSearchParams();
+  if($('plChatFilter').value) p.set('chat', $('plChatFilter').value);
+  if($('plUserFilter').value) p.set('username', $('plUserFilter').value);
+  if($('plOnlineOnly').checked) p.set('online_only', '1');
+  if($('plMinMsgs').value) p.set('min_msgs', $('plMinMsgs').value);
+  p.set('limit', '1000');
+  const r = await fetch('/api/players?'+p).then(r=>r.json());
+  const body = $('plPlayersBody'); body.innerHTML='';
+  if(!r.players.length){
+    body.innerHTML = '<tr><td colspan="6" class="hint">Нет данных по фильтру</td></tr>';
+    return;
+  }
+  const now = Date.now()/1000;
+  r.players.forEach(x=>{
+    const online = (now - (x.last_seen||0)) < 300;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><b>${esc(x.chat)}</b></td><td>${esc(x.username)}</td>
+      <td style="color:#8ab4f8;font-weight:bold">${x.msg_count}</td>
+      <td>${x.first_seen?fmtTime(x.first_seen):'—'}</td>
+      <td>${x.last_seen?fmtTime(x.last_seen):'—'}</td>
+      <td>${online?'<span class="pill ok">🟢 online</span>':'<span class="pill">offline</span>'}</td>`;
+    body.appendChild(tr);
+  });
 }
 
 renderBulkChips();
@@ -1935,14 +2111,15 @@ async def admin_page():
     return ADMIN_HTML
 
 
+# ==================== STARTUP ====================
 @app.on_event("startup")
 async def startup_event():
     threading.Thread(target=promo_parser_thread, daemon=True).start()
     print(f"[PROMO] Поток мониторинга @{PROMO_CHANNEL} запущен")
     if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
-        print("[AI] ✅ GROQ_API_KEY задан")
+        print(f"[AI] ✅ GROQ_API_KEY задан, модель: {GROQ_MODEL}")
     else:
-        print("[AI] ⚠️ GROQ_API_KEY не задан")
+        print("[AI] ⚠️ GROQ_API_KEY не задан — Интенты и AI Ассистент работать не будут")
 
 
 if __name__ == "__main__":
