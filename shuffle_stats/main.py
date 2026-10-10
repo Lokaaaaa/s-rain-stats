@@ -136,7 +136,6 @@ def init_db():
         """)
     _try("ALTER TABLE events ADD COLUMN ts DOUBLE PRECISION" if USE_POSTGRES
          else "ALTER TABLE events ADD COLUMN ts REAL")
-    # Поля для контекста дождей
     _try("ALTER TABLE events ADD COLUMN context_messages TEXT" if USE_POSTGRES
          else "ALTER TABLE events ADD COLUMN context_messages TEXT")
     _try("ALTER TABLE events ADD COLUMN context_bets TEXT" if USE_POSTGRES
@@ -237,6 +236,35 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_bets_chat ON bets(chat)")
     execute("CREATE INDEX IF NOT EXISTS idx_bets_sender ON bets(sender)")
 
+    # --- intents: обещания сделать дождь (детект через Groq) ---
+    if USE_POSTGRES:
+        execute("""
+            CREATE TABLE IF NOT EXISTS intents (
+                id SERIAL PRIMARY KEY,
+                ts DOUBLE PRECISION NOT NULL,
+                chat TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                text TEXT,
+                matched_rain_id INTEGER,
+                matched_delta_sec INTEGER
+            )
+        """)
+    else:
+        execute("""
+            CREATE TABLE IF NOT EXISTS intents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                chat TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                text TEXT,
+                matched_rain_id INTEGER,
+                matched_delta_sec INTEGER
+            )
+        """)
+    execute("CREATE INDEX IF NOT EXISTS idx_intents_ts ON intents(ts)")
+    execute("CREATE INDEX IF NOT EXISTS idx_intents_chat ON intents(chat)")
+    execute("CREATE INDEX IF NOT EXISTS idx_intents_sender ON intents(sender)")
+
     execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
 
 
@@ -267,14 +295,12 @@ def migrate_ts_once():
                 SET ts = EXTRACT(EPOCH FROM created_at::timestamptz)
                 WHERE ts IS NULL AND created_at IS NOT NULL
             """)
-            print("[DB] events — обновлено")
         else:
             execute("""
                 UPDATE events
                 SET ts = CAST(strftime('%s', created_at) AS REAL)
                 WHERE ts IS NULL AND created_at IS NOT NULL
             """)
-            print("[DB] events — обновлено")
         meta_set("ts_migrated_v1", "1")
         print("[DB] ✅ Миграция ts завершена")
     except Exception as e:
@@ -317,6 +343,13 @@ class PlayerActivityIn(BaseModel):
     ts: Optional[float] = None
     username: str
     chat: str
+    text: str = ""
+
+
+class IntentIn(BaseModel):
+    ts: Optional[float] = None
+    chat: str
+    sender: str
     text: str = ""
 
 
@@ -432,6 +465,48 @@ async def add_bet(body: BetIn, x_api_key: str = Header(default="")):
     return {"ok": True}
 
 
+@app.post("/api/intent")
+async def add_intent(body: IntentIn, x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    ts_val = body.ts if body.ts else time.time()
+
+    # Защита от дублей: тот же sender + text в том же чате за 60 сек
+    dup = query_one("""
+        SELECT id FROM intents
+        WHERE chat=? AND sender=? AND text=? AND ABS(ts - ?) < 60
+        LIMIT 1
+    """, (body.chat, body.sender, body.text, ts_val))
+    if dup:
+        return {"ok": True, "dup": True}
+
+    p = ph()
+    execute(f"""
+        INSERT INTO intents (ts, chat, sender, text, matched_rain_id, matched_delta_sec)
+        VALUES ({p},{p},{p},{p},NULL,NULL)
+    """, (ts_val, body.chat, body.sender, body.text))
+
+    # Пытаемся найти дождь этим же игроком в течение 5 минут после интента
+    WINDOW = 300
+    rain = query_one("""
+        SELECT id, ts FROM events
+        WHERE type='rain' AND chat=? AND sender LIKE ?
+          AND ts IS NOT NULL
+          AND ts >= ? AND ts <= ?
+        ORDER BY ts ASC LIMIT 1
+    """, (body.chat, f"%{body.sender}%", ts_val, ts_val + WINDOW))
+
+    if rain:
+        delta = int(rain["ts"] - ts_val)
+        execute("""
+            UPDATE intents SET matched_rain_id=?, matched_delta_sec=?
+            WHERE chat=? AND sender=? AND text=? AND ABS(ts - ?) < 60
+        """, (rain["id"], delta, body.chat, body.sender, body.text, ts_val))
+        print(f"[INTENT] ✅ {body.sender} обещал и залил через {delta}с ({body.chat})")
+
+    return {"ok": True}
+
+
 @app.post("/api/status")
 async def post_status(payload: StatusPayload, x_api_key: str = Header(default="")):
     if x_api_key != API_KEY:
@@ -539,12 +614,14 @@ async def get_status():
     rains = query_one("SELECT COUNT(*) AS c FROM events WHERE type='rain'") or {"c": 0}
     first = query_one("SELECT MIN(ts) AS m FROM events WHERE ts IS NOT NULL") or {"m": None}
     bets_count = query_one("SELECT COUNT(*) AS c FROM bets") or {"c": 0}
+    intents_count = query_one("SELECT COUNT(*) AS c FROM intents") or {"c": 0}
     return {
         "first_ts": first.get("m"),
         "total": s.get("c", 0),
         "tips": tips.get("c", 0),
         "rains": rains.get("c", 0),
         "bets": bets_count.get("c", 0),
+        "intents": intents_count.get("c", 0),
         "instances": instances,
     }
 
@@ -660,7 +737,6 @@ async def api_contexts(
     chat: Optional[str] = None,
     limit: int = 30,
 ):
-    """Последние дожди с контекстом (сообщения + ставки до дождя)."""
     q = "SELECT id, ts, created_at, chat, sender, receivers, amount_text, amount_rub, crypto_symbol, context_messages, context_bets FROM events WHERE type='rain'"
     p = []
     if chat:
@@ -682,6 +758,60 @@ async def api_contexts(
         except: r["context_bets"] = []
         out.append(r)
     return {"contexts": out}
+
+
+@app.get("/api/intents")
+async def api_intents(
+    chat: Optional[str] = None,
+    sender: Optional[str] = None,
+    only_matched: Optional[int] = None,
+    limit: int = 100,
+):
+    q = "SELECT * FROM intents WHERE 1=1"
+    p = []
+    if chat: q += " AND chat = ?"; p.append(chat)
+    if sender: q += " AND sender LIKE ?"; p.append(f"%{sender}%")
+    if only_matched == 1: q += " AND matched_rain_id IS NOT NULL"
+    if only_matched == 0: q += " AND matched_rain_id IS NULL"
+    if USE_POSTGRES:
+        q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?"
+    else:
+        q += " ORDER BY ts DESC, id DESC LIMIT ?"
+    p.append(limit)
+    return {"intents": query_all(q, tuple(p))}
+
+
+@app.get("/api/intents_stats")
+async def api_intents_stats():
+    if USE_POSTGRES:
+        rows = query_all("""
+            SELECT
+                sender AS nickname,
+                COUNT(*) AS total,
+                SUM(CASE WHEN matched_rain_id IS NOT NULL THEN 1 ELSE 0 END) AS matched,
+                ROUND(CAST(SUM(CASE WHEN matched_rain_id IS NOT NULL THEN 1 ELSE 0 END) AS NUMERIC)
+                      / CAST(COUNT(*) AS NUMERIC) * 100, 1) AS percent
+            FROM intents
+            GROUP BY sender
+            HAVING COUNT(*) >= 2
+            ORDER BY percent DESC, matched DESC
+            LIMIT 50
+        """)
+    else:
+        rows = query_all("""
+            SELECT
+                sender AS nickname,
+                COUNT(*) AS total,
+                SUM(CASE WHEN matched_rain_id IS NOT NULL THEN 1 ELSE 0 END) AS matched,
+                ROUND(CAST(SUM(CASE WHEN matched_rain_id IS NOT NULL THEN 1 ELSE 0 END) AS REAL)
+                      / CAST(COUNT(*) AS REAL) * 100, 1) AS percent
+            FROM intents
+            GROUP BY sender
+            HAVING COUNT(*) >= 2
+            ORDER BY percent DESC, matched DESC
+            LIMIT 50
+        """)
+    return {"stats": rows}
 
 
 @app.get("/api/bulk")
@@ -1006,6 +1136,9 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
   <button data-tab="contexts">Контексты дождей
     <span class="hint-btn" data-hint="Последние 30 дождей с контекстом.&#10;&#10;Для каждого дождя показаны:&#10;• Сам дождь (кто разлил, сумму)&#10;• 15 последних сообщений перед ним&#10;• 5 последних выигрышных ставок перед ним&#10;&#10;Позволяет понять что было до дождя:&#10;обещания залить, крупные выигрыши и т.д.">?</span>
   </button>
+  <button data-tab="intents">Интенты
+    <span class="hint-btn" data-hint="Обещания сделать дождь, найденные нейронкой Groq.&#10;&#10;Логика:&#10;• Groq анализирует каждое сообщение с ключевым словом (rain, залью, дождь...)&#10;• Если это интент — сохраняется здесь&#10;• Если в течение 5 минут после интента идёт rain от того же ника — считается СБЫЛОСЬ&#10;&#10;Кнопка 🏆 показывает рейтинг: % сбывшихся обещаний по игрокам.">?</span>
+  </button>
 </div>
 <main>
   <div id="tab-status">
@@ -1091,6 +1224,25 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     </div>
     <div id="ctxList"></div>
   </div>
+
+  <div id="tab-intents" style="display:none">
+    <div class="row-flex">
+      <select id="intChat"><option value="">Все чаты</option></select>
+      <input type="text" id="intSender" placeholder="Игрок">
+      <select id="intOnly">
+        <option value="">Все</option>
+        <option value="1">Только сбывшиеся</option>
+        <option value="0">Только несбывшиеся</option>
+      </select>
+      <button class="btn" onclick="loadIntents()">Фильтр</button>
+      <button class="btn" onclick="loadIntentsStats()">🏆 Рейтинг обещателей</button>
+    </div>
+    <div id="intStats" style="margin-bottom:16px"></div>
+    <table><thead><tr>
+      <th>Время</th><th>Чат</th><th>Игрок</th><th>Текст</th><th>Статус</th><th>Δ</th>
+    </tr></thead>
+    <tbody id="intBody"></tbody></table>
+  </div>
 </main>
 
 <div class="modal" id="imgModal" onclick="this.classList.remove('on')">
@@ -1108,7 +1260,7 @@ let currentPlayer = null;
 
 function switchTab(name){
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
-  ['status','events','chart','bulk','bets','player','contexts'].forEach(t=>{
+  ['status','events','chart','bulk','bets','player','contexts','intents'].forEach(t=>{
     $('tab-'+t).style.display = (t===name) ? '' : 'none';
   });
   if(name==='events') { loadDays(); loadEvents(); }
@@ -1117,6 +1269,7 @@ function switchTab(name){
   if(name==='bets') { loadChats(); loadBets(); }
   if(name==='player') loadPlayers();
   if(name==='contexts') { loadChats(); loadContexts(); }
+  if(name==='intents') { loadChats(); loadIntents(); }
 }
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 
@@ -1126,13 +1279,14 @@ async function refreshStatus(){
     $('uptime').textContent = r.first_ts
       ? 'Мониторинг с ' + new Date(r.first_ts*1000).toLocaleString('ru-RU')
       : 'Мониторинг только запущен';
-    $('kpiTotal').textContent = `Всего: ${r.total||0} | Tips: ${r.tips||0} | Rains: ${r.rains||0} | Bets: ${r.bets||0}`;
+    $('kpiTotal').textContent = `Всего: ${r.total||0} | Tips: ${r.tips||0} | Rains: ${r.rains||0} | Bets: ${r.bets||0} | Intents: ${r.intents||0}`;
     const now = Date.now()/1000;
     $('kpiRow').innerHTML = `
       <div>Всего событий<b>${r.total||0}</b></div>
       <div>Tips<b>${r.tips||0}</b></div>
       <div>Rains<b>${r.rains||0}</b></div>
       <div>Bets<b>${r.bets||0}</b></div>
+      <div>Intents<b>${r.intents||0}</b></div>
       <div>Вкладок онлайн<b>${(r.instances||[]).filter(i=>now - (i.updated_at||0) < 40).length}</b></div>`;
     const body = $('instBody'); body.innerHTML = '';
     (r.instances||[]).forEach(i=>{
@@ -1175,7 +1329,7 @@ async function reqShot(iid){
 
 async function loadChats(){
   const r = await fetch('/api/chats').then(r=>r.json());
-  ['fChat','cChat','pChat','betChat','ctxChat'].forEach(id=>{
+  ['fChat','cChat','pChat','betChat','ctxChat','intChat'].forEach(id=>{
     const sel = $(id); if(!sel) return;
     const cur = sel.value;
     sel.innerHTML = '<option value="">Все чаты</option>' +
@@ -1500,6 +1654,51 @@ async function loadContexts(){
       </div>
     </div>`;
   }).join('');
+}
+
+// ---------- Intents ----------
+async function loadIntents(){
+  const p = new URLSearchParams();
+  if($('intChat').value) p.set('chat',$('intChat').value);
+  if($('intSender').value) p.set('sender',$('intSender').value);
+  if($('intOnly').value !== '') p.set('only_matched',$('intOnly').value);
+  const r = await fetch('/api/intents?'+p).then(r=>r.json());
+  const body = $('intBody'); body.innerHTML='';
+  if(!r.intents.length){
+    body.innerHTML = '<tr><td colspan="6" class="hint">Нет интентов по фильтру</td></tr>';
+    return;
+  }
+  r.intents.forEach(x=>{
+    const matched = !!x.matched_rain_id;
+    const statusCls = matched ? 'ok' : 'err';
+    const statusTxt = matched ? '✅ сбылось' : '❌ не сбылось';
+    const delta = x.matched_delta_sec !== null && x.matched_delta_sec !== undefined
+      ? Math.round(x.matched_delta_sec) + 'с'
+      : '—';
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${fmtTime(x.ts)}</td>
+      <td>${esc(x.chat)}</td>
+      <td><b>${esc(x.sender)}</b></td>
+      <td>${esc(x.text)}</td>
+      <td><span class="pill ${statusCls}">${statusTxt}</span></td>
+      <td>${delta}</td>`;
+    body.appendChild(tr);
+  });
+}
+
+async function loadIntentsStats(){
+  const r = await fetch('/api/intents_stats').then(r=>r.json());
+  const el = $('intStats');
+  if(!r.stats.length){
+    el.innerHTML = '<p class="hint">Пока нет ни одного игрока с 2+ обещаниями</p>';
+    return;
+  }
+  el.innerHTML = '<div class="kpi">' + r.stats.map(s => {
+    const cls = s.percent >= 50 ? 'ok' : (s.percent >= 25 ? 'warn' : 'err');
+    return `<div>${esc(s.nickname)}<b>${s.percent}%</b>
+      <span class="hint"><span class="pill ${cls}">${s.matched}/${s.total}</span></span>
+    </div>`;
+  }).join('') + '</div>';
 }
 
 renderBulkChips();
