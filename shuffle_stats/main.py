@@ -196,7 +196,6 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_player_ts ON player_activity(ts)")
     execute("CREATE INDEX IF NOT EXISTS idx_player_user ON player_activity(username)")
 
-    # --- bets: выигрышные ставки ≥50$ ---
     if USE_POSTGRES:
         execute("""
             CREATE TABLE IF NOT EXISTS bets (
@@ -233,12 +232,58 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_bets_chat ON bets(chat)")
     execute("CREATE INDEX IF NOT EXISTS idx_bets_sender ON bets(sender)")
 
-    # meta
     execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+
+
+# ==================== META ====================
+def meta_get(k, default=None):
+    r = query_one("SELECT v FROM meta WHERE k=?", (k,))
+    return r["v"] if r else default
+
+
+def meta_set(k, v):
+    if USE_POSTGRES:
+        execute("INSERT INTO meta (k,v) VALUES (%s,%s) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v",
+                (k, str(v)))
+    else:
+        execute("INSERT OR REPLACE INTO meta (k,v) VALUES (?,?)", (k, str(v)))
+
+
+# ==================== МИГРАЦИЯ ts для старых записей ====================
+def migrate_ts_once():
+    """Заполняет ts для старых записей, где ts IS NULL, из created_at.
+    Запускается однократно — отмечается флагом в meta."""
+    try:
+        done = meta_get("ts_migrated_v1")
+        if done:
+            print("[DB] Миграция ts уже выполнена, пропускаю")
+            return
+        print("[DB] Миграция ts — заполняю для старых записей...")
+
+        if USE_POSTGRES:
+            execute("""
+                UPDATE events
+                SET ts = EXTRACT(EPOCH FROM created_at::timestamptz)
+                WHERE ts IS NULL AND created_at IS NOT NULL
+            """)
+            print("[DB] events — обновлено")
+        else:
+            execute("""
+                UPDATE events
+                SET ts = CAST(strftime('%s', created_at) AS REAL)
+                WHERE ts IS NULL AND created_at IS NOT NULL
+            """)
+            print("[DB] events — обновлено")
+
+        meta_set("ts_migrated_v1", "1")
+        print("[DB] ✅ Миграция ts завершена")
+    except Exception as e:
+        print(f"[DB] ❌ Ошибка миграции ts: {e}")
 
 
 init_db()
 print(f"[DB] Using {'PostgreSQL' if USE_POSTGRES else 'SQLite'}")
+migrate_ts_once()
 
 
 # ==================== МОДЕЛИ ====================
@@ -303,20 +348,6 @@ class StatusPayload(BaseModel):
     screenshot_requests: List[int] = []
 
 
-# ==================== META ====================
-def meta_get(k, default=None):
-    r = query_one("SELECT v FROM meta WHERE k=?", (k,))
-    return r["v"] if r else default
-
-
-def meta_set(k, v):
-    if USE_POSTGRES:
-        execute("INSERT INTO meta (k,v) VALUES (%s,%s) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v",
-                (k, str(v)))
-    else:
-        execute("INSERT OR REPLACE INTO meta (k,v) VALUES (?,?)", (k, str(v)))
-
-
 # ==================== API ДЛЯ СКРИПТА ====================
 @app.post("/api/event")
 async def add_event(event: EventIn, x_api_key: str = Header(default="")):
@@ -332,7 +363,7 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
     dup = query_one("""
         SELECT id FROM events
         WHERE type=? AND chat=? AND sender=? AND receivers=? AND amount_text=?
-          AND ABS(ts - ?) < 2
+          AND ts IS NOT NULL AND ABS(ts - ?) < 2
         LIMIT 1
     """, (event.type, event.chat, event.sender,
           json.dumps(event.receivers or [], ensure_ascii=False),
@@ -501,7 +532,7 @@ async def get_status():
     s = query_one("SELECT COUNT(*) AS c FROM events") or {"c": 0}
     tips = query_one("SELECT COUNT(*) AS c FROM events WHERE type='tip'") or {"c": 0}
     rains = query_one("SELECT COUNT(*) AS c FROM events WHERE type='rain'") or {"c": 0}
-    first = query_one("SELECT MIN(ts) AS m FROM events") or {"m": None}
+    first = query_one("SELECT MIN(ts) AS m FROM events WHERE ts IS NOT NULL") or {"m": None}
     bets_count = query_one("SELECT COUNT(*) AS c FROM bets") or {"c": 0}
     return {
         "first_ts": first.get("m"),
@@ -550,7 +581,11 @@ async def api_events(
     if chat: q += " AND chat = ?"; p.append(chat)
     if sender: q += " AND sender LIKE ?"; p.append(f"%{sender}%")
     if min_rub is not None: q += " AND amount_rub >= ?"; p.append(min_rub)
-    q += " ORDER BY ts DESC LIMIT ?"
+    # NULLS LAST — старые записи с ts=NULL в самом низу, свежие всегда сверху
+    if USE_POSTGRES:
+        q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?"
+    else:
+        q += " ORDER BY ts DESC, id DESC LIMIT ?"
     p.append(limit)
     rows = query_all(q, tuple(p))
     out = []
@@ -633,7 +668,10 @@ async def api_bulk(
             placeholders = ",".join(["?"] * len(names))
             q += f" AND sender IN ({placeholders})"
             p.extend(names)
-    q += " ORDER BY ts DESC LIMIT ?"
+    if USE_POSTGRES:
+        q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?"
+    else:
+        q += " ORDER BY ts DESC, id DESC LIMIT ?"
     p.append(limit)
     rows = query_all(q, tuple(p))
     for r in rows:
@@ -654,7 +692,10 @@ async def api_player(
     if username: q += " AND username LIKE ?"; p.append(f"%{username}%")
     if chat: q += " AND chat = ?"; p.append(chat)
     if since is not None: q += " AND ts >= ?"; p.append(since)
-    q += " ORDER BY ts DESC LIMIT ?"
+    if USE_POSTGRES:
+        q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?"
+    else:
+        q += " ORDER BY ts DESC, id DESC LIMIT ?"
     p.append(limit)
     rows = query_all(q, tuple(p))
 
@@ -698,7 +739,10 @@ async def api_bets(
     if chat: q += " AND chat = ?"; p.append(chat)
     if sender: q += " AND sender LIKE ?"; p.append(f"%{sender}%")
     if min_usd is not None: q += " AND amount_usd >= ?"; p.append(min_usd)
-    q += " ORDER BY ts DESC LIMIT ?"
+    if USE_POSTGRES:
+        q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?"
+    else:
+        q += " ORDER BY ts DESC, id DESC LIMIT ?"
     p.append(limit)
     return {"bets": query_all(q, tuple(p))}
 
@@ -921,7 +965,7 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     <span class="hint-btn" data-hint="Срабатывает, когда один отправитель шлёт одинаковую сумму 3+ людям за 20 мин.&#10;&#10;Фильтр:&#10;• Введи ник → Enter → добавится чип&#10;• Крестик на чипе — удалить&#10;• Несколько чипов = OR-фильтр">?</span>
   </button>
   <button data-tab="bets">Ставки
-    <span class="hint-btn" data-hint="Только ВЫИГРЫШНЫЕ ставки ≥50$.&#10;&#10;Скрипт парсит сообщения «Поделился ставкой» в чате,&#10;проверяет зелёный цвет суммы = выигрыш,&#10;и если она ≥50$ — сохраняет здесь.&#10;&#10;Фильтр:&#10;• All — все чаты&#10;• ENGLISH/RUSSIAN/… — конкретный чат&#10;• Sender — поиск по нику&#10;&#10;Кнопка 📊 показывает статистику по чатам за 24ч.">?</span>
+    <span class="hint-btn" data-hint="Только ВЫИГРЫШНЫЕ ставки ≥50$.&#10;&#10;Скрипт парсит таблицу «Последние ставки» на странице игры.&#10;&#10;Фильтр:&#10;• All — все чаты&#10;• ENGLISH/RUSSIAN/… — конкретный чат&#10;• Sender — поиск по нику&#10;&#10;Кнопка 📊 показывает статистику по чатам за 24ч.">?</span>
   </button>
   <button data-tab="player">Активность
     <span class="hint-btn" data-hint="Сообщения конкретных игроков во всех чатах.&#10;&#10;Watch-лист синхронизируется со скриптом:&#10;• Введи ник → Add → скрипт подхватит через 15 сек&#10;• X на вкладке игрока — удалить из слежки&#10;&#10;График показывает, в какие часы игрок обычно пишет.">?</span>
@@ -966,7 +1010,10 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
       <button class="btn" onclick="clearBulkChips()">Очистить</button>
     </div>
     <div class="chips" id="bulkChips"></div>
-    <table><thead><tr><th>Время</th><th>Чат</th><th>От</th><th>Сумма</th><th>Получателей</th><th>Кому</th></tr></thead>
+    <table><thead><tr>
+      <th>Время</th><th>Чат</th><th>От</th><th>Сумма</th>
+      <th>₽ каждому</th><th>₽ всего</th><th>Получателей</th><th>Кому</th>
+    </tr></thead>
     <tbody id="bulkBody"></tbody></table>
   </div>
 
@@ -1201,16 +1248,21 @@ async function loadBulk(){
   const r = await fetch('/api/bulk?'+p).then(r=>r.json());
   const body = $('bulkBody'); body.innerHTML='';
   if(!r.alerts.length){
-    body.innerHTML = '<tr><td colspan="6" class="hint">Нет данных</td></tr>';
+    body.innerHTML = '<tr><td colspan="8" class="hint">Нет данных</td></tr>';
     return;
   }
   r.alerts.forEach(a=>{
+    const recCount = (a.receivers||[]).length;
+    const rubEach = a.amount_rub || 0;
+    const rubTotal = rubEach * recCount;
     const tr = document.createElement('tr');
     tr.innerHTML = `<td>${fmtTime(a.ts)}</td>
       <td>${esc(a.chat)}</td>
       <td>${esc(a.sender)}</td>
       <td>${esc(a.amount_text)}</td>
-      <td>${(a.receivers||[]).length}</td>
+      <td>${fmtMoney(rubEach)} ₽</td>
+      <td style="color:#71d68a;font-weight:bold">${fmtMoney(rubTotal)} ₽</td>
+      <td>${recCount}</td>
       <td>${(a.receivers||[]).map(esc).join(', ')}</td>`;
     body.appendChild(tr);
   });
