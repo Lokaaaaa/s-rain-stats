@@ -19,11 +19,15 @@ GROQ_MODEL = "openai/gpt-oss-20b"
 
 _default_screenshots = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", _default_screenshots)
-try: os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-except: SCREENSHOT_DIR = _default_screenshots; os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+try:
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+except Exception:
+    SCREENSHOT_DIR = _default_screenshots
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 if USE_POSTGRES:
-    import psycopg2, psycopg2.extras
+    import psycopg2
+    import psycopg2.extras
 
 app = FastAPI(title="Shuffle Rain & Tips Stats")
 _state_lock = threading.Lock()
@@ -33,88 +37,150 @@ PROMO_CHANNEL = os.environ.get("PROMO_CHANNEL", "anyclaimershuffle")
 PROMO_PARSE_INTERVAL = 5 * 60
 BET_TO_RAIN_WINDOW_SEC = 900
 
-LANG_MAP = {'ENGLISH':'английский','RUSSIAN':'русский','JAPANESE':'японский','TURKISH':'турецкий',
-            'FRENCH':'французский','SPANISH':'испанский','PORTUGUESE':'португальский','KOREAN':'корейский',
-            'VIETNAMESE':'вьетнамский','POLISH':'польский','INDONESIAN':'индонезийский','CHINESE':'китайский'}
+LANG_MAP = {
+    'ENGLISH': 'английский', 'RUSSIAN': 'русский', 'JAPANESE': 'японский',
+    'TURKISH': 'турецкий', 'FRENCH': 'французский', 'SPANISH': 'испанский',
+    'PORTUGUESE': 'португальский', 'KOREAN': 'корейский', 'VIETNAMESE': 'вьетнамский',
+    'POLISH': 'польский', 'INDONESIAN': 'индонезийский', 'CHINESE': 'китайский',
+}
 
 ALL_CHATS = list(LANG_MAP.keys())
 
-CURRENCIES = ["USDT","USDC","BTC","ETH","SOL","LTC","DOGE","XRP","TRX","BNB","SHIB","SHFL","POL","MATIC",
-              "AVAX","TON","GRAM","BONK","WIF","PUMP","TRUMP","DAI","CASH","USD"]
+CURRENCIES = [
+    "USDT", "USDC", "BTC", "ETH", "SOL", "LTC", "DOGE", "XRP", "TRX", "BNB", "SHIB",
+    "SHFL", "POL", "MATIC", "AVAX", "TON", "GRAM", "BONK", "WIF", "PUMP", "TRUMP",
+    "DAI", "CASH", "USD",
+]
+
 
 # ==================== RATES ====================
 RATES_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_rates.json")
-RATE_ALIASES = {"TON":"GRAM","MATIC":"POL","POLYGON":"POL","USD":"USDT","USDC":"USDT","DAI":"USDT","BUSD":"USDT","TUSD":"USDT"}
+RATE_ALIASES = {
+    "TON": "GRAM", "MATIC": "POL", "POLYGON": "POL", "USD": "USDT",
+    "USDC": "USDT", "DAI": "USDT", "BUSD": "USDT", "TUSD": "USDT",
+}
 _server_rates = {}
 _server_rates_lock = threading.Lock()
 _server_rates_updated = [0.0]
+
 
 def _load_server_rates():
     global _server_rates
     if os.path.exists(RATES_CACHE_FILE):
         try:
-            with open(RATES_CACHE_FILE, "r", encoding="utf-8") as f: data = json.load(f)
+            with open(RATES_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
             with _server_rates_lock:
-                _server_rates = data.get("rates", {}); _server_rates_updated[0] = data.get("last_update", 0)
-        except Exception as e: print(f"[RATES] ⚠️ {e}")
+                _server_rates = data.get("rates", {})
+                _server_rates_updated[0] = data.get("last_update", 0)
+        except Exception as e:
+            print(f"[RATES] ⚠️ {e}")
+
 
 def _save_server_rates():
     try:
-        with _server_rates_lock: data = {"rates": _server_rates, "last_update": _server_rates_updated[0]}
-        with open(RATES_CACHE_FILE, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
-    except: pass
+        with _server_rates_lock:
+            data = {"rates": _server_rates, "last_update": _server_rates_updated[0]}
+        with open(RATES_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 
 def _fetch_server_rates():
     try:
         url = "https://api.coingecko.com/api/v3/simple/price"
-        ids = ("bitcoin,ethereum,solana,litecoin,dogecoin,ripple,tron,binancecoin,tether,usd-coin,shiba-inu,"
-               "shuffle-2,polygon-ecosystem-token,avalanche-2,the-open-network,bonk,dogwifcoin,pump-fun,official-trump,dai")
+        ids = (
+            "bitcoin,ethereum,solana,litecoin,dogecoin,ripple,tron,binancecoin,tether,"
+            "usd-coin,shiba-inu,shuffle-2,polygon-ecosystem-token,avalanche-2,"
+            "the-open-network,bonk,dogwifcoin,pump-fun,official-trump,dai"
+        )
         r = requests.get(url, params={"ids": ids, "vs_currencies": "rub,usd"}, timeout=15)
-        if r.status_code != 200: return
+        if r.status_code != 200:
+            return
         data = r.json()
-        mapping = {"BTC":"bitcoin","ETH":"ethereum","SOL":"solana","LTC":"litecoin","DOGE":"dogecoin","XRP":"ripple",
-                   "TRX":"tron","BNB":"binancecoin","USDT":"tether","USDC":"usd-coin","SHIB":"shiba-inu",
-                   "SHFL":"shuffle-2","POL":"polygon-ecosystem-token","AVAX":"avalanche-2","GRAM":"the-open-network",
-                   "BONK":"bonk","WIF":"dogwifcoin","PUMP":"pump-fun","TRUMP":"official-trump","DAI":"dai"}
+        mapping = {
+            "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "LTC": "litecoin",
+            "DOGE": "dogecoin", "XRP": "ripple", "TRX": "tron", "BNB": "binancecoin",
+            "USDT": "tether", "USDC": "usd-coin", "SHIB": "shiba-inu", "SHFL": "shuffle-2",
+            "POL": "polygon-ecosystem-token", "AVAX": "avalanche-2", "GRAM": "the-open-network",
+            "BONK": "bonk", "WIF": "dogwifcoin", "PUMP": "pump-fun", "TRUMP": "official-trump",
+            "DAI": "dai",
+        }
         new = {}
         for sym, cg in mapping.items():
             if cg in data:
-                if "rub" in data[cg]: new[sym] = data[cg]["rub"]
-                if "usd" in data[cg]: new[f"{sym}_USD"] = data[cg]["usd"]
-        if "GRAM" in new: new["TON"] = new["GRAM"]
-        if "GRAM_USD" in new: new["TON_USD"] = new["GRAM_USD"]
-        if "POL" in new: new["MATIC"] = new["POL"]
-        if "POL_USD" in new: new["MATIC_USD"] = new["POL_USD"]
-        new["CASH"] = new.get("USDT", 95.0); new["CASH_USD"] = 1.0
+                if "rub" in data[cg]:
+                    new[sym] = data[cg]["rub"]
+                if "usd" in data[cg]:
+                    new[f"{sym}_USD"] = data[cg]["usd"]
+        if "GRAM" in new:
+            new["TON"] = new["GRAM"]
+        if "GRAM_USD" in new:
+            new["TON_USD"] = new["GRAM_USD"]
+        if "POL" in new:
+            new["MATIC"] = new["POL"]
+        if "POL_USD" in new:
+            new["MATIC_USD"] = new["POL_USD"]
+        new["CASH"] = new.get("USDT", 95.0)
+        new["CASH_USD"] = 1.0
         with _server_rates_lock:
-            _server_rates.update(new); _server_rates_updated[0] = time.time()
+            _server_rates.update(new)
+            _server_rates_updated[0] = time.time()
         _save_server_rates()
         print(f"[RATES] 🔄 Обновлено {len(new)} курсов")
-    except Exception as e: print(f"[RATES] fetch: {e}")
+    except Exception as e:
+        print(f"[RATES] fetch: {e}")
+
 
 def server_rate_rub(symbol):
-    if not symbol: return None
-    s = symbol.upper().strip(); s = RATE_ALIASES.get(s, s)
-    with _server_rates_lock: return _server_rates.get(s)
+    if not symbol:
+        return None
+    s = symbol.upper().strip()
+    s = RATE_ALIASES.get(s, s)
+    with _server_rates_lock:
+        return _server_rates.get(s)
+
 
 def server_rate_usd(symbol):
-    if not symbol: return None
-    s = symbol.upper().strip(); s = RATE_ALIASES.get(s, s)
-    with _server_rates_lock: return _server_rates.get(f"{s}_USD")
+    if not symbol:
+        return None
+    s = symbol.upper().strip()
+    s = RATE_ALIASES.get(s, s)
+    with _server_rates_lock:
+        return _server_rates.get(f"{s}_USD")
+
 
 def rates_refresh_thread():
     _fetch_server_rates()
     while True:
         time.sleep(3600)
-        try: _fetch_server_rates()
-        except: pass
+        try:
+            _fetch_server_rates()
+        except Exception:
+            pass
+
 
 # ==================== БАЗА ====================
 def get_db():
-    if USE_POSTGRES: return psycopg2.connect(DATABASE_URL)
-    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; return conn
+    if USE_POSTGRES:
+        url = DATABASE_URL
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql://", 1)
+        # SSL: если не указан явно — добавляем require (для внешних URL).
+        # Для внутренних URL Render можно убрать.
+        if "sslmode" not in url:
+            sep = "&" if "?" in url else "?"
+            url += f"{sep}sslmode=require"
+        return psycopg2.connect(url)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def ph(): return "%s" if USE_POSTGRES else "?"
+
+def ph():
+    return "%s" if USE_POSTGRES else "?"
+
 
 def query_all(sql, params=()):
     sql_pg = sql.replace("?", "%s") if USE_POSTGRES else sql
@@ -122,9 +188,13 @@ def query_all(sql, params=()):
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if USE_POSTGRES else conn.cursor()
         cur.execute(sql_pg, params)
-        try: return [dict(r) for r in cur.fetchall()]
-        except Exception: return []
-    finally: conn.close()
+        try:
+            return [dict(r) for r in cur.fetchall()]
+        except Exception:
+            return []
+    finally:
+        conn.close()
+
 
 def query_one(sql, params=()):
     sql_pg = sql.replace("?", "%s") if USE_POSTGRES else sql
@@ -132,19 +202,29 @@ def query_one(sql, params=()):
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if USE_POSTGRES else conn.cursor()
         cur.execute(sql_pg, params)
-        row = cur.fetchone(); return dict(row) if row else None
-    finally: conn.close()
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
 
 def execute(sql, params=()):
     sql_pg = sql.replace("?", "%s") if USE_POSTGRES else sql
     conn = get_db()
     try:
-        cur = conn.cursor(); cur.execute(sql_pg, params); conn.commit()
-    finally: conn.close()
+        cur = conn.cursor()
+        cur.execute(sql_pg, params)
+        conn.commit()
+    finally:
+        conn.close()
+
 
 def _try(sql):
-    try: execute(sql)
-    except: pass
+    try:
+        execute(sql)
+    except Exception:
+        pass
+
 
 def init_db():
     if USE_POSTGRES:
@@ -161,25 +241,31 @@ def init_db():
             amount_text TEXT, amount_type TEXT, crypto_symbol TEXT,
             amount_rub REAL DEFAULT 0, amount_usd REAL DEFAULT 0,
             created_at TEXT NOT NULL, ts REAL)""")
-    for col, typ in [("ts", "DOUBLE PRECISION" if USE_POSTGRES else "REAL"),
-                     ("context_messages", "TEXT"), ("context_bets", "TEXT"),
-                     ("amount_usd", "DOUBLE PRECISION DEFAULT 0" if USE_POSTGRES else "REAL DEFAULT 0"),
-                     ("receivers_info", "TEXT")]:
+    for col, typ in [
+        ("ts", "DOUBLE PRECISION" if USE_POSTGRES else "REAL"),
+        ("context_messages", "TEXT"), ("context_bets", "TEXT"),
+        ("amount_usd", "DOUBLE PRECISION DEFAULT 0" if USE_POSTGRES else "REAL DEFAULT 0"),
+        ("receivers_info", "TEXT"),
+    ]:
         _try(f"ALTER TABLE events ADD COLUMN {col} {typ}")
-    for idx in ["idx_type ON events(type)", "idx_sender ON events(sender)",
-                "idx_events_ts ON events(ts)", "idx_events_chat ON events(chat)"]:
+    for idx in [
+        "idx_type ON events(type)", "idx_sender ON events(sender)",
+        "idx_events_ts ON events(ts)", "idx_events_chat ON events(chat)",
+    ]:
         execute(f"CREATE INDEX IF NOT EXISTS {idx}")
 
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS bulk_alerts (
             id SERIAL PRIMARY KEY, ts DOUBLE PRECISION NOT NULL, chat TEXT NOT NULL,
             sender TEXT NOT NULL, amount_text TEXT, amount_rub DOUBLE PRECISION DEFAULT 0,
-            crypto TEXT, receivers TEXT NOT NULL, window_sec INTEGER DEFAULT 0, is_rubric INTEGER DEFAULT 0)""")
+            crypto TEXT, receivers TEXT NOT NULL, window_sec INTEGER DEFAULT 0,
+            is_rubric INTEGER DEFAULT 0)""")
     else:
         execute("""CREATE TABLE IF NOT EXISTS bulk_alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, chat TEXT NOT NULL,
             sender TEXT NOT NULL, amount_text TEXT, amount_rub REAL DEFAULT 0,
-            crypto TEXT, receivers TEXT NOT NULL, window_sec INTEGER DEFAULT 0, is_rubric INTEGER DEFAULT 0)""")
+            crypto TEXT, receivers TEXT NOT NULL, window_sec INTEGER DEFAULT 0,
+            is_rubric INTEGER DEFAULT 0)""")
     _try("ALTER TABLE bulk_alerts ADD COLUMN is_rubric INTEGER DEFAULT 0")
     execute("CREATE INDEX IF NOT EXISTS idx_bulk_ts ON bulk_alerts(ts)")
     execute("CREATE INDEX IF NOT EXISTS idx_bulk_sender ON bulk_alerts(sender)")
@@ -229,14 +315,17 @@ def init_db():
         execute("""CREATE TABLE IF NOT EXISTS promocodes (
             id SERIAL PRIMARY KEY, tg_msg_id TEXT UNIQUE, text TEXT NOT NULL, link TEXT,
             message_date TEXT, discovered_at DOUBLE PRECISION, used INTEGER DEFAULT 0,
-            used_at DOUBLE PRECISION, used_for_vault INTEGER DEFAULT 0, vault_amount_usd DOUBLE PRECISION DEFAULT 0)""")
+            used_at DOUBLE PRECISION, used_for_vault INTEGER DEFAULT 0,
+            vault_amount_usd DOUBLE PRECISION DEFAULT 0)""")
     else:
         execute("""CREATE TABLE IF NOT EXISTS promocodes (
             id INTEGER PRIMARY KEY AUTOINCREMENT, tg_msg_id TEXT UNIQUE, text TEXT NOT NULL,
             link TEXT, message_date TEXT, discovered_at REAL, used INTEGER DEFAULT 0,
             used_at REAL, used_for_vault INTEGER DEFAULT 0, vault_amount_usd REAL DEFAULT 0)""")
     _try("ALTER TABLE promocodes ADD COLUMN used_for_vault INTEGER DEFAULT 0")
-    _try("ALTER TABLE promocodes ADD COLUMN vault_amount_usd DOUBLE PRECISION DEFAULT 0" if USE_POSTGRES else "ALTER TABLE promocodes ADD COLUMN vault_amount_usd REAL DEFAULT 0")
+    _try("ALTER TABLE promocodes ADD COLUMN vault_amount_usd DOUBLE PRECISION DEFAULT 0"
+         if USE_POSTGRES else
+         "ALTER TABLE promocodes ADD COLUMN vault_amount_usd REAL DEFAULT 0")
 
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS chat_tasks (
@@ -245,14 +334,15 @@ def init_db():
             created_at DOUBLE PRECISION, completed_at DOUBLE PRECISION)""")
     else:
         execute("""CREATE TABLE IF NOT EXISTS chat_tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT NOT NULL, status TEXT DEFAULT 'pending',
-            messages TEXT, result TEXT, error TEXT, created_at REAL, completed_at REAL)""")
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT NOT NULL,
+            status TEXT DEFAULT 'pending', messages TEXT, result TEXT, error TEXT,
+            created_at REAL, completed_at REAL)""")
 
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS chat_players (
             id SERIAL PRIMARY KEY, chat TEXT NOT NULL, username TEXT NOT NULL,
-            msg_count INTEGER DEFAULT 0, first_seen DOUBLE PRECISION, last_seen DOUBLE PRECISION,
-            UNIQUE(chat, username))""")
+            msg_count INTEGER DEFAULT 0, first_seen DOUBLE PRECISION,
+            last_seen DOUBLE PRECISION, UNIQUE(chat, username))""")
     else:
         execute("""CREATE TABLE IF NOT EXISTS chat_players (
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT NOT NULL, username TEXT NOT NULL,
@@ -286,8 +376,8 @@ def init_db():
             amount_usd DOUBLE PRECISION DEFAULT 0, updated_at DOUBLE PRECISION)""")
         execute("""CREATE TABLE IF NOT EXISTS vault_transactions (
             id SERIAL PRIMARY KEY, ts DOUBLE PRECISION NOT NULL, type TEXT NOT NULL,
-            currency TEXT, amount DOUBLE PRECISION DEFAULT 0, amount_usd DOUBLE PRECISION DEFAULT 0,
-            description TEXT)""")
+            currency TEXT, amount DOUBLE PRECISION DEFAULT 0,
+            amount_usd DOUBLE PRECISION DEFAULT 0, description TEXT)""")
         execute("""CREATE TABLE IF NOT EXISTS wager_state (
             id INTEGER PRIMARY KEY, amount_required DOUBLE PRECISION DEFAULT 0,
             deadline_ts DOUBLE PRECISION DEFAULT 0, updated_at DOUBLE PRECISION)""")
@@ -314,281 +404,468 @@ def init_db():
     execute("CREATE TABLE IF NOT EXISTS vault_meta (k TEXT PRIMARY KEY, v TEXT)")
     execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
 
+
 def meta_get(k, default=None):
-    r = query_one("SELECT v FROM meta WHERE k=?", (k,)); return r["v"] if r else default
+    r = query_one("SELECT v FROM meta WHERE k=?", (k,))
+    return r["v"] if r else default
+
 
 def meta_set(k, v):
-    if USE_POSTGRES: execute("INSERT INTO meta (k,v) VALUES (%s,%s) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v", (k, str(v)))
-    else: execute("INSERT OR REPLACE INTO meta (k,v) VALUES (?,?)", (k, str(v)))
+    if USE_POSTGRES:
+        execute("INSERT INTO meta (k,v) VALUES (%s,%s) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v",
+                (k, str(v)))
+    else:
+        execute("INSERT OR REPLACE INTO meta (k,v) VALUES (?,?)", (k, str(v)))
+
 
 def vault_meta_get(k, default=None):
-    r = query_one("SELECT v FROM vault_meta WHERE k=?", (k,)); return r["v"] if r else default
+    r = query_one("SELECT v FROM vault_meta WHERE k=?", (k,))
+    return r["v"] if r else default
+
 
 def vault_meta_set(k, v):
-    if USE_POSTGRES: execute("INSERT INTO vault_meta (k,v) VALUES (%s,%s) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v", (k, str(v)))
-    else: execute("INSERT OR REPLACE INTO vault_meta (k,v) VALUES (?,?)", (k, str(v)))
+    if USE_POSTGRES:
+        execute("INSERT INTO vault_meta (k,v) VALUES (%s,%s) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v",
+                (k, str(v)))
+    else:
+        execute("INSERT OR REPLACE INTO vault_meta (k,v) VALUES (?,?)", (k, str(v)))
+
 
 def migrate_ts_once():
     try:
-        if meta_get("ts_migrated_v1"): return
+        if meta_get("ts_migrated_v1"):
+            return
         if USE_POSTGRES:
-            execute("""UPDATE events SET ts = EXTRACT(EPOCH FROM created_at::timestamptz) WHERE ts IS NULL AND created_at IS NOT NULL""")
+            execute("""UPDATE events SET ts = EXTRACT(EPOCH FROM created_at::timestamptz)
+                       WHERE ts IS NULL AND created_at IS NOT NULL""")
         else:
-            execute("""UPDATE events SET ts = CAST(strftime('%s', created_at) AS REAL) WHERE ts IS NULL AND created_at IS NOT NULL""")
+            execute("""UPDATE events SET ts = CAST(strftime('%s', created_at) AS REAL)
+                       WHERE ts IS NULL AND created_at IS NOT NULL""")
         meta_set("ts_migrated_v1", "1")
-    except: pass
+    except Exception as e:
+        print(f"[MIGRATE] ⚠️ {e}")
+
 
 def dedup_thread():
     while True:
         time.sleep(600)
         try:
-            rows = query_all("""SELECT id, amount_text, crypto_symbol, amount_rub, amount_usd FROM events
-                                WHERE (amount_rub IS NULL OR amount_rub=0 OR amount_usd IS NULL OR amount_usd=0) LIMIT 5000""")
+            rows = query_all("""SELECT id, amount_text, crypto_symbol, amount_rub, amount_usd
+                                FROM events
+                                WHERE (amount_rub IS NULL OR amount_rub=0
+                                       OR amount_usd IS NULL OR amount_usd=0)
+                                LIMIT 5000""")
             for r in rows:
                 txt = r.get("amount_text") or ""
                 crypto = (r.get("crypto_symbol") or "").upper().strip()
                 value = None
-                try: value = float(txt.replace("\u00a0"," ").replace(" ","").replace(",",".").replace("₽","").replace("$","").replace("€",""))
-                except: pass
-                if value is None: continue
-                new_rub = r.get("amount_rub") or 0; new_usd = r.get("amount_usd") or 0
-                has_fiat = any(m in txt for m in ("₽","$","€","£"))
+                try:
+                    value = float(txt.replace("\u00a0", " ").replace(" ", "").replace(",", ".")
+                                  .replace("₽", "").replace("$", "").replace("€", ""))
+                except Exception:
+                    pass
+                if value is None:
+                    continue
+                new_rub = r.get("amount_rub") or 0
+                new_usd = r.get("amount_usd") or 0
+                has_fiat = any(m in txt for m in ("₽", "$", "€", "£"))
                 if crypto and not has_fiat:
-                    cr = server_rate_rub(crypto); cu = server_rate_usd(crypto)
-                    if cr and not new_rub: new_rub = value * cr
-                    if cu and not new_usd: new_usd = value * cu
-                elif "₽" in txt and not new_rub: new_rub = value
-                elif "$" in txt and not new_usd: new_usd = value
+                    cr = server_rate_rub(crypto)
+                    cu = server_rate_usd(crypto)
+                    if cr and not new_rub:
+                        new_rub = value * cr
+                    if cu and not new_usd:
+                        new_usd = value * cu
+                elif "₽" in txt and not new_rub:
+                    new_rub = value
+                elif "$" in txt and not new_usd:
+                    new_usd = value
                 if new_rub != (r.get("amount_rub") or 0) or new_usd != (r.get("amount_usd") or 0):
-                    p = ph(); execute(f"UPDATE events SET amount_rub={p}, amount_usd={p} WHERE id={p}", (new_rub, new_usd, r["id"]))
-        except: pass
+                    p = ph()
+                    execute(f"UPDATE events SET amount_rub={p}, amount_usd={p} WHERE id={p}",
+                            (new_rub, new_usd, r["id"]))
+        except Exception:
+            pass
+
 
 def ticks_cleanup_thread():
     while True:
         time.sleep(6 * 3600)
-        try: execute(f"DELETE FROM player_message_ticks WHERE ts < {ph()}", (time.time() - 7 * 86400,))
-        except: pass
+        try:
+            execute(f"DELETE FROM player_message_ticks WHERE ts < {ph()}",
+                    (time.time() - 7 * 86400,))
+        except Exception:
+            pass
+
 
 # ==================== МОДЕЛИ ====================
 class EventIn(BaseModel):
-    type: str; chat: str; sender: str
-    receivers: List[str] = []; receivers_info: List[dict] = []
-    amount_text: str = ""; amount_type: str = "fiat"; crypto_symbol: str = ""
-    amount_rub: float = 0.0; amount_usd: float = 0.0
-    created_at: Optional[str] = None; ts: Optional[float] = None
-    context_messages: List[str] = []; context_bets: List[dict] = []
+    type: str
+    chat: str
+    sender: str
+    receivers: List[str] = []
+    receivers_info: List[dict] = []
+    amount_text: str = ""
+    amount_type: str = "fiat"
+    crypto_symbol: str = ""
+    amount_rub: float = 0.0
+    amount_usd: float = 0.0
+    created_at: Optional[str] = None
+    ts: Optional[float] = None
+    context_messages: List[str] = []
+    context_bets: List[dict] = []
+
 
 class BulkAlertIn(BaseModel):
-    ts: Optional[float] = None; chat: str; sender: str; amount_text: str = ""
-    amount_rub: float = 0.0; crypto: str = ""; receivers: List[str] = []; window_sec: int = 0
+    ts: Optional[float] = None
+    chat: str
+    sender: str
+    amount_text: str = ""
+    amount_rub: float = 0.0
+    crypto: str = ""
+    receivers: List[str] = []
+    window_sec: int = 0
+
 
 class PlayerActivityIn(BaseModel):
-    ts: Optional[float] = None; username: str; chat: str; text: str = ""
+    ts: Optional[float] = None
+    username: str
+    chat: str
+    text: str = ""
+
 
 class IntentIn(BaseModel):
-    ts: Optional[float] = None; chat: str; sender: str; text: str = ""; percent: int = 100
+    ts: Optional[float] = None
+    chat: str
+    sender: str
+    text: str = ""
+    percent: int = 100
+
 
 class BetIn(BaseModel):
-    ts: Optional[float] = None; chat: str; sender: str; real_sender: Optional[str] = None
-    game: str = ""; multiplier: str = ""; amount_text: str = ""
-    amount_rub: float = 0.0; amount_usd: float = 0.0
-    crypto: str = ""; outcome: str = "win"; source: str = "bets_page"
+    ts: Optional[float] = None
+    chat: str
+    sender: str
+    real_sender: Optional[str] = None
+    game: str = ""
+    multiplier: str = ""
+    amount_text: str = ""
+    amount_rub: float = 0.0
+    amount_usd: float = 0.0
+    crypto: str = ""
+    outcome: str = "win"
+    source: str = "bets_page"
+
 
 class InstanceStatus(BaseModel):
-    iid: int; mode: Optional[str] = None; status: Optional[str] = None
-    current_chat: Optional[str] = None; chats: Optional[List[str]] = None
-    new_count: Optional[int] = 0; threshold: Optional[int] = None; error: Optional[str] = None
+    iid: int
+    mode: Optional[str] = None
+    status: Optional[str] = None
+    current_chat: Optional[str] = None
+    chats: Optional[List[str]] = None
+    new_count: Optional[int] = 0
+    threshold: Optional[int] = None
+    error: Optional[str] = None
     updated_at: Optional[float] = None
 
-class StatusPayload(BaseModel):
-    instances: List[InstanceStatus] = []; screenshot_requests: List[int] = []
 
-class ChatTaskIn(BaseModel): chat: str
+class StatusPayload(BaseModel):
+    instances: List[InstanceStatus] = []
+    screenshot_requests: List[int] = []
+
+
+class ChatTaskIn(BaseModel):
+    chat: str
+
+
 class ChatTaskCompleteIn(BaseModel):
-    task_id: int; messages: List[dict] = []; error: str = ""
+    task_id: int
+    messages: List[dict] = []
+    error: str = ""
+
 
 class PlayerStatItem(BaseModel):
-    name: str; msgs: int = 0; last_seen: float = 0.0
+    name: str
+    msgs: int = 0
+    last_seen: float = 0.0
+
 
 class PlayerTick(BaseModel):
-    username: str; ts: float
+    username: str
+    ts: float
+
 
 class PlayersBatchIn(BaseModel):
-    chat: str; players: List[PlayerStatItem] = []; ticks: List[PlayerTick] = []
+    chat: str
+    players: List[PlayerStatItem] = []
+    ticks: List[PlayerTick] = []
+
 
 class BalanceIn(BaseModel):
-    currency: str; amount: float; amount_usd: Optional[float] = None
+    currency: str
+    amount: float
+    amount_usd: Optional[float] = None
+
 
 class BalanceDeleteIn(BaseModel):
     currency: str
 
+
 class VaultTransactionIn(BaseModel):
-    type: str; currency: str = "USDT"; amount: float = 0.0
-    amount_usd: float = 0.0; description: str = ""; ts: Optional[float] = None
+    type: str
+    currency: str = "USDT"
+    amount: float = 0.0
+    amount_usd: float = 0.0
+    description: str = ""
+    ts: Optional[float] = None
+
 
 class VaultWagerIn(BaseModel):
-    amount_required: float; deadline_ts: float; spent_now: Optional[float] = None
+    amount_required: float
+    deadline_ts: float
+    spent_now: Optional[float] = None
+
 
 class VaultGoalIn(BaseModel):
-    goal_usd: float; goal_text: str = ""
+    goal_usd: float
+    goal_text: str = ""
+
 
 class TransferIn(BaseModel):
-    direction: str; currency: str; amount: float
+    direction: str
+    currency: str
+    amount: float
+
 
 # ==================== РАСЧЁТ ====================
 def _recalc_amounts(amount_text, amount_type, crypto_symbol):
-    txt = amount_text or ""; crypto = (crypto_symbol or "").upper().strip()
-    cleaned = (txt.replace("\u00a0", " ").replace(" ", "").replace("₽", "").replace("$", "").replace("€", ""))
+    txt = amount_text or ""
+    crypto = (crypto_symbol or "").upper().strip()
+    cleaned = (txt.replace("\u00a0", " ").replace(" ", "")
+               .replace("₽", "").replace("$", "").replace("€", ""))
     if "," in cleaned and "." in cleaned:
-        if cleaned.rfind(",") > cleaned.rfind("."): cleaned = cleaned.replace(".", "").replace(",", ".")
-        else: cleaned = cleaned.replace(",", "")
-    else: cleaned = cleaned.replace(",", ".")
-    try: value = float(cleaned)
-    except: return 0.0, 0.0
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    else:
+        cleaned = cleaned.replace(",", ".")
+    try:
+        value = float(cleaned)
+    except Exception:
+        return 0.0, 0.0
     has_fiat = any(m in txt for m in ("₽", "$", "€", "£", "₴", "₸", "₺"))
     if crypto and (amount_type == "crypto" or not has_fiat):
-        cr = server_rate_rub(crypto) or 0.0; cu = server_rate_usd(crypto) or 0.0
+        cr = server_rate_rub(crypto) or 0.0
+        cu = server_rate_usd(crypto) or 0.0
         return value * cr, value * cu
     if "₽" in txt:
-        ur = server_rate_rub("USDT") or 95.0; uu = server_rate_usd("USDT") or 1.0
+        ur = server_rate_rub("USDT") or 95.0
+        uu = server_rate_usd("USDT") or 1.0
         return value, value / ur * uu
     if "$" in txt:
-        ur = server_rate_rub("USDT") or 95.0; uu = server_rate_usd("USDT") or 1.0
+        ur = server_rate_rub("USDT") or 95.0
+        uu = server_rate_usd("USDT") or 1.0
         return value / uu * ur, value
     if "€" in txt:
-        usd = value * 1.08; ur = server_rate_rub("USDT") or 95.0; uu = server_rate_usd("USDT") or 1.0
+        usd = value * 1.08
+        ur = server_rate_rub("USDT") or 95.0
+        uu = server_rate_usd("USDT") or 1.0
         return usd / uu * ur, usd
-    ur = server_rate_rub("USDT") or 95.0; uu = server_rate_usd("USDT") or 1.0
+    ur = server_rate_rub("USDT") or 95.0
+    uu = server_rate_usd("USDT") or 1.0
     return value, value / ur * uu
+
 
 # ==================== API SCRIPT ====================
 @app.post("/api/event")
 async def add_event(event: EventIn, x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY: raise HTTPException(401, "Invalid API key")
-    if event.type not in ("rain", "tip"): raise HTTPException(400, "type must be rain or tip")
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
+    if event.type not in ("rain", "tip"):
+        raise HTTPException(400, "type must be rain or tip")
     ts_val = event.ts if event.ts else time.time()
     created = event.created_at or datetime.fromtimestamp(ts_val, tz=timezone.utc).isoformat()
-    dup = query_one("""SELECT id FROM events WHERE type=? AND chat=? AND sender=? AND receivers=? AND amount_text=? AND ts IS NOT NULL AND ABS(ts-?)<30 LIMIT 1""",
-                    (event.type, event.chat, event.sender, json.dumps(event.receivers or [], ensure_ascii=False), event.amount_text, ts_val))
-    if dup: return {"ok": True, "dup": True}
-    rub = event.amount_rub or 0.0; usd = event.amount_usd or 0.0
+    dup = query_one("""SELECT id FROM events
+                       WHERE type=? AND chat=? AND sender=? AND receivers=? AND amount_text=?
+                       AND ts IS NOT NULL AND ABS(ts-?)<30 LIMIT 1""",
+                    (event.type, event.chat, event.sender,
+                     json.dumps(event.receivers or [], ensure_ascii=False),
+                     event.amount_text, ts_val))
+    if dup:
+        return {"ok": True, "dup": True}
+    rub = event.amount_rub or 0.0
+    usd = event.amount_usd or 0.0
     if rub == 0 or usd == 0:
         cr, cu = _recalc_amounts(event.amount_text, event.amount_type, event.crypto_symbol)
-        if not rub: rub = cr
-        if not usd: usd = cu
+        if not rub:
+            rub = cr
+        if not usd:
+            usd = cu
     p = ph()
-    execute(f"""INSERT INTO events (type,chat,sender,receivers,receivers_info,amount_text,amount_type,crypto_symbol,amount_rub,amount_usd,created_at,ts,context_messages,context_bets)
+    execute(f"""INSERT INTO events
+                (type,chat,sender,receivers,receivers_info,amount_text,amount_type,
+                 crypto_symbol,amount_rub,amount_usd,created_at,ts,
+                 context_messages,context_bets)
                 VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p})""",
-            (event.type, event.chat, event.sender, json.dumps(event.receivers or [], ensure_ascii=False),
-             json.dumps(event.receivers_info or [], ensure_ascii=False), event.amount_text, event.amount_type, event.crypto_symbol,
-             rub, usd, created, ts_val, json.dumps(event.context_messages or [], ensure_ascii=False),
+            (event.type, event.chat, event.sender,
+             json.dumps(event.receivers or [], ensure_ascii=False),
+             json.dumps(event.receivers_info or [], ensure_ascii=False),
+             event.amount_text, event.amount_type, event.crypto_symbol,
+             rub, usd, created, ts_val,
+             json.dumps(event.context_messages or [], ensure_ascii=False),
              json.dumps(event.context_bets or [], ensure_ascii=False)))
     return {"ok": True}
 
+
 @app.post("/api/events_batch")
 async def events_batch(payload: dict, x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY: raise HTTPException(401, "Invalid API key")
-    events = payload.get("events", []); inserted = 0
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
+    events = payload.get("events", [])
+    inserted = 0
     for e in events:
         try:
-            rub = float(e.get("amount_rub") or 0); usd = float(e.get("amount_usd") or 0)
+            rub = float(e.get("amount_rub") or 0)
+            usd = float(e.get("amount_usd") or 0)
             if rub == 0 or usd == 0:
-                cr, cu = _recalc_amounts(e.get("amount_text", ""), e.get("amount_type", "fiat"), e.get("crypto_symbol", ""))
-                if not rub: rub = cr
-                if not usd: usd = cu
+                cr, cu = _recalc_amounts(e.get("amount_text", ""),
+                                         e.get("amount_type", "fiat"),
+                                         e.get("crypto_symbol", ""))
+                if not rub:
+                    rub = cr
+                if not usd:
+                    usd = cu
             p = ph()
-            execute(f"""INSERT INTO events (type,chat,sender,receivers,receivers_info,amount_text,amount_type,crypto_symbol,amount_rub,amount_usd,created_at,ts,context_messages,context_bets)
+            execute(f"""INSERT INTO events
+                        (type,chat,sender,receivers,receivers_info,amount_text,amount_type,
+                         crypto_symbol,amount_rub,amount_usd,created_at,ts,
+                         context_messages,context_bets)
                         VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p})""",
                     (e.get("type"), e.get("chat"), e.get("sender"),
                      json.dumps(e.get("receivers", []), ensure_ascii=False),
                      json.dumps(e.get("receivers_info", []), ensure_ascii=False),
                      e.get("amount_text", ""), e.get("amount_type", "fiat"),
                      e.get("crypto_symbol", ""), rub, usd,
-                     datetime.fromtimestamp(e.get("ts", time.time()), tz=timezone.utc).isoformat(),
+                     datetime.fromtimestamp(e.get("ts", time.time()),
+                                            tz=timezone.utc).isoformat(),
                      e.get("ts", time.time()),
                      json.dumps(e.get("context_messages", []), ensure_ascii=False),
                      json.dumps(e.get("context_bets", []), ensure_ascii=False)))
             inserted += 1
-        except: pass
+        except Exception:
+            pass
     return {"ok": True, "inserted": inserted}
+
 
 @app.post("/api/bulk_alert")
 async def add_bulk_alert(body: BulkAlertIn, x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY: raise HTTPException(401, "Invalid API key")
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
     ts_val = body.ts if body.ts else time.time()
     rub = body.amount_rub or 0.0
     if rub == 0:
-        cr, _ = _recalc_amounts(body.amount_text, "crypto" if body.crypto else "fiat", body.crypto); rub = cr
+        cr, _ = _recalc_amounts(body.amount_text,
+                                "crypto" if body.crypto else "fiat",
+                                body.crypto)
+        rub = cr
     p = ph()
-    execute(f"""INSERT INTO bulk_alerts (ts,chat,sender,amount_text,amount_rub,crypto,receivers,window_sec)
+    execute(f"""INSERT INTO bulk_alerts
+                (ts,chat,sender,amount_text,amount_rub,crypto,receivers,window_sec)
                 VALUES ({p},{p},{p},{p},{p},{p},{p},{p})""",
             (ts_val, body.chat, body.sender, body.amount_text, rub, body.crypto,
              json.dumps(body.receivers, ensure_ascii=False), body.window_sec))
     return {"ok": True}
 
+
 @app.post("/api/bulk/rubric/{alert_id}")
 async def toggle_bulk_rubric(alert_id: int):
     row = query_one("SELECT id, is_rubric FROM bulk_alerts WHERE id=?", (alert_id,))
-    if not row: raise HTTPException(404, "not found")
+    if not row:
+        raise HTTPException(404, "not found")
     nv = 0 if row.get("is_rubric") else 1
     execute("UPDATE bulk_alerts SET is_rubric=? WHERE id=?", (nv, alert_id))
     return {"ok": True, "is_rubric": nv}
 
+
 @app.post("/api/player_activity")
 async def add_player_activity(body: PlayerActivityIn, x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY: raise HTTPException(401, "Invalid API key")
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
     ts_val = body.ts if body.ts else time.time()
     execute(f"INSERT INTO player_activity (ts,username,chat,text) VALUES ({ph()},{ph()},{ph()},{ph()})",
             (ts_val, body.username, body.chat, body.text))
     return {"ok": True}
 
+
 @app.post("/api/bet")
 async def add_bet(body: BetIn, x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY: raise HTTPException(401, "Invalid API key")
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
     ts_val = body.ts if body.ts else time.time()
-    rub = body.amount_rub or 0.0; usd = body.amount_usd or 0.0
+    rub = body.amount_rub or 0.0
+    usd = body.amount_usd or 0.0
     if rub == 0 or usd == 0:
-        cr, cu = _recalc_amounts(body.amount_text, "crypto" if body.crypto else "fiat", body.crypto)
-        if not rub: rub = cr
-        if not usd: usd = cu
+        cr, cu = _recalc_amounts(body.amount_text,
+                                 "crypto" if body.crypto else "fiat",
+                                 body.crypto)
+        if not rub:
+            rub = cr
+        if not usd:
+            usd = cu
     p = ph()
-    execute(f"""INSERT INTO bets (ts,chat,sender,real_sender,game,multiplier,amount_text,amount_rub,amount_usd,crypto,outcome,source)
+    execute(f"""INSERT INTO bets
+                (ts,chat,sender,real_sender,game,multiplier,amount_text,
+                 amount_rub,amount_usd,crypto,outcome,source)
                 VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p})""",
-            (ts_val, body.chat, body.sender, body.real_sender, body.game, body.multiplier, body.amount_text,
-             rub, usd, body.crypto, body.outcome, body.source or "bets_page"))
+            (ts_val, body.chat, body.sender, body.real_sender, body.game, body.multiplier,
+             body.amount_text, rub, usd, body.crypto, body.outcome,
+             body.source or "bets_page"))
     return {"ok": True}
+
 
 @app.post("/api/bets/clear_top")
 async def clear_bets_top():
-    meta_set("bets_top_cleared_at", time.time()); return {"ok": True}
+    meta_set("bets_top_cleared_at", time.time())
+    return {"ok": True}
+
 
 @app.post("/api/intent")
 async def add_intent(body: IntentIn, x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY: raise HTTPException(401, "Invalid API key")
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
     ts_val = body.ts if body.ts else time.time()
     dup = query_one("SELECT id FROM intents WHERE chat=? AND sender=? AND text=? AND ABS(ts-?)<60 LIMIT 1",
                     (body.chat, body.sender, body.text, ts_val))
-    if dup: return {"ok": True, "dup": True}
+    if dup:
+        return {"ok": True, "dup": True}
     p = ph()
-    execute(f"INSERT INTO intents (ts,chat,sender,text,percent,matched_rain_id,matched_delta_sec) VALUES ({p},{p},{p},{p},{p},NULL,NULL)",
+    execute(f"""INSERT INTO intents (ts,chat,sender,text,percent,matched_rain_id,matched_delta_sec)
+                VALUES ({p},{p},{p},{p},{p},NULL,NULL)""",
             (ts_val, body.chat, body.sender, body.text, body.percent or 100))
     rain = query_one("""SELECT id, ts FROM events WHERE type='rain' AND chat=? AND sender LIKE ?
                         AND ts IS NOT NULL AND ts>=? AND ts<=? ORDER BY ts ASC LIMIT 1""",
                      (body.chat, f"%{body.sender}%", ts_val, ts_val + 300))
     if rain:
         delta = int(rain["ts"] - ts_val)
-        execute("UPDATE intents SET matched_rain_id=?, matched_delta_sec=? WHERE chat=? AND sender=? AND text=? AND ABS(ts-?)<60",
+        execute("""UPDATE intents SET matched_rain_id=?, matched_delta_sec=?
+                   WHERE chat=? AND sender=? AND text=? AND ABS(ts-?)<60""",
                 (rain["id"], delta, body.chat, body.sender, body.text, ts_val))
     return {"ok": True}
 
+
 @app.post("/api/players_batch")
 async def add_players_batch(body: PlayersBatchIn, x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY: raise HTTPException(401, "Invalid API key")
-    now = time.time(); p = ph()
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
+    now = time.time()
+    p = ph()
     for pl in body.players:
         name = (pl.name or "").strip()
-        if not name or name == "?": continue
-        msgs = max(0, int(pl.msgs)); last_seen = float(pl.last_seen) or now
+        if not name or name == "?":
+            continue
+        msgs = max(0, int(pl.msgs))
+        last_seen = float(pl.last_seen) or now
         if USE_POSTGRES:
             execute(f"""INSERT INTO chat_players (chat,username,msg_count,first_seen,last_seen)
                         VALUES ({p},{p},{p},{p},{p})
@@ -606,176 +883,261 @@ async def add_players_batch(body: PlayersBatchIn, x_api_key: str = Header(defaul
     if body.ticks:
         for t in body.ticks:
             un = (t.username or "").strip()
-            if not un or un == "?": continue
-            try: ts_val = float(t.ts or 0)
-            except: continue
-            if ts_val <= 0: continue
+            if not un or un == "?":
+                continue
+            try:
+                ts_val = float(t.ts or 0)
+            except Exception:
+                continue
+            if ts_val <= 0:
+                continue
             if USE_POSTGRES:
-                execute(f"INSERT INTO player_message_ticks (username,chat,ts) VALUES ({p},{p},{p}) ON CONFLICT DO NOTHING",
+                execute(f"""INSERT INTO player_message_ticks (username,chat,ts)
+                            VALUES ({p},{p},{p}) ON CONFLICT DO NOTHING""",
                         (un, body.chat, ts_val))
             else:
-                execute(f"INSERT OR IGNORE INTO player_message_ticks (username,chat,ts) VALUES ({p},{p},{p})",
+                execute(f"""INSERT OR IGNORE INTO player_message_ticks (username,chat,ts)
+                            VALUES ({p},{p},{p})""",
                         (un, body.chat, ts_val))
     return {"ok": True}
+
 
 @app.get("/api/player/activity")
 async def api_player_activity(username: str, windows: str = "15,25,60,1440"):
     un = (username or "").strip()
-    if not un: raise HTTPException(400, "username required")
-    try: wins = sorted({int(w) for w in windows.split(",") if w.strip()})
-    except: wins = [15, 25, 60, 1440]
+    if not un:
+        raise HTTPException(400, "username required")
+    try:
+        wins = sorted({int(w) for w in windows.split(",") if w.strip()})
+    except Exception:
+        wins = [15, 25, 60, 1440]
     max_win = max(wins) if wins else 1440
     since = time.time() - max_win * 60
-    all_chat_rows = query_all("SELECT chat, msg_count, last_seen FROM chat_players WHERE username=?", (un,))
-    all_chats = {r["chat"]: {"msg_count": r.get("msg_count", 0) or 0, "last_seen_total": r.get("last_seen") or 0}
-                 for r in all_chat_rows}
-    tick_rows = query_all("""SELECT chat, ts FROM player_message_ticks WHERE username=? AND ts>=? ORDER BY ts DESC""", (un, since))
+    all_chat_rows = query_all("SELECT chat, msg_count, last_seen FROM chat_players WHERE username=?",
+                              (un,))
+    all_chats = {
+        r["chat"]: {"msg_count": r.get("msg_count", 0) or 0,
+                    "last_seen_total": r.get("last_seen") or 0}
+        for r in all_chat_rows
+    }
+    tick_rows = query_all("""SELECT chat, ts FROM player_message_ticks
+                             WHERE username=? AND ts>=? ORDER BY ts DESC""",
+                          (un, since))
     now = time.time()
-    per_chat = {c: {"counts": {w: 0 for w in wins}, "last_ts": 0.0,
-                    "total_msgs": m["msg_count"] or 0, "last_seen_total": m["last_seen_total"] or 0}
-                for c, m in all_chats.items()}
+    per_chat = {
+        c: {"counts": {w: 0 for w in wins}, "last_ts": 0.0,
+            "total_msgs": m["msg_count"] or 0, "last_seen_total": m["last_seen_total"] or 0}
+        for c, m in all_chats.items()
+    }
     for r in tick_rows:
-        c = r["chat"]; ts = float(r["ts"] or 0)
-        if c not in per_chat: per_chat[c] = {"counts": {w: 0 for w in wins}, "last_ts": 0.0, "total_msgs": 0, "last_seen_total": 0}
+        c = r["chat"]
+        ts = float(r["ts"] or 0)
+        if c not in per_chat:
+            per_chat[c] = {"counts": {w: 0 for w in wins}, "last_ts": 0.0,
+                           "total_msgs": 0, "last_seen_total": 0}
         for w in wins:
-            if now - ts <= w * 60: per_chat[c]["counts"][w] += 1
-        if ts > per_chat[c]["last_ts"]: per_chat[c]["last_ts"] = ts
-    total = {w: 0 for w in wins}; last_ts = 0.0
+            if now - ts <= w * 60:
+                per_chat[c]["counts"][w] += 1
+        if ts > per_chat[c]["last_ts"]:
+            per_chat[c]["last_ts"] = ts
+    total = {w: 0 for w in wins}
+    last_ts = 0.0
     for c, v in per_chat.items():
-        for w in wins: total[w] += v["counts"][w]
-        if v["last_ts"] > last_ts: last_ts = v["last_ts"]
+        for w in wins:
+            total[w] += v["counts"][w]
+        if v["last_ts"] > last_ts:
+            last_ts = v["last_ts"]
     chats = []
     for c, v in per_chat.items():
         eff = max(v["last_ts"] or 0, v["last_seen_total"] or 0)
         chats.append({"chat": c, "counts": v["counts"], "last_ts": eff,
-                      "minutes_ago": int((now - eff) / 60) if eff else None, "total_msgs": v["total_msgs"] or 0})
+                      "minutes_ago": int((now - eff) / 60) if eff else None,
+                      "total_msgs": v["total_msgs"] or 0})
     chats.sort(key=lambda x: (-sum(x["counts"].values()), -x["last_ts"]))
     gl = max([c["last_ts"] for c in chats], default=0)
     return {"username": un, "windows": wins, "total": total, "last_ts": gl,
-            "minutes_ago_total": int((now - gl) / 60) if gl else None, "chats": chats, "now": now, "known_chats": len(chats)}
+            "minutes_ago_total": int((now - gl) / 60) if gl else None,
+            "chats": chats, "now": now, "known_chats": len(chats)}
+
 
 @app.get("/api/user/{nickname}/rains_received")
 async def user_rains_received(nickname: str, days: int = 30, limit: int = 500):
     since = time.time() - days * 86400
-    rows = query_all("""SELECT id, ts, chat, sender, receivers, amount_text, amount_rub, amount_usd, crypto_symbol
-                        FROM events WHERE type='rain' AND ts >= ? ORDER BY ts DESC LIMIT 5000""", (since,))
-    out = []; total_rub = 0.0; total_usd = 0.0
+    rows = query_all("""SELECT id, ts, chat, sender, receivers, amount_text, amount_rub,
+                        amount_usd, crypto_symbol FROM events
+                        WHERE type='rain' AND ts >= ? ORDER BY ts DESC LIMIT 5000""",
+                     (since,))
+    out = []
+    total_rub = 0.0
+    total_usd = 0.0
     for r in rows:
-        try: recs = json.loads(r.get("receivers") or "[]")
-        except: recs = []
-        if nickname not in recs: continue
+        try:
+            recs = json.loads(r.get("receivers") or "[]")
+        except Exception:
+            recs = []
+        if nickname not in recs:
+            continue
         n = len(recs) or 1
         per_rub = (r.get("amount_rub") or 0) / n
         per_usd = (r.get("amount_usd") or 0) / n
-        total_rub += per_rub; total_usd += per_usd
+        total_rub += per_rub
+        total_usd += per_usd
         out.append({"id": r["id"], "ts": r["ts"], "chat": r["chat"], "sender": r["sender"],
-                    "amount_text": r["amount_text"], "crypto_symbol": r.get("crypto_symbol", ""),
-                    "share_rub": round(per_rub, 2), "share_usd": round(per_usd, 2), "receivers_count": n})
-        if len(out) >= limit: break
-    return {"nickname": nickname, "wins": len(out), "total_rub": round(total_rub, 2),
-            "total_usd": round(total_usd, 2), "items": out, "days": days}
+                    "amount_text": r["amount_text"],
+                    "crypto_symbol": r.get("crypto_symbol", ""),
+                    "share_rub": round(per_rub, 2), "share_usd": round(per_usd, 2),
+                    "receivers_count": n})
+        if len(out) >= limit:
+            break
+    return {"nickname": nickname, "wins": len(out),
+            "total_rub": round(total_rub, 2), "total_usd": round(total_usd, 2),
+            "items": out, "days": days}
+
 
 @app.post("/api/status")
 async def post_status(payload: StatusPayload, x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY: raise HTTPException(401, "Invalid API key")
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
     now = time.time()
     with _state_lock:
-        for inst in payload.instances: INSTANCE_STATES[inst.iid] = {**inst.dict(), "server_received_at": now}
+        for inst in payload.instances:
+            INSTANCE_STATES[inst.iid] = {**inst.dict(), "server_received_at": now}
         for iid in payload.screenshot_requests:
-            if iid not in SCREENSHOT_REQUESTS: SCREENSHOT_REQUESTS[iid] = {"requested_at": now, "done": False}
+            if iid not in SCREENSHOT_REQUESTS:
+                SCREENSHOT_REQUESTS[iid] = {"requested_at": now, "done": False}
     return {"ok": True}
+
 
 @app.get("/api/screenshot_req")
 async def get_screenshot_req(x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY: raise HTTPException(401, "Invalid API key")
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
     with _state_lock:
         pending = [{"iid": iid, "requested_at": r.get("requested_at", 0)}
                    for iid, r in SCREENSHOT_REQUESTS.items() if not r.get("done")]
     return {"requests": pending}
 
+
 @app.post("/api/screenshot_upload")
-async def upload_screenshot(iid: int = Form(...), file: UploadFile = File(...), x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY: raise HTTPException(401, "Invalid API key")
+async def upload_screenshot(iid: int = Form(...), file: UploadFile = File(...),
+                            x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
     path = os.path.join(SCREENSHOT_DIR, f"inst{iid}_latest.png")
     content = await file.read()
-    with open(path, "wb") as f: f.write(content)
+    with open(path, "wb") as f:
+        f.write(content)
     with _state_lock:
         prev = SCREENSHOT_REQUESTS.get(iid, {})
         SCREENSHOT_REQUESTS[iid] = {"requested_at": prev.get("requested_at", time.time()),
-                                     "done": True, "path": path, "uploaded_at": time.time()}
+                                     "done": True, "path": path,
+                                     "uploaded_at": time.time()}
     return {"ok": True}
+
 
 # ==================== WATCHLIST / PROFILES ====================
 DEFAULT_WATCHLIST = ["Fab", "Fab434", "fab434"]
 
+
 @app.get("/api/watchlist")
 async def get_watchlist():
     v = meta_get("watchlist")
-    if not v: return {"players": DEFAULT_WATCHLIST}
-    try: return {"players": json.loads(v)}
-    except: return {"players": DEFAULT_WATCHLIST}
+    if not v:
+        return {"players": DEFAULT_WATCHLIST}
+    try:
+        return {"players": json.loads(v)}
+    except Exception:
+        return {"players": DEFAULT_WATCHLIST}
+
 
 @app.post("/api/watchlist/add")
 async def watchlist_add(body: dict):
     name = (body.get("name") or "").strip()
-    if not name: raise HTTPException(400, "name required")
+    if not name:
+        raise HTTPException(400, "name required")
     v = meta_get("watchlist")
-    try: players = json.loads(v) if v else list(DEFAULT_WATCHLIST)
-    except: players = list(DEFAULT_WATCHLIST)
-    if name not in players: players.append(name)
+    try:
+        players = json.loads(v) if v else list(DEFAULT_WATCHLIST)
+    except Exception:
+        players = list(DEFAULT_WATCHLIST)
+    if name not in players:
+        players.append(name)
     meta_set("watchlist", json.dumps(players, ensure_ascii=False))
     return {"ok": True, "players": players}
+
 
 @app.post("/api/watchlist/remove")
 async def watchlist_remove(body: dict):
     name = (body.get("name") or "").strip()
     v = meta_get("watchlist")
-    try: players = json.loads(v) if v else list(DEFAULT_WATCHLIST)
-    except: players = list(DEFAULT_WATCHLIST)
+    try:
+        players = json.loads(v) if v else list(DEFAULT_WATCHLIST)
+    except Exception:
+        players = list(DEFAULT_WATCHLIST)
     players = [p for p in players if p != name]
     meta_set("watchlist", json.dumps(players, ensure_ascii=False))
     return {"ok": True, "players": players}
 
+
 @app.get("/api/profile/{username}")
 async def get_profile(username: str):
     p = query_one("SELECT * FROM player_profiles WHERE username=?", (username,))
-    if not p: return {"profile": {"username": username, "lang": "ENGLISH", "description": "", "is_top": False}}
+    if not p:
+        return {"profile": {"username": username, "lang": "ENGLISH",
+                            "description": "", "is_top": False}}
     return {"profile": p}
+
 
 @app.post("/api/profile/{username}")
 async def upsert_profile(username: str, body: dict):
-    lang = (body.get("lang") or "ENGLISH").strip(); desc = (body.get("description") or "").strip()
-    is_top = 1 if body.get("is_top") else 0; p = ph()
+    lang = (body.get("lang") or "ENGLISH").strip()
+    desc = (body.get("description") or "").strip()
+    is_top = 1 if body.get("is_top") else 0
+    p = ph()
     if USE_POSTGRES:
         execute(f"""INSERT INTO player_profiles (username,lang,description,is_top,updated_at)
                     VALUES ({p},{p},{p},{p},{p}) ON CONFLICT (username) DO UPDATE
-                    SET lang=EXCLUDED.lang,description=EXCLUDED.description,is_top=EXCLUDED.is_top,updated_at=EXCLUDED.updated_at""",
+                    SET lang=EXCLUDED.lang,description=EXCLUDED.description,
+                        is_top=EXCLUDED.is_top,updated_at=EXCLUDED.updated_at""",
                 (username, lang, desc, is_top, time.time()))
     else:
         execute(f"""INSERT INTO player_profiles (username,lang,description,is_top,updated_at)
                     VALUES ({p},{p},{p},{p},{p}) ON CONFLICT (username) DO UPDATE
-                    SET lang=excluded.lang,description=excluded.description,is_top=excluded.is_top,updated_at=excluded.updated_at""",
+                    SET lang=excluded.lang,description=excluded.description,
+                        is_top=excluded.is_top,updated_at=excluded.updated_at""",
                 (username, lang, desc, is_top, time.time()))
     return {"ok": True}
+
 
 # ==================== ПРОМОКОДЫ ====================
 def fetch_promo_channel():
     try:
-        r = requests.get(f"https://t.me/s/{PROMO_CHANNEL}", headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        if r.status_code != 200: return []
-        soup = BeautifulSoup(r.text, "html.parser"); messages = []
+        r = requests.get(f"https://t.me/s/{PROMO_CHANNEL}",
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        if r.status_code != 200:
+            return []
+        soup = BeautifulSoup(r.text, "html.parser")
+        messages = []
         for wrap in soup.select(".tgme_widget_message_wrap"):
             msg_el = wrap.select_one(".tgme_widget_message")
-            if not msg_el: continue
+            if not msg_el:
+                continue
             data_post = msg_el.get("data-post", "")
-            if not data_post: continue
-            time_el = wrap.select_one("time"); msg_date = time_el.get("datetime", "") if time_el else ""
+            if not data_post:
+                continue
+            time_el = wrap.select_one("time")
+            msg_date = time_el.get("datetime", "") if time_el else ""
             text_el = wrap.select_one(".tgme_widget_message_text")
             text = text_el.get_text("\n", strip=True) if text_el else ""
-            if not text: continue
-            messages.append({"tg_msg_id": data_post, "text": text, "link": f"https://t.me/{data_post}", "message_date": msg_date})
+            if not text:
+                continue
+            messages.append({"tg_msg_id": data_post, "text": text,
+                             "link": f"https://t.me/{data_post}",
+                             "message_date": msg_date})
         return messages
-    except: return []
+    except Exception:
+        return []
+
 
 def promo_parser_thread():
     time.sleep(10)
@@ -783,40 +1145,56 @@ def promo_parser_thread():
         try:
             messages = fetch_promo_channel()
             for m in messages:
-                if query_one("SELECT id FROM promocodes WHERE tg_msg_id=?", (m["tg_msg_id"],)): continue
-                execute(f"""INSERT INTO promocodes (tg_msg_id,text,link,message_date,discovered_at,used)
+                if query_one("SELECT id FROM promocodes WHERE tg_msg_id=?", (m["tg_msg_id"],)):
+                    continue
+                execute(f"""INSERT INTO promocodes
+                            (tg_msg_id,text,link,message_date,discovered_at,used)
                             VALUES ({ph()},{ph()},{ph()},{ph()},{ph()},0)""",
-                        (m["tg_msg_id"], m["text"], m["link"], m["message_date"], time.time()))
-        except: pass
+                        (m["tg_msg_id"], m["text"], m["link"], m["message_date"],
+                         time.time()))
+        except Exception:
+            pass
         time.sleep(PROMO_PARSE_INTERVAL)
+
 
 @app.get("/api/promocodes")
 async def api_promocodes(only_unused: Optional[int] = None, limit: int = 200):
-    q = "SELECT * FROM promocodes WHERE 1=1"; p = []
-    if only_unused == 1: q += " AND used = 0"
-    q += " ORDER BY discovered_at DESC LIMIT ?"; p.append(limit)
+    q = "SELECT * FROM promocodes WHERE 1=1"
+    p = []
+    if only_unused == 1:
+        q += " AND used = 0"
+    q += " ORDER BY discovered_at DESC LIMIT ?"
+    p.append(limit)
     return {"promos": query_all(q, tuple(p))}
+
 
 @app.post("/api/promo/toggle/{promo_id}")
 async def api_promo_toggle(promo_id: int):
     row = query_one("SELECT id, used FROM promocodes WHERE id=?", (promo_id,))
-    if not row: raise HTTPException(404, "not found")
+    if not row:
+        raise HTTPException(404, "not found")
     nv = 0 if row["used"] else 1
-    execute("UPDATE promocodes SET used=?, used_at=? WHERE id=?", (nv, time.time() if nv else None, promo_id))
+    execute("UPDATE promocodes SET used=?, used_at=? WHERE id=?",
+            (nv, time.time() if nv else None, promo_id))
     return {"ok": True, "used": nv}
+
 
 @app.post("/api/promo/to_vault/{promo_id}")
 async def promo_to_vault(promo_id: int, body: dict = None):
     row = query_one("SELECT * FROM promocodes WHERE id=?", (promo_id,))
-    if not row: raise HTTPException(404, "not found")
+    if not row:
+        raise HTTPException(404, "not found")
     body = body or {}
     amount_usd = float(body.get("amount_usd") or 0)
     currency = (body.get("currency") or "USD").upper()
-    execute("UPDATE promocodes SET used_for_vault=1, vault_amount_usd=? WHERE id=?", (amount_usd, promo_id))
+    execute("UPDATE promocodes SET used_for_vault=1, vault_amount_usd=? WHERE id=?",
+            (amount_usd, promo_id))
     execute(f"""INSERT INTO vault_transactions (ts,type,currency,amount,amount_usd,description)
                 VALUES ({ph()},{ph()},{ph()},{ph()},{ph()},{ph()})""",
-            (time.time(), "promo_code", currency, amount_usd, amount_usd, f"Промокод: {row['text'][:100]}"))
+            (time.time(), "promo_code", currency, amount_usd, amount_usd,
+             f"Промокод: {row['text'][:100]}"))
     return {"ok": True}
+
 
 @app.get("/api/promocodes/stats")
 async def api_promocodes_stats():
@@ -824,30 +1202,44 @@ async def api_promocodes_stats():
     used = (query_one("SELECT COUNT(*) AS c FROM promocodes WHERE used=1") or {}).get("c", 0)
     return {"total": total, "used": used, "unused": total - used}
 
+
 @app.post("/api/promo/test")
 async def api_promo_test():
-    messages = fetch_promo_channel(); new_count = 0
+    messages = fetch_promo_channel()
+    new_count = 0
     for m in messages:
-        if query_one("SELECT id FROM promocodes WHERE tg_msg_id=?", (m["tg_msg_id"],)): continue
-        execute(f"""INSERT INTO promocodes (tg_msg_id,text,link,message_date,discovered_at,used)
+        if query_one("SELECT id FROM promocodes WHERE tg_msg_id=?", (m["tg_msg_id"],)):
+            continue
+        execute(f"""INSERT INTO promocodes
+                    (tg_msg_id,text,link,message_date,discovered_at,used)
                     VALUES ({ph()},{ph()},{ph()},{ph()},{ph()},0)""",
                 (m["tg_msg_id"], m["text"], m["link"], m["message_date"], time.time()))
         new_count += 1
     return {"ok": True, "found": len(messages), "new": new_count}
 
+
 # ==================== VAULT ====================
 def _balance_upsert(table, cur, amt, amt_usd):
     p = ph()
     if USE_POSTGRES:
-        execute(f"""INSERT INTO {table} (currency,amount,amount_usd,updated_at) VALUES ({p},{p},{p},{p})
-                    ON CONFLICT (currency) DO UPDATE SET amount=EXCLUDED.amount,amount_usd=EXCLUDED.amount_usd,updated_at=EXCLUDED.updated_at""",
+        execute(f"""INSERT INTO {table} (currency,amount,amount_usd,updated_at)
+                    VALUES ({p},{p},{p},{p})
+                    ON CONFLICT (currency) DO UPDATE
+                    SET amount=EXCLUDED.amount,amount_usd=EXCLUDED.amount_usd,
+                        updated_at=EXCLUDED.updated_at""",
                 (cur, amt, amt_usd, time.time()))
     else:
-        execute(f"""INSERT INTO {table} (currency,amount,amount_usd,updated_at) VALUES ({p},{p},{p},{p})
-                    ON CONFLICT (currency) DO UPDATE SET amount=excluded.amount,amount_usd=excluded.amount_usd,updated_at=excluded.updated_at""",
+        execute(f"""INSERT INTO {table} (currency,amount,amount_usd,updated_at)
+                    VALUES ({p},{p},{p},{p})
+                    ON CONFLICT (currency) DO UPDATE
+                    SET amount=excluded.amount,amount_usd=excluded.amount_usd,
+                        updated_at=excluded.updated_at""",
                 (cur, amt, amt_usd, time.time()))
 
-def _balance_get(table, cur): return query_one(f"SELECT amount, amount_usd FROM {table} WHERE currency=?", (cur,))
+
+def _balance_get(table, cur):
+    return query_one(f"SELECT amount, amount_usd FROM {table} WHERE currency=?", (cur,))
+
 
 def _balance_add(table, cur, delta_amt, delta_usd):
     row = _balance_get(table, cur)
@@ -855,79 +1247,106 @@ def _balance_add(table, cur, delta_amt, delta_usd):
     new_usd = max(0.0, (float(row["amount_usd"]) if row else 0.0) + delta_usd)
     _balance_upsert(table, cur, new_amt, new_usd)
 
+
 def _calc_usd(cur, amount):
     cur = (cur or "").upper().strip()
-    if cur in ("USD", "USDT", "USDC", "DAI", "CASH"): return amount
+    if cur in ("USD", "USDT", "USDC", "DAI", "CASH"):
+        return amount
     rate = server_rate_usd(cur)
     return amount * rate if rate else 0.0
+
 
 @app.get("/api/vault")
 async def get_vault():
     account = query_all("SELECT * FROM account_balances ORDER BY currency")
     vault = query_all("SELECT * FROM vault_balances ORDER BY currency")
     wager = query_one("SELECT * FROM wager_state WHERE id=1") or {"amount_required": 0, "deadline_ts": 0}
-    goal_usd = float(vault_meta_get("goal_usd") or 0); goal_text = vault_meta_get("goal_text") or ""
+    goal_usd = float(vault_meta_get("goal_usd") or 0)
+    goal_text = vault_meta_get("goal_text") or ""
     now = time.time()
     week_ago = now - 7 * 86400
-    income_week = (query_one("SELECT COALESCE(SUM(amount_usd),0) AS s FROM vault_transactions WHERE ts>=? AND type='income'", (week_ago,)) or {"s": 0})["s"] or 0
-    wager_week = (query_one("SELECT COALESCE(SUM(amount_usd),0) AS s FROM vault_transactions WHERE ts>=? AND type='wager_spend'", (week_ago,)) or {"s": 0})["s"] or 0
-    vault_add_week = (query_one("SELECT COALESCE(SUM(amount_usd),0) AS s FROM vault_transactions WHERE ts>=? AND type='vault_add'", (week_ago,)) or {"s": 0})["s"] or 0
+    income_week = (query_one("""SELECT COALESCE(SUM(amount_usd),0) AS s FROM vault_transactions
+                                WHERE ts>=? AND type='income'""", (week_ago,)) or {"s": 0})["s"] or 0
+    wager_week = (query_one("""SELECT COALESCE(SUM(amount_usd),0) AS s FROM vault_transactions
+                               WHERE ts>=? AND type='wager_spend'""", (week_ago,)) or {"s": 0})["s"] or 0
+    vault_add_week = (query_one("""SELECT COALESCE(SUM(amount_usd),0) AS s FROM vault_transactions
+                                   WHERE ts>=? AND type='vault_add'""", (week_ago,)) or {"s": 0})["s"] or 0
     total_account = sum(float(b.get("amount_usd") or 0) for b in account)
     total_vault = sum(float(b.get("amount_usd") or 0) for b in vault)
     days_left = max(0, int((wager.get("deadline_ts", 0) - now) / 86400)) if wager.get("deadline_ts") else None
     hours_left = max(0, int((wager.get("deadline_ts", 0) - now) / 3600)) if wager.get("deadline_ts") else None
-    return {"account": account, "vault": vault,
-            "total_account_usd": round(total_account, 2), "total_vault_usd": round(total_vault, 2),
-            "total_usd": round(total_account + total_vault, 2),
-            "wager": {"amount_required": wager.get("amount_required", 0), "deadline_ts": wager.get("deadline_ts", 0),
-                      "days_left": days_left, "hours_left": hours_left,
-                      "is_expired": (wager.get("deadline_ts", 0) > 0 and wager.get("deadline_ts", 0) < now)},
-            "goal_usd": goal_usd, "goal_text": goal_text,
-            "week": {"income": round(income_week, 2), "wager_spend": round(wager_week, 2), "vault_add": round(vault_add_week, 2)},
-            "currencies": CURRENCIES, "now": now}
+    return {
+        "account": account, "vault": vault,
+        "total_account_usd": round(total_account, 2),
+        "total_vault_usd": round(total_vault, 2),
+        "total_usd": round(total_account + total_vault, 2),
+        "wager": {"amount_required": wager.get("amount_required", 0),
+                  "deadline_ts": wager.get("deadline_ts", 0),
+                  "days_left": days_left, "hours_left": hours_left,
+                  "is_expired": (wager.get("deadline_ts", 0) > 0 and wager.get("deadline_ts", 0) < now)},
+        "goal_usd": goal_usd, "goal_text": goal_text,
+        "week": {"income": round(income_week, 2), "wager_spend": round(wager_week, 2),
+                 "vault_add": round(vault_add_week, 2)},
+        "currencies": CURRENCIES, "now": now,
+    }
+
 
 @app.post("/api/account/balance")
 async def set_account_balance(body: BalanceIn):
     cur = body.currency.upper().strip()
-    if not cur: raise HTTPException(400, "currency required")
+    if not cur:
+        raise HTTPException(400, "currency required")
     amt = float(body.amount or 0)
     amt_usd = body.amount_usd if body.amount_usd is not None else _calc_usd(cur, amt)
     _balance_upsert("account_balances", cur, amt, amt_usd)
     return {"ok": True}
 
+
 @app.post("/api/account/balance/delete")
 async def delete_account_balance(body: BalanceDeleteIn):
     cur = (body.currency or "").upper().strip()
-    if not cur: raise HTTPException(400, "currency required")
+    if not cur:
+        raise HTTPException(400, "currency required")
     execute("DELETE FROM account_balances WHERE currency=?", (cur,))
     return {"ok": True}
+
 
 @app.post("/api/vault/balance")
 async def set_vault_balance(body: BalanceIn):
     cur = body.currency.upper().strip()
-    if not cur: raise HTTPException(400, "currency required")
+    if not cur:
+        raise HTTPException(400, "currency required")
     amt = float(body.amount or 0)
     amt_usd = body.amount_usd if body.amount_usd is not None else _calc_usd(cur, amt)
     _balance_upsert("vault_balances", cur, amt, amt_usd)
     return {"ok": True}
 
+
 @app.post("/api/vault/balance/delete")
 async def delete_vault_balance(body: BalanceDeleteIn):
     cur = (body.currency or "").upper().strip()
-    if not cur: raise HTTPException(400, "currency required")
+    if not cur:
+        raise HTTPException(400, "currency required")
     execute("DELETE FROM vault_balances WHERE currency=?", (cur,))
     return {"ok": True}
 
+
 @app.post("/api/transfer")
 async def transfer(body: TransferIn):
-    direction = body.direction.strip(); cur = body.currency.upper().strip(); amt = float(body.amount or 0)
-    if direction not in ("to_vault", "to_account"): raise HTTPException(400, "direction must be to_vault or to_account")
-    if amt <= 0: raise HTTPException(400, "amount must be > 0")
-    if not cur: raise HTTPException(400, "currency required")
+    direction = body.direction.strip()
+    cur = body.currency.upper().strip()
+    amt = float(body.amount or 0)
+    if direction not in ("to_vault", "to_account"):
+        raise HTTPException(400, "direction must be to_vault or to_account")
+    if amt <= 0:
+        raise HTTPException(400, "amount must be > 0")
+    if not cur:
+        raise HTTPException(400, "currency required")
     usd = _calc_usd(cur, amt)
     if direction == "to_vault":
         row = _balance_get("account_balances", cur)
-        if not row or float(row["amount"]) < amt: raise HTTPException(400, f"Недостаточно {cur} на аккаунте")
+        if not row or float(row["amount"]) < amt:
+            raise HTTPException(400, f"Недостаточно {cur} на аккаунте")
         _balance_add("account_balances", cur, -amt, -usd)
         _balance_add("vault_balances", cur, amt, usd)
         execute(f"""INSERT INTO vault_transactions (ts,type,currency,amount,amount_usd,description)
@@ -935,13 +1354,15 @@ async def transfer(body: TransferIn):
                 (time.time(), cur, amt, usd, f"Перевод в хранилище {amt} {cur}"))
     else:
         row = _balance_get("vault_balances", cur)
-        if not row or float(row["amount"]) < amt: raise HTTPException(400, f"Недостаточно {cur} в хранилище")
+        if not row or float(row["amount"]) < amt:
+            raise HTTPException(400, f"Недостаточно {cur} в хранилище")
         _balance_add("vault_balances", cur, -amt, -usd)
         _balance_add("account_balances", cur, amt, usd)
         execute(f"""INSERT INTO vault_transactions (ts,type,currency,amount,amount_usd,description)
                     VALUES ({ph()},'vault_take',{ph()},{ph()},{ph()},{ph()})""",
                 (time.time(), cur, amt, usd, f"Перевод из хранилища {amt} {cur}"))
     return {"ok": True}
+
 
 @app.post("/api/vault/transaction")
 async def add_vault_transaction(body: VaultTransactionIn):
@@ -950,139 +1371,213 @@ async def add_vault_transaction(body: VaultTransactionIn):
         raise HTTPException(400, "invalid type")
     ts_val = body.ts if body.ts else time.time()
     cur = (body.currency or "USDT").upper().strip()
-    amount = float(body.amount or 0); amount_usd = float(body.amount_usd or 0)
-    if amount_usd == 0 and amount != 0: amount_usd = _calc_usd(cur, amount)
+    amount = float(body.amount or 0)
+    amount_usd = float(body.amount_usd or 0)
+    if amount_usd == 0 and amount != 0:
+        amount_usd = _calc_usd(cur, amount)
     execute(f"""INSERT INTO vault_transactions (ts,type,currency,amount,amount_usd,description)
                 VALUES ({ph()},{ph()},{ph()},{ph()},{ph()},{ph()})""",
             (ts_val, typ, cur, amount, amount_usd, body.description or ""))
-    if typ == "vault_add" and amount: _balance_add("vault_balances", cur, amount, amount_usd); _balance_add("account_balances", cur, -amount, -amount_usd)
-    if typ == "vault_take" and amount: _balance_add("vault_balances", cur, -amount, -amount_usd); _balance_add("account_balances", cur, amount, amount_usd)
-    if typ == "income" and amount: _balance_add("account_balances", cur, amount, amount_usd)
+    if typ == "vault_add" and amount:
+        _balance_add("vault_balances", cur, amount, amount_usd)
+        _balance_add("account_balances", cur, -amount, -amount_usd)
+    if typ == "vault_take" and amount:
+        _balance_add("vault_balances", cur, -amount, -amount_usd)
+        _balance_add("account_balances", cur, amount, amount_usd)
+    if typ == "income" and amount:
+        _balance_add("account_balances", cur, amount, amount_usd)
     return {"ok": True}
+
 
 @app.get("/api/vault/transactions")
 async def list_vault_transactions(days: int = 30, type: Optional[str] = None, limit: int = 500):
     since = time.time() - days * 86400
-    q = "SELECT * FROM vault_transactions WHERE ts>=?"; p = [since]
-    if type: q += " AND type=?"; p.append(type)
-    q += " ORDER BY ts DESC LIMIT ?"; p.append(limit)
+    q = "SELECT * FROM vault_transactions WHERE ts>=?"
+    p = [since]
+    if type:
+        q += " AND type=?"
+        p.append(type)
+    q += " ORDER BY ts DESC LIMIT ?"
+    p.append(limit)
     return {"transactions": query_all(q, tuple(p))}
+
 
 @app.post("/api/vault/wager")
 async def set_wager(body: VaultWagerIn):
     p = ph()
     if USE_POSTGRES:
-        execute(f"""INSERT INTO wager_state (id,amount_required,deadline_ts,updated_at) VALUES (1,{p},{p},{p})
-                    ON CONFLICT (id) DO UPDATE SET amount_required=EXCLUDED.amount_required,
-                    deadline_ts=EXCLUDED.deadline_ts,updated_at=EXCLUDED.updated_at""",
+        execute(f"""INSERT INTO wager_state (id,amount_required,deadline_ts,updated_at)
+                    VALUES (1,{p},{p},{p}) ON CONFLICT (id) DO UPDATE
+                    SET amount_required=EXCLUDED.amount_required,
+                        deadline_ts=EXCLUDED.deadline_ts,
+                        updated_at=EXCLUDED.updated_at""",
                 (body.amount_required, body.deadline_ts, time.time()))
     else:
-        execute(f"""INSERT INTO wager_state (id,amount_required,deadline_ts,updated_at) VALUES (1,{p},{p},{p})
-                    ON CONFLICT (id) DO UPDATE SET amount_required=excluded.amount_required,
-                    deadline_ts=excluded.deadline_ts,updated_at=excluded.updated_at""",
+        execute(f"""INSERT INTO wager_state (id,amount_required,deadline_ts,updated_at)
+                    VALUES (1,{p},{p},{p}) ON CONFLICT (id) DO UPDATE
+                    SET amount_required=excluded.amount_required,
+                        deadline_ts=excluded.deadline_ts,
+                        updated_at=excluded.updated_at""",
                 (body.amount_required, body.deadline_ts, time.time()))
     return {"ok": True}
 
+
 @app.post("/api/vault/goal")
 async def set_goal(body: VaultGoalIn):
-    vault_meta_set("goal_usd", body.goal_usd); vault_meta_set("goal_text", body.goal_text)
+    vault_meta_set("goal_usd", body.goal_usd)
+    vault_meta_set("goal_text", body.goal_text)
     return {"ok": True}
+
 
 # ==================== AI ====================
 @app.get("/api/chat/pending")
 async def chat_pending(x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY: raise HTTPException(401, "Invalid API key")
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
     task = query_one("SELECT id, chat FROM chat_tasks WHERE status='pending' ORDER BY created_at ASC LIMIT 1")
-    if not task: return {"task": None}
+    if not task:
+        return {"task": None}
     execute("UPDATE chat_tasks SET status='reading' WHERE id=?", (task["id"],))
     return {"task": task}
 
+
 @app.post("/api/chat/complete")
 async def chat_complete(body: ChatTaskCompleteIn, x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY: raise HTTPException(401, "Invalid API key")
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
     task = query_one("SELECT * FROM chat_tasks WHERE id=?", (body.task_id,))
-    if not task: raise HTTPException(404, "task not found")
+    if not task:
+        raise HTTPException(404, "task not found")
     if body.error:
-        execute("UPDATE chat_tasks SET status='failed', error=?, completed_at=? WHERE id=?", (body.error, time.time(), body.task_id))
+        execute("UPDATE chat_tasks SET status='failed', error=?, completed_at=? WHERE id=?",
+                (body.error, time.time(), body.task_id))
         return {"ok": True, "status": "failed"}
-    execute("UPDATE chat_tasks SET messages=? WHERE id=?", (json.dumps(body.messages, ensure_ascii=False), body.task_id))
-    threading.Thread(target=_process_chat_task_groq, args=(body.task_id, task["chat"], body.messages), daemon=True).start()
+    execute("UPDATE chat_tasks SET messages=? WHERE id=?",
+            (json.dumps(body.messages, ensure_ascii=False), body.task_id))
+    threading.Thread(target=_process_chat_task_groq,
+                     args=(body.task_id, task["chat"], body.messages), daemon=True).start()
     return {"ok": True, "status": "processing"}
+
 
 def _process_chat_task_groq(task_id, chat_name, messages):
     if not GROQ_API_KEY or not GROQ_API_KEY.startswith("gsk_"):
-        execute("UPDATE chat_tasks SET status='failed', error='GROQ_API_KEY не задан', completed_at=? WHERE id=?", (time.time(), task_id)); return
+        execute("UPDATE chat_tasks SET status='failed', error='GROQ_API_KEY не задан', completed_at=? WHERE id=?",
+                (time.time(), task_id))
+        return
     lang = LANG_MAP.get(chat_name, chat_name.lower())
-    lines = [f"{m.get('user', '?')}: {m.get('text', '')}" for m in (messages or [])[-50:] if m.get("text")]
+    lines = [f"{m.get('user', '?')}: {m.get('text', '')}"
+             for m in (messages or [])[-50:] if m.get("text")]
     context = "\n".join(lines)
     sp = (f"Ты носитель {lang} и активный участник игрового чата казино. "
           f"Дан контекст из последних 50 сообщений. Предложи 5 коротких живых сообщений на {lang} (до 100 символов) "
           f"и 5 нейтральных фраз. Ответь СТРОГО JSON: "
           f'{{"topic": "...", "messages": ["..."], "phrases": ["..."]}}')
     models = [GROQ_MODEL, "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
-    content = None; last_error = ""
+    content = None
+    last_error = ""
     for m in models:
         try:
             r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                              headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                              json={"model": m, "messages": [{"role": "system", "content": sp}, {"role": "user", "content": context}],
-                                    "max_tokens": 800, "temperature": 0.8}, timeout=30)
+                              headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                                       "Content-Type": "application/json"},
+                              json={"model": m,
+                                    "messages": [{"role": "system", "content": sp},
+                                                 {"role": "user", "content": context}],
+                                    "max_tokens": 800, "temperature": 0.8},
+                              timeout=30)
             if r.status_code == 200:
-                content = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip(); break
-            elif r.status_code == 404: last_error = f"{m} not found"; continue
-            else: last_error = f"HTTP {r.status_code}"; break
-        except Exception as e: last_error = f"{type(e).__name__}"
+                content = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                break
+            elif r.status_code == 404:
+                last_error = f"{m} not found"
+                continue
+            else:
+                last_error = f"HTTP {r.status_code}"
+                break
+        except Exception as e:
+            last_error = f"{type(e).__name__}"
     if not content:
-        execute("UPDATE chat_tasks SET status='failed', error=?, completed_at=? WHERE id=?", (last_error, time.time(), task_id)); return
+        execute("UPDATE chat_tasks SET status='failed', error=?, completed_at=? WHERE id=?",
+                (last_error, time.time(), task_id))
+        return
     mm = re.search(r'\{[\s\S]*\}', content)
     if not mm:
-        execute("UPDATE chat_tasks SET status='failed', error='не-JSON', completed_at=? WHERE id=?", (time.time(), task_id)); return
-    try: data = json.loads(mm.group(0))
+        execute("UPDATE chat_tasks SET status='failed', error='не-JSON', completed_at=? WHERE id=?",
+                (time.time(), task_id))
+        return
+    try:
+        data = json.loads(mm.group(0))
     except Exception as e:
-        execute("UPDATE chat_tasks SET status='failed', error=?, completed_at=? WHERE id=?", (f"JSON: {e}", time.time(), task_id)); return
-    result = {"topic": data.get("topic", ""), "messages": data.get("messages", [])[:5], "phrases": data.get("phrases", [])[:5]}
+        execute("UPDATE chat_tasks SET status='failed', error=?, completed_at=? WHERE id=?",
+                (f"JSON: {e}", time.time(), task_id))
+        return
+    result = {"topic": data.get("topic", ""),
+              "messages": data.get("messages", [])[:5],
+              "phrases": data.get("phrases", [])[:5]}
     execute("UPDATE chat_tasks SET status='completed', result=?, completed_at=? WHERE id=?",
             (json.dumps(result, ensure_ascii=False), time.time(), task_id))
 
+
 @app.post("/api/chat/request")
 async def chat_request(body: ChatTaskIn):
-    if not body.chat: raise HTTPException(400, "chat required")
-    execute(f"INSERT INTO chat_tasks (chat,status,created_at) VALUES ({ph()},'pending',{ph()})", (body.chat, time.time()))
-    task = query_one("SELECT id FROM chat_tasks WHERE chat=? AND status='pending' ORDER BY id DESC LIMIT 1", (body.chat,))
+    if not body.chat:
+        raise HTTPException(400, "chat required")
+    execute(f"INSERT INTO chat_tasks (chat,status,created_at) VALUES ({ph()},'pending',{ph()})",
+            (body.chat, time.time()))
+    task = query_one("SELECT id FROM chat_tasks WHERE chat=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                     (body.chat,))
     return {"ok": True, "task_id": task["id"] if task else None}
+
 
 @app.get("/api/chat/task/{task_id}")
 async def chat_task_get(task_id: int):
     task = query_one("SELECT * FROM chat_tasks WHERE id=?", (task_id,))
-    if not task: raise HTTPException(404, "not found")
+    if not task:
+        raise HTTPException(404, "not found")
     result = None
     if task.get("result"):
-        try: result = json.loads(task["result"])
-        except: pass
-    return {"id": task["id"], "chat": task["chat"], "status": task["status"], "result": result, "error": task.get("error"),
-            "created_at": task.get("created_at"), "completed_at": task.get("completed_at")}
+        try:
+            result = json.loads(task["result"])
+        except Exception:
+            pass
+    return {"id": task["id"], "chat": task["chat"], "status": task["status"],
+            "result": result, "error": task.get("error"),
+            "created_at": task.get("created_at"),
+            "completed_at": task.get("completed_at")}
+
 
 @app.get("/api/chat/latest")
 async def chat_latest(chat: Optional[str] = None):
-    q = "SELECT * FROM chat_tasks WHERE status='completed'"; p = []
-    if chat: q += " AND chat=?"; p.append(chat)
+    q = "SELECT * FROM chat_tasks WHERE status='completed'"
+    p = []
+    if chat:
+        q += " AND chat=?"
+        p.append(chat)
     q += " ORDER BY completed_at DESC LIMIT 1"
     task = query_one(q, tuple(p))
-    if not task: return {"task": None}
+    if not task:
+        return {"task": None}
     result = None
     if task.get("result"):
-        try: result = json.loads(task["result"])
-        except: pass
-    return {"task": {"id": task["id"], "chat": task["chat"], "result": result, "completed_at": task["completed_at"]}}
+        try:
+            result = json.loads(task["result"])
+        except Exception:
+            pass
+    return {"task": {"id": task["id"], "chat": task["chat"],
+                     "result": result, "completed_at": task["completed_at"]}}
+
 
 # ==================== API UI ====================
 @app.get("/api/rates")
 async def api_rates():
-    with _server_rates_lock: return {"rates": dict(_server_rates), "updated_at": _server_rates_updated[0]}
+    with _server_rates_lock:
+        return {"rates": dict(_server_rates), "updated_at": _server_rates_updated[0]}
+
 
 @app.get("/api/status")
 async def get_status():
-    with _state_lock: instances = list(INSTANCE_STATES.values())
+    with _state_lock:
+        instances = list(INSTANCE_STATES.values())
     instances.sort(key=lambda x: x.get("iid", 0))
     s = query_one("SELECT COUNT(*) AS c FROM events") or {"c": 0}
     tips = query_one("SELECT COUNT(*) AS c FROM events WHERE type='tip'") or {"c": 0}
@@ -1090,171 +1585,273 @@ async def get_status():
     first = query_one("SELECT MIN(ts) AS m FROM events WHERE ts IS NOT NULL") or {"m": None}
     bets_c = query_one("SELECT COUNT(*) AS c FROM bets") or {"c": 0}
     intents_c = query_one("SELECT COUNT(*) AS c FROM intents") or {"c": 0}
-    return {"first_ts": first.get("m"), "total": s.get("c", 0), "tips": tips.get("c", 0), "rains": rains.get("c", 0),
-            "bets": bets_c.get("c", 0), "intents": intents_c.get("c", 0), "instances": instances}
+    return {"first_ts": first.get("m"), "total": s.get("c", 0),
+            "tips": tips.get("c", 0), "rains": rains.get("c", 0),
+            "bets": bets_c.get("c", 0), "intents": intents_c.get("c", 0),
+            "instances": instances}
+
 
 @app.post("/api/screenshot/{iid}")
 async def request_screenshot(iid: int):
-    with _state_lock: SCREENSHOT_REQUESTS[iid] = {"requested_at": time.time(), "done": False, "path": None}
+    with _state_lock:
+        SCREENSHOT_REQUESTS[iid] = {"requested_at": time.time(), "done": False, "path": None}
     return {"ok": True}
+
 
 @app.get("/api/screenshot/{iid}")
 async def get_screenshot(iid: int):
-    with _state_lock: r = SCREENSHOT_REQUESTS.get(iid)
-    if not r or not r.get("done"): return JSONResponse(status_code=202, content={"pending": True})
+    with _state_lock:
+        r = SCREENSHOT_REQUESTS.get(iid)
+    if not r or not r.get("done"):
+        return JSONResponse(status_code=202, content={"pending": True})
     path = r.get("path")
-    if not path or not os.path.exists(path): raise HTTPException(404, "not_available")
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "not_available")
     return FileResponse(path, media_type="image/png")
+
 
 @app.get("/api/events")
 async def api_events(since: Optional[float] = None, until: Optional[float] = None,
                      type: Optional[str] = None, chat: Optional[str] = None,
                      sender: Optional[str] = None, min_rub: Optional[float] = None,
                      last_hours: Optional[int] = None, limit: int = 500):
-    q = "SELECT * FROM events WHERE 1=1"; p = []
-    if last_hours: since = time.time() - last_hours * 3600
-    if since is not None: q += " AND ts>=?"; p.append(since)
-    if until is not None: q += " AND ts<=?"; p.append(until)
-    if type: q += " AND type=?"; p.append(type)
-    if chat: q += " AND chat=?"; p.append(chat)
-    if sender: q += " AND sender LIKE ?"; p.append(f"%{sender}%")
-    if min_rub is not None: q += " AND amount_rub>=?"; p.append(min_rub)
-    q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES else " ORDER BY ts DESC, id DESC LIMIT ?"
+    q = "SELECT * FROM events WHERE 1=1"
+    p = []
+    if last_hours:
+        since = time.time() - last_hours * 3600
+    if since is not None:
+        q += " AND ts>=?"
+        p.append(since)
+    if until is not None:
+        q += " AND ts<=?"
+        p.append(until)
+    if type:
+        q += " AND type=?"
+        p.append(type)
+    if chat:
+        q += " AND chat=?"
+        p.append(chat)
+    if sender:
+        q += " AND sender LIKE ?"
+        p.append(f"%{sender}%")
+    if min_rub is not None:
+        q += " AND amount_rub>=?"
+        p.append(min_rub)
+    q += (" ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES
+          else " ORDER BY ts DESC, id DESC LIMIT ?")
     p.append(limit)
     rows = query_all(q, tuple(p))
     for r in rows:
-        try: r["receivers"] = json.loads(r.get("receivers") or "[]")
-        except: r["receivers"] = []
-        try: r["receivers_info"] = json.loads(r.get("receivers_info") or "[]")
-        except: r["receivers_info"] = []
+        try:
+            r["receivers"] = json.loads(r.get("receivers") or "[]")
+        except Exception:
+            r["receivers"] = []
+        try:
+            r["receivers_info"] = json.loads(r.get("receivers_info") or "[]")
+        except Exception:
+            r["receivers_info"] = []
         rc = len(r["receivers"]) or 1
         r["per_person_rub"] = (r.get("amount_rub") or 0) / rc
     return {"events": rows}
 
+
 @app.get("/api/receivers_top")
-async def api_receivers_top(limit: int = 100, metric: str = "total", days: int = 30, window_min: int = 25):
+async def api_receivers_top(limit: int = 100, metric: str = "total", days: int = 30,
+                            window_min: int = 25):
     since = time.time() - days * 86400
-    rows = query_all("SELECT chat,ts,amount_rub,receivers,receivers_info FROM events WHERE type='rain' AND ts>=? ORDER BY ts DESC", (since,))
-    stats = defaultdict(lambda: {"total_rub": 0.0, "wins": 0, "active_wins": 0, "unknown_activity_wins": 0, "chats": defaultdict(int), "last_seen": 0.0})
+    rows = query_all("""SELECT chat,ts,amount_rub,receivers,receivers_info FROM events
+                        WHERE type='rain' AND ts>=? ORDER BY ts DESC""", (since,))
+    stats = defaultdict(lambda: {"total_rub": 0.0, "wins": 0, "active_wins": 0,
+                                  "unknown_activity_wins": 0,
+                                  "chats": defaultdict(int), "last_seen": 0.0})
     for r in rows:
-        try: recs = json.loads(r.get("receivers") or "[]")
-        except: recs = []
-        if not recs: continue
-        try: rinfo = json.loads(r.get("receivers_info") or "[]")
-        except: rinfo = []
+        try:
+            recs = json.loads(r.get("receivers") or "[]")
+        except Exception:
+            recs = []
+        if not recs:
+            continue
+        try:
+            rinfo = json.loads(r.get("receivers_info") or "[]")
+        except Exception:
+            rinfo = []
         rmap = {x.get("name"): x for x in rinfo if isinstance(x, dict) and x.get("name")}
-        amt = r.get("amount_rub") or 0; per = amt / len(recs); chat = r.get("chat") or "?"
+        amt = r.get("amount_rub") or 0
+        per = amt / len(recs)
+        chat = r.get("chat") or "?"
         for nick in recs:
-            if not nick: continue
-            s = stats[nick]; s["total_rub"] += per; s["wins"] += 1; s["chats"][chat] += 1
+            if not nick:
+                continue
+            s = stats[nick]
+            s["total_rub"] += per
+            s["wins"] += 1
+            s["chats"][chat] += 1
             info = rmap.get(nick)
             if info:
-                if info.get("wrote_in_25min"): s["active_wins"] += 1
-                try: ls = float(info.get("last_msg_ts") or 0)
-                except: ls = 0
-                if ls > s["last_seen"]: s["last_seen"] = ls
-            else: s["unknown_activity_wins"] += 1
+                if info.get("wrote_in_25min"):
+                    s["active_wins"] += 1
+                try:
+                    ls = float(info.get("last_msg_ts") or 0)
+                except Exception:
+                    ls = 0
+                if ls > s["last_seen"]:
+                    s["last_seen"] = ls
+            else:
+                s["unknown_activity_wins"] += 1
     arr = []
     for nick, s in stats.items():
         known = s["wins"] - s["unknown_activity_wins"]
         pct = (s["active_wins"] / known * 100) if known > 0 else None
-        arr.append({"nickname": nick, "total_rub": round(s["total_rub"], 2), "wins": s["wins"],
-                    "active_wins": s["active_wins"], "known_wins": known,
+        arr.append({"nickname": nick, "total_rub": round(s["total_rub"], 2),
+                    "wins": s["wins"], "active_wins": s["active_wins"],
+                    "known_wins": known,
                     "active_percent": round(pct, 1) if pct is not None else None,
                     "chats": dict(s["chats"]), "last_seen": s["last_seen"]})
-    if metric == "count": arr.sort(key=lambda x: x["wins"], reverse=True)
-    elif metric == "active_percent": arr.sort(key=lambda x: (x["active_percent"] if x["active_percent"] is not None else -1, x["wins"]), reverse=True)
-    else: arr.sort(key=lambda x: x["total_rub"], reverse=True)
-    return {"players": arr[:limit], "total": len(arr), "window_min": window_min, "days": days}
+    if metric == "count":
+        arr.sort(key=lambda x: x["wins"], reverse=True)
+    elif metric == "active_percent":
+        arr.sort(key=lambda x: (x["active_percent"] if x["active_percent"] is not None else -1,
+                                 x["wins"]), reverse=True)
+    else:
+        arr.sort(key=lambda x: x["total_rub"], reverse=True)
+    return {"players": arr[:limit], "total": len(arr),
+            "window_min": window_min, "days": days}
+
 
 @app.get("/api/chart")
 async def api_chart(type: Optional[str] = None, chat: Optional[str] = None,
-                    since: Optional[float] = None, until: Optional[float] = None, last_hours: Optional[int] = None):
-    if last_hours: since = time.time() - last_hours * 3600
-    hour_expr = "CAST(EXTRACT(HOUR FROM to_timestamp(ts)) AS INTEGER)" if USE_POSTGRES else "CAST(strftime('%H', ts, 'unixepoch') AS INTEGER)"
+                    since: Optional[float] = None, until: Optional[float] = None,
+                    last_hours: Optional[int] = None):
+    if last_hours:
+        since = time.time() - last_hours * 3600
+    hour_expr = ("CAST(EXTRACT(HOUR FROM to_timestamp(ts)) AS INTEGER)" if USE_POSTGRES
+                 else "CAST(strftime('%H', ts, 'unixepoch') AS INTEGER)")
     q = f"SELECT {hour_expr} AS h, COUNT(*) AS c, COALESCE(SUM(amount_rub),0) AS s FROM events WHERE ts IS NOT NULL"
     p = []
-    if since is not None: q += " AND ts>=?"; p.append(since)
-    if until is not None: q += " AND ts<=?"; p.append(until)
-    if type: q += " AND type=?"; p.append(type)
-    if chat: q += " AND chat=?"; p.append(chat)
+    if since is not None:
+        q += " AND ts>=?"
+        p.append(since)
+    if until is not None:
+        q += " AND ts<=?"
+        p.append(until)
+    if type:
+        q += " AND type=?"
+        p.append(type)
+    if chat:
+        q += " AND chat=?"
+        p.append(chat)
     q += " GROUP BY h"
     rows = query_all(q, tuple(p))
     buckets = {h: {"count": 0, "sum": 0.0} for h in range(24)}
     for r in rows:
-        if r.get("h") is not None: buckets[int(r["h"])] = {"count": r["c"], "sum": r["s"] or 0}
+        if r.get("h") is not None:
+            buckets[int(r["h"])] = {"count": r["c"], "sum": r["s"] or 0}
     return {"buckets": buckets}
+
 
 @app.get("/api/days")
 async def api_days(days: int = 90):
     since = time.time() - days * 86400
-    day_expr = "to_char(to_timestamp(ts),'YYYY-MM-DD')" if USE_POSTGRES else "strftime('%Y-%m-%d',ts,'unixepoch')"
+    day_expr = ("to_char(to_timestamp(ts),'YYYY-MM-DD')" if USE_POSTGRES
+                else "strftime('%Y-%m-%d',ts,'unixepoch')")
     rows = query_all(f"""SELECT {day_expr} AS day, COUNT(*) AS cnt,
                          SUM(CASE WHEN type='rain' THEN 1 ELSE 0 END) AS rains,
                          SUM(CASE WHEN type='tip' THEN 1 ELSE 0 END) AS tips,
                          COALESCE(SUM(amount_rub),0) AS total_rub
-                         FROM events WHERE ts IS NOT NULL AND ts>=? GROUP BY day ORDER BY day DESC""", (since,))
+                         FROM events WHERE ts IS NOT NULL AND ts>=?
+                         GROUP BY day ORDER BY day DESC""", (since,))
     return {"days": rows}
+
 
 @app.get("/api/day_detail")
 async def api_day_detail(date: str):
     try:
         dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        start = dt.timestamp(); end = start + 86400
+        start = dt.timestamp()
+        end = start + 86400
     except Exception:
         raise HTTPException(400, "invalid date")
-    events = query_all("""SELECT * FROM events WHERE ts>=? AND ts<=? ORDER BY ts ASC""", (start, end))
+    events = query_all("""SELECT * FROM events WHERE ts>=? AND ts<=? ORDER BY ts ASC""",
+                       (start, end))
     for r in events:
-        try: r["receivers"] = json.loads(r.get("receivers") or "[]")
-        except: r["receivers"] = []
-    # Топ получателей дня
+        try:
+            r["receivers"] = json.loads(r.get("receivers") or "[]")
+        except Exception:
+            r["receivers"] = []
     recv = defaultdict(lambda: {"count": 0, "rub": 0.0, "usd": 0.0})
     send = defaultdict(lambda: {"count": 0, "rub": 0.0, "usd": 0.0})
     for e in events:
         if e["type"] == "rain":
             s = send[e["sender"]]
-            s["count"] += 1; s["rub"] += (e.get("amount_rub") or 0); s["usd"] += (e.get("amount_usd") or 0)
+            s["count"] += 1
+            s["rub"] += (e.get("amount_rub") or 0)
+            s["usd"] += (e.get("amount_usd") or 0)
             recs = e.get("receivers") or []
             n = len(recs) or 1
             for nick in recs:
-                r = recv[nick]; r["count"] += 1; r["rub"] += (e.get("amount_rub") or 0) / n; r["usd"] += (e.get("amount_usd") or 0) / n
+                r = recv[nick]
+                r["count"] += 1
+                r["rub"] += (e.get("amount_rub") or 0) / n
+                r["usd"] += (e.get("amount_usd") or 0) / n
     return {"date": date, "events_count": len(events), "events": events[:500],
-            "top_receivers": sorted([{"nickname": k, **v} for k, v in recv.items()], key=lambda x: -x["rub"])[:30],
-            "top_senders": sorted([{"nickname": k, **v} for k, v in send.items()], key=lambda x: -x["rub"])[:30]}
+            "top_receivers": sorted([{"nickname": k, **v} for k, v in recv.items()],
+                                     key=lambda x: -x["rub"])[:30],
+            "top_senders": sorted([{"nickname": k, **v} for k, v in send.items()],
+                                   key=lambda x: -x["rub"])[:30]}
+
 
 @app.get("/api/chats")
 async def api_chats():
     rows = query_all("SELECT DISTINCT chat FROM events WHERE chat IS NOT NULL ORDER BY chat")
     existing = [r["chat"] for r in rows]
     for c in ALL_CHATS:
-        if c not in existing: existing.append(c)
+        if c not in existing:
+            existing.append(c)
     return {"chats": sorted(existing)}
+
 
 @app.get("/api/contexts")
 async def api_contexts(chat: Optional[str] = None, limit: int = 30):
-    q = "SELECT id,ts,created_at,chat,sender,receivers,receivers_info,amount_text,amount_rub,amount_usd,crypto_symbol,context_messages,context_bets FROM events WHERE type='rain'"
+    q = ("SELECT id,ts,created_at,chat,sender,receivers,receivers_info,amount_text,"
+         "amount_rub,amount_usd,crypto_symbol,context_messages,context_bets "
+         "FROM events WHERE type='rain'")
     p = []
-    if chat: q += " AND chat=?"; p.append(chat)
-    q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES else " ORDER BY ts DESC, id DESC LIMIT ?"
+    if chat:
+        q += " AND chat=?"
+        p.append(chat)
+    q += (" ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES
+          else " ORDER BY ts DESC, id DESC LIMIT ?")
     p.append(limit)
     rows = query_all(q, tuple(p))
     for r in rows:
         for k in ("receivers", "receivers_info", "context_messages", "context_bets"):
-            try: r[k] = json.loads(r.get(k) or "[]")
-            except: r[k] = []
+            try:
+                r[k] = json.loads(r.get(k) or "[]")
+            except Exception:
+                r[k] = []
     return {"contexts": rows}
+
 
 @app.get("/api/intents")
 async def api_intents(chat: Optional[str] = None, sender: Optional[str] = None,
                       only_matched: Optional[int] = None, limit: int = 100):
-    q = "SELECT * FROM intents WHERE 1=1"; p = []
-    if chat: q += " AND chat=?"; p.append(chat)
-    if sender: q += " AND sender LIKE ?"; p.append(f"%{sender}%")
-    if only_matched == 1: q += " AND matched_rain_id IS NOT NULL"
-    if only_matched == 0: q += " AND matched_rain_id IS NULL"
-    q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES else " ORDER BY ts DESC, id DESC LIMIT ?"
+    q = "SELECT * FROM intents WHERE 1=1"
+    p = []
+    if chat:
+        q += " AND chat=?"
+        p.append(chat)
+    if sender:
+        q += " AND sender LIKE ?"
+        p.append(f"%{sender}%")
+    if only_matched == 1:
+        q += " AND matched_rain_id IS NOT NULL"
+    if only_matched == 0:
+        q += " AND matched_rain_id IS NULL"
+    q += (" ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES
+          else " ORDER BY ts DESC, id DESC LIMIT ?")
     p.append(limit)
     return {"intents": query_all(q, tuple(p))}
+
 
 @app.get("/api/intents_stats")
 async def api_intents_stats():
@@ -1262,77 +1859,121 @@ async def api_intents_stats():
         rows = query_all("""SELECT sender AS nickname, COUNT(*) AS total,
                             SUM(CASE WHEN matched_rain_id IS NOT NULL THEN 1 ELSE 0 END) AS matched,
                             ROUND(AVG(percent),0) AS avg_percent,
-                            ROUND(CAST(SUM(CASE WHEN matched_rain_id IS NOT NULL THEN 1 ELSE 0 END) AS NUMERIC)/CAST(COUNT(*) AS NUMERIC)*100,1) AS percent
-                            FROM intents GROUP BY sender HAVING COUNT(*)>=2 ORDER BY percent DESC, matched DESC LIMIT 50""")
+                            ROUND(CAST(SUM(CASE WHEN matched_rain_id IS NOT NULL THEN 1 ELSE 0 END) AS NUMERIC)
+                                  /CAST(COUNT(*) AS NUMERIC)*100,1) AS percent
+                            FROM intents GROUP BY sender HAVING COUNT(*)>=2
+                            ORDER BY percent DESC, matched DESC LIMIT 50""")
     else:
         rows = query_all("""SELECT sender AS nickname, COUNT(*) AS total,
                             SUM(CASE WHEN matched_rain_id IS NOT NULL THEN 1 ELSE 0 END) AS matched,
                             ROUND(AVG(percent),0) AS avg_percent,
-                            ROUND(CAST(SUM(CASE WHEN matched_rain_id IS NOT NULL THEN 1 ELSE 0 END) AS REAL)/CAST(COUNT(*) AS REAL)*100,1) AS percent
-                            FROM intents GROUP BY sender HAVING COUNT(*)>=2 ORDER BY percent DESC, matched DESC LIMIT 50""")
+                            ROUND(CAST(SUM(CASE WHEN matched_rain_id IS NOT NULL THEN 1 ELSE 0 END) AS REAL)
+                                  /CAST(COUNT(*) AS REAL)*100,1) AS percent
+                            FROM intents GROUP BY sender HAVING COUNT(*)>=2
+                            ORDER BY percent DESC, matched DESC LIMIT 50""")
     return {"stats": rows}
 
+
 @app.get("/api/bulk")
-async def api_bulk(since: Optional[float] = None, until: Optional[float] = None, senders: Optional[str] = None, limit: int = 500):
-    q = "SELECT * FROM bulk_alerts WHERE 1=1"; p = []
-    if since is not None: q += " AND ts>=?"; p.append(since)
-    if until is not None: q += " AND ts<=?"; p.append(until)
+async def api_bulk(since: Optional[float] = None, until: Optional[float] = None,
+                   senders: Optional[str] = None, limit: int = 500):
+    q = "SELECT * FROM bulk_alerts WHERE 1=1"
+    p = []
+    if since is not None:
+        q += " AND ts>=?"
+        p.append(since)
+    if until is not None:
+        q += " AND ts<=?"
+        p.append(until)
     if senders:
         names = [s.strip() for s in senders.split(",") if s.strip()]
         if names:
-            phs = ",".join(["?"] * len(names)); q += f" AND sender IN ({phs})"; p.extend(names)
-    q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES else " ORDER BY ts DESC, id DESC LIMIT ?"
+            phs = ",".join(["?"] * len(names))
+            q += f" AND sender IN ({phs})"
+            p.extend(names)
+    q += (" ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES
+          else " ORDER BY ts DESC, id DESC LIMIT ?")
     p.append(limit)
     rows = query_all(q, tuple(p))
     for r in rows:
-        try: r["receivers"] = json.loads(r.get("receivers") or "[]")
-        except: r["receivers"] = []
+        try:
+            r["receivers"] = json.loads(r.get("receivers") or "[]")
+        except Exception:
+            r["receivers"] = []
     return {"alerts": rows}
 
+
 @app.get("/api/player")
-async def api_player(username: Optional[str] = None, chat: Optional[str] = None, since: Optional[float] = None, limit: int = 500):
-    q = "SELECT * FROM player_activity WHERE 1=1"; p = []
-    if username: q += " AND username LIKE ?"; p.append(f"%{username}%")
-    if chat: q += " AND chat=?"; p.append(chat)
-    if since is not None: q += " AND ts>=?"; p.append(since)
-    q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES else " ORDER BY ts DESC, id DESC LIMIT ?"
+async def api_player(username: Optional[str] = None, chat: Optional[str] = None,
+                     since: Optional[float] = None, limit: int = 500):
+    q = "SELECT * FROM player_activity WHERE 1=1"
+    p = []
+    if username:
+        q += " AND username LIKE ?"
+        p.append(f"%{username}%")
+    if chat:
+        q += " AND chat=?"
+        p.append(chat)
+    if since is not None:
+        q += " AND ts>=?"
+        p.append(since)
+    q += (" ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES
+          else " ORDER BY ts DESC, id DESC LIMIT ?")
     p.append(limit)
     return {"rows": query_all(q, tuple(p)), "hourly": {h: 0 for h in range(24)}}
 
+
 @app.get("/api/players")
 async def api_players(chat: Optional[str] = None, username: Optional[str] = None,
-                      online_only: Optional[int] = None, min_msgs: Optional[int] = None, limit: int = 500):
-    q = "SELECT chat,username,msg_count,first_seen,last_seen FROM chat_players WHERE 1=1"; p = []
-    if chat: q += " AND chat=?"; p.append(chat)
-    if username: q += " AND username LIKE ?"; p.append(f"%{username}%")
-    if min_msgs is not None: q += " AND msg_count>=?"; p.append(min_msgs)
-    if online_only == 1: q += " AND last_seen>=?"; p.append(time.time() - 300)
-    q += " ORDER BY last_seen DESC NULLS LAST, msg_count DESC LIMIT ?" if USE_POSTGRES else " ORDER BY last_seen DESC, msg_count DESC LIMIT ?"
+                      online_only: Optional[int] = None, min_msgs: Optional[int] = None,
+                      limit: int = 500):
+    q = "SELECT chat,username,msg_count,first_seen,last_seen FROM chat_players WHERE 1=1"
+    p = []
+    if chat:
+        q += " AND chat=?"
+        p.append(chat)
+    if username:
+        q += " AND username LIKE ?"
+        p.append(f"%{username}%")
+    if min_msgs is not None:
+        q += " AND msg_count>=?"
+        p.append(min_msgs)
+    if online_only == 1:
+        q += " AND last_seen>=?"
+        p.append(time.time() - 300)
+    q += (" ORDER BY last_seen DESC NULLS LAST, msg_count DESC LIMIT ?" if USE_POSTGRES
+          else " ORDER BY last_seen DESC, msg_count DESC LIMIT ?")
     p.append(limit)
     return {"players": query_all(q, tuple(p))}
 
+
 @app.post("/api/players/relocate")
 async def api_players_relocate(body: dict):
-    username = (body.get("username") or "").strip(); new_chat = (body.get("chat") or "").strip()
-    if not username or not new_chat: raise HTTPException(400, "username, chat required")
+    username = (body.get("username") or "").strip()
+    new_chat = (body.get("chat") or "").strip()
+    if not username or not new_chat:
+        raise HTTPException(400, "username, chat required")
     p = ph()
     if USE_POSTGRES:
         execute(f"""INSERT INTO chat_players (chat,username,msg_count,first_seen,last_seen)
                     VALUES ({p},{p},0,{p},{p}) ON CONFLICT (chat,username) DO NOTHING""",
                 (new_chat, username, time.time(), time.time()))
     else:
-        execute(f"""INSERT OR IGNORE INTO chat_players (chat,username,msg_count,first_seen,last_seen)
-                    VALUES (?,?,0,?,?)""", (new_chat, username, time.time(), time.time()))
+        execute(f"""INSERT OR IGNORE INTO chat_players
+                    (chat,username,msg_count,first_seen,last_seen)
+                    VALUES (?,?,0,?,?)""",
+                (new_chat, username, time.time(), time.time()))
     return {"ok": True}
+
 
 @app.post("/api/players/set_chats")
 async def api_players_set_chats(body: dict):
-    """Заменить полный набор чатов игрока. Удаляем записи из чатов, которых нет в новом списке."""
+    """Заменить полный набор чатов игрока."""
     username = (body.get("username") or "").strip()
     chats = body.get("chats") or []
-    if not username: raise HTTPException(400, "username required")
+    if not username:
+        raise HTTPException(400, "username required")
     chats = [c.strip().upper() for c in chats if c.strip()]
-    # удалить все
     execute("DELETE FROM chat_players WHERE username=?", (username,))
     p = ph()
     now = time.time()
@@ -1342,9 +1983,12 @@ async def api_players_set_chats(body: dict):
                         VALUES ({p},{p},0,{p},{p}) ON CONFLICT (chat,username) DO NOTHING""",
                     (c, username, now, now))
         else:
-            execute(f"""INSERT OR IGNORE INTO chat_players (chat,username,msg_count,first_seen,last_seen)
-                        VALUES (?,?,0,?,?)""", (c, username, now, now))
+            execute(f"""INSERT OR IGNORE INTO chat_players
+                        (chat,username,msg_count,first_seen,last_seen)
+                        VALUES (?,?,0,?,?)""",
+                    (c, username, now, now))
     return {"ok": True, "chats": chats}
+
 
 @app.get("/api/players_by_chat")
 async def api_players_by_chat():
@@ -1352,85 +1996,127 @@ async def api_players_by_chat():
     rows = query_all("""SELECT chat, COUNT(*) AS total_players,
                         SUM(CASE WHEN last_seen>=? THEN 1 ELSE 0 END) AS online_players,
                         SUM(msg_count) AS total_messages
-                        FROM chat_players GROUP BY chat ORDER BY total_players DESC""", (cutoff,))
+                        FROM chat_players GROUP BY chat ORDER BY total_players DESC""",
+                     (cutoff,))
     return {"chats": rows}
+
 
 @app.get("/api/players_by_language")
 async def api_players_by_language():
     if USE_POSTGRES:
         rows = query_all("""SELECT username, STRING_AGG(chat,',') AS chats_raw,
-                            COUNT(DISTINCT chat) AS chat_count, SUM(msg_count) AS total_msgs, MAX(last_seen) AS last_seen
-                            FROM chat_players GROUP BY username ORDER BY SUM(msg_count) DESC LIMIT 5000""")
+                            COUNT(DISTINCT chat) AS chat_count,
+                            SUM(msg_count) AS total_msgs, MAX(last_seen) AS last_seen
+                            FROM chat_players GROUP BY username
+                            ORDER BY SUM(msg_count) DESC LIMIT 5000""")
     else:
         rows = query_all("""SELECT username, GROUP_CONCAT(chat) AS chats_raw,
-                            COUNT(DISTINCT chat) AS chat_count, SUM(msg_count) AS total_msgs, MAX(last_seen) AS last_seen
-                            FROM chat_players GROUP BY username ORDER BY SUM(msg_count) DESC LIMIT 5000""")
+                            COUNT(DISTINCT chat) AS chat_count,
+                            SUM(msg_count) AS total_msgs, MAX(last_seen) AS last_seen
+                            FROM chat_players GROUP BY username
+                            ORDER BY SUM(msg_count) DESC LIMIT 5000""")
     out = []
     for r in rows:
         chats = list(set((r.get("chats_raw") or "").split(",")))
-        r["chats"] = [c.strip() for c in chats if c.strip()]; r.pop("chats_raw", None); out.append(r)
+        r["chats"] = [c.strip() for c in chats if c.strip()]
+        r.pop("chats_raw", None)
+        out.append(r)
     return {"players": out, "all_chats": ALL_CHATS}
 
+
 @app.get("/api/bets_to_rains")
-async def api_bets_to_rains(window_sec: int = BET_TO_RAIN_WINDOW_SEC, last_hours: Optional[int] = None):
-    """Теперь считает: сколько % ставок (>= $20) были 'до дождя' (ЛЮБОГО дождя в течение окна)."""
+async def api_bets_to_rains(window_sec: int = BET_TO_RAIN_WINDOW_SEC,
+                             last_hours: Optional[int] = None):
     since = time.time() - (last_hours * 3600 if last_hours else 7 * 86400)
-    bets = query_all("SELECT id,ts,sender FROM bets WHERE ts>=? AND COALESCE(amount_usd,0)>=20 ORDER BY ts ASC", (since,))
-    rains = query_all("SELECT ts FROM events WHERE type='rain' AND ts>=? AND ts IS NOT NULL ORDER BY ts ASC", (since,))
+    bets = query_all("""SELECT id,ts,sender FROM bets
+                        WHERE ts>=? AND COALESCE(amount_usd,0)>=20
+                        ORDER BY ts ASC""", (since,))
+    rains = query_all("""SELECT ts FROM events WHERE type='rain' AND ts>=? AND ts IS NOT NULL
+                        ORDER BY ts ASC""", (since,))
     rlist = sorted([r["ts"] for r in rains if r.get("ts")])
     stats = defaultdict(lambda: {"bets": 0, "triggered": 0, "total_rain_rub": 0.0})
-    # Pre-индексируем rains для быстрого поиска
     import bisect
     for b in bets:
         s = (b.get("sender") or "").strip()
-        if not s: continue
+        if not s:
+            continue
         stats[s]["bets"] += 1
-        t0 = b["ts"]; t1 = t0 + window_sec
+        t0 = b["ts"]
+        t1 = t0 + window_sec
         idx = bisect.bisect_left(rlist, t0)
         if idx < len(rlist) and rlist[idx] <= t1:
             stats[s]["triggered"] += 1
     arr = []
     for nick, d in stats.items():
-        if d["bets"] < 3: continue
+        if d["bets"] < 3:
+            continue
         pct = (d["triggered"] / d["bets"] * 100) if d["bets"] else 0
-        arr.append({"nickname": nick, "bets": d["bets"], "triggered": d["triggered"], "percent": round(pct, 1)})
+        arr.append({"nickname": nick, "bets": d["bets"],
+                    "triggered": d["triggered"], "percent": round(pct, 1)})
     arr.sort(key=lambda x: (-x["percent"], -x["bets"]))
     return {"stats": arr[:200], "window_sec": window_sec}
 
+
 @app.get("/api/bets")
-async def api_bets(since: Optional[float] = None, until: Optional[float] = None, chat: Optional[str] = None,
-                   sender: Optional[str] = None, min_usd: Optional[float] = None, source: Optional[str] = None,
+async def api_bets(since: Optional[float] = None, until: Optional[float] = None,
+                   chat: Optional[str] = None, sender: Optional[str] = None,
+                   min_usd: Optional[float] = None, source: Optional[str] = None,
                    last_hours: Optional[int] = None, limit: int = 500):
-    if last_hours: since = time.time() - last_hours * 3600
-    q = "SELECT * FROM bets WHERE 1=1"; p = []
-    if since is not None: q += " AND ts>=?"; p.append(since)
-    if until is not None: q += " AND ts<=?"; p.append(until)
-    if chat: q += " AND chat=?"; p.append(chat)
-    if sender: q += " AND (sender LIKE ? OR real_sender LIKE ?)"; p.extend([f"%{sender}%", f"%{sender}%"])
-    if min_usd is not None: q += " AND amount_usd>=?"; p.append(min_usd)
-    if source: q += " AND source=?"; p.append(source)
-    q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES else " ORDER BY ts DESC, id DESC LIMIT ?"
+    if last_hours:
+        since = time.time() - last_hours * 3600
+    q = "SELECT * FROM bets WHERE 1=1"
+    p = []
+    if since is not None:
+        q += " AND ts>=?"
+        p.append(since)
+    if until is not None:
+        q += " AND ts<=?"
+        p.append(until)
+    if chat:
+        q += " AND chat=?"
+        p.append(chat)
+    if sender:
+        q += " AND (sender LIKE ? OR real_sender LIKE ?)"
+        p.extend([f"%{sender}%", f"%{sender}%"])
+    if min_usd is not None:
+        q += " AND amount_usd>=?"
+        p.append(min_usd)
+    if source:
+        q += " AND source=?"
+        p.append(source)
+    q += (" ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES
+          else " ORDER BY ts DESC, id DESC LIMIT ?")
     p.append(limit)
     return {"bets": query_all(q, tuple(p))}
+
 
 @app.get("/api/bets_stats")
 async def api_bets_stats():
     since = time.time() - 86400
-    rows = query_all("""SELECT chat, COUNT(*) AS cnt, COALESCE(SUM(amount_usd),0) AS total_usd,
-                        COALESCE(AVG(amount_usd),0) AS avg_usd FROM bets WHERE ts>=? GROUP BY chat ORDER BY total_usd DESC""", (since,))
+    rows = query_all("""SELECT chat, COUNT(*) AS cnt,
+                        COALESCE(SUM(amount_usd),0) AS total_usd,
+                        COALESCE(AVG(amount_usd),0) AS avg_usd
+                        FROM bets WHERE ts>=? GROUP BY chat ORDER BY total_usd DESC""",
+                     (since,))
     return {"stats": rows}
+
 
 @app.get("/api/bets_top_senders")
 async def api_bets_top_senders(last_hours: Optional[int] = None):
     cleared = float(meta_get("bets_top_cleared_at") or 0)
-    since = time.time() - (last_hours * 3600 if last_hours else 7 * 86400); since = max(since, cleared)
-    rows = query_all("""SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_usd),0) AS total_usd
-                        FROM bets WHERE ts>=? GROUP BY sender ORDER BY total_usd DESC LIMIT 30""", (since,))
+    since = time.time() - (last_hours * 3600 if last_hours else 7 * 86400)
+    since = max(since, cleared)
+    rows = query_all("""SELECT sender AS nickname, COUNT(*) AS cnt,
+                        COALESCE(SUM(amount_usd),0) AS total_usd
+                        FROM bets WHERE ts>=? GROUP BY sender
+                        ORDER BY total_usd DESC LIMIT 30""", (since,))
     return {"senders": rows, "cleared_at": cleared, "since": since}
+
 
 @app.get("/api/health")
 async def health():
     return {"ok": True, "groq": bool(GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"))}
+
 
 @app.get("/api/stats")
 async def get_stats():
@@ -1438,24 +2124,35 @@ async def get_stats():
     total_tips = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='tip'") or {}).get("c", 0)
     trub = (query_one("SELECT COALESCE(SUM(amount_rub),0) AS s FROM events WHERE type='rain'") or {}).get("s", 0)
     ttrub = (query_one("SELECT COALESCE(SUM(amount_rub),0) AS s FROM events WHERE type='tip'") or {}).get("s", 0)
-    recent = query_all("""SELECT type,chat,sender,receivers,amount_text,crypto_symbol,amount_rub,amount_usd,created_at,ts
+    recent = query_all("""SELECT type,chat,sender,receivers,amount_text,crypto_symbol,
+                          amount_rub,amount_usd,created_at,ts
                           FROM events ORDER BY id DESC LIMIT 30""")
     for r in recent:
-        try: rcs = json.loads(r.get("receivers") or "[]")
-        except: rcs = []
+        try:
+            rcs = json.loads(r.get("receivers") or "[]")
+        except Exception:
+            rcs = []
         r["receivers"] = rcs
         r["per_person_rub"] = (r.get("amount_rub") or 0) / max(len(rcs), 1)
     return {"totals": {"rains": total_rains, "tips": total_tips,
-                       "rain_rub": round(trub or 0, 2), "tip_rub": round(ttrub or 0, 2)},
-            "recent": recent, "generated_at": datetime.now(timezone.utc).isoformat()}
+                       "rain_rub": round(trub or 0, 2),
+                       "tip_rub": round(ttrub or 0, 2)},
+            "recent": recent,
+            "generated_at": datetime.now(timezone.utc).isoformat()}
+
 
 @app.post("/api/clear")
 async def clear_database(body: dict, x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY: raise HTTPException(401, "Invalid API key")
-    if body.get("confirm") != "DELETE_ALL": raise HTTPException(400, "Подтверждение обязательно")
-    if USE_POSTGRES: execute("TRUNCATE TABLE events RESTART IDENTITY CASCADE;")
-    else: execute("DELETE FROM events;")
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
+    if body.get("confirm") != "DELETE_ALL":
+        raise HTTPException(400, "Подтверждение обязательно")
+    if USE_POSTGRES:
+        execute("TRUNCATE TABLE events RESTART IDENTITY CASCADE;")
+    else:
+        execute("DELETE FROM events;")
     return {"ok": True, "message": "Все данные удалены"}
+
 
 # ==================== HTML ====================
 BASE_HTML = """<!DOCTYPE html>
@@ -1502,9 +2199,13 @@ tr:hover td{{background:#1c222b}}
 <main>{content}</main>
 </body></html>"""
 
+
 def fmt_rub(x):
-    try: return f"{x:,.2f}".replace(",", " ").replace(".", ",") + " ₽"
-    except: return "0 ₽"
+    try:
+        return f"{x:,.2f}".replace(",", " ").replace(".", ",") + " ₽"
+    except Exception:
+        return "0 ₽"
+
 
 @app.get("/", response_class=HTMLResponse)
 async def page_home():
@@ -1538,7 +2239,9 @@ async def page_home():
       }}
       loadOnce(); setInterval(loadOnce, 15000);
     </script>"""
-    return BASE_HTML.format(title="Shuffle Rain Stats", active_home="active", active_hosts="", active_receivers="", content=content)
+    return BASE_HTML.format(title="Shuffle Rain Stats", active_home="active",
+                            active_hosts="", active_receivers="", content=content)
+
 
 @app.get("/receivers", response_class=HTMLResponse)
 async def page_receivers():
@@ -1599,17 +2302,32 @@ async def page_receivers():
       }
       loadReceiversTop();
     </script>"""
-    return BASE_HTML.format(title="Shuffle — Получатели", active_home="", active_hosts="", active_receivers="active", content=content)
+    return BASE_HTML.format(title="Shuffle — Получатели", active_home="",
+                            active_hosts="", active_receivers="active", content=content)
+
 
 @app.get("/hosts", response_class=HTMLResponse)
 async def page_hosts():
-    r1 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='rain' GROUP BY sender ORDER BY total DESC LIMIT 50")
-    r2 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='rain' GROUP BY sender ORDER BY cnt DESC LIMIT 50")
-    t1 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY total DESC LIMIT 50")
-    t2 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY cnt DESC LIMIT 50")
+    r1 = query_all("""SELECT sender AS nickname, COUNT(*) AS cnt,
+                      COALESCE(SUM(amount_rub),0) AS total
+                      FROM events WHERE type='rain' GROUP BY sender
+                      ORDER BY total DESC LIMIT 50""")
+    r2 = query_all("""SELECT sender AS nickname, COUNT(*) AS cnt,
+                      COALESCE(SUM(amount_rub),0) AS total
+                      FROM events WHERE type='rain' GROUP BY sender
+                      ORDER BY cnt DESC LIMIT 50""")
+    t1 = query_all("""SELECT sender AS nickname, COUNT(*) AS cnt,
+                      COALESCE(SUM(amount_rub),0) AS total
+                      FROM events WHERE type='tip' GROUP BY sender
+                      ORDER BY total DESC LIMIT 50""")
+    t2 = query_all("""SELECT sender AS nickname, COUNT(*) AS cnt,
+                      COALESCE(SUM(amount_rub),0) AS total
+                      FROM events WHERE type='tip' GROUP BY sender
+                      ORDER BY cnt DESC LIMIT 50""")
 
     def table(rows):
-        if not rows: return "<tr><td colspan='4' class='muted'>Пусто</td></tr>"
+        if not rows:
+            return "<tr><td colspan='4' class='muted'>Пусто</td></tr>"
         html = ""
         for i, r in enumerate(rows, 1):
             nick = r['nickname'].replace("'", "\\'")
@@ -1686,7 +2404,9 @@ async def page_hosts():
         alert('Сохранено');
       }}
     </script>"""
-    return BASE_HTML.format(title="Shuffle — Раздающие", active_home="", active_hosts="active", active_receivers="", content=content)
+    return BASE_HTML.format(title="Shuffle — Раздающие", active_home="",
+                            active_hosts="active", active_receivers="", content=content)
+
 
 # ==================== MONITOR ====================
 MONITOR_HTML = r"""<!DOCTYPE html>
@@ -2103,7 +2823,6 @@ const esc = s => (s==null?'':String(s)).replace(/[<>&"]/g, c=>({'<':'&lt;','>':'
 const CURRENCIES = ["USDT","USDC","BTC","ETH","SOL","LTC","DOGE","XRP","TRX","BNB","SHIB","SHFL","POL","MATIC","AVAX","TON","GRAM","BONK","WIF","PUMP","TRUMP","DAI","CASH","USD"];
 const ALL_CHATS = ["ENGLISH","RUSSIAN","JAPANESE","TURKISH","FRENCH","SPANISH","PORTUGUESE","KOREAN","VIETNAMESE","POLISH","INDONESIAN","CHINESE"];
 
-// === СОРТИРОВКА ТАБЛИЦ (клик по <th>) ===
 function sortTable(tableId, colIdx) {
   const table = document.getElementById(tableId);
   if (!table) return;
@@ -2122,7 +2841,6 @@ function sortTable(tableId, colIdx) {
   rows.forEach(r => tb.appendChild(r));
 }
 
-// === АВТОКОМПЛИТ ===
 function attachAutocomplete(inputEl) {
   if (!inputEl) return;
   inputEl.setAttribute('autocomplete','off');
@@ -2376,12 +3094,10 @@ async function loadIntentsStats(){
 async function loadCalendar(){
   const r = await fetch('/api/days?days=60').then(r=>r.json());
   const grid = $('calGrid'); grid.innerHTML = '';
-  // соберём map
   const byDay = {};
   r.days.forEach(d=>{ byDay[d.day] = d; });
   const today = new Date();
   const start = new Date(today); start.setDate(start.getDate() - 41);
-  // Собираем 42 дня (6 недель)
   for (let i=0; i<42; i++) {
     const d = new Date(start); d.setDate(start.getDate() + i);
     const key = d.toISOString().slice(0,10);
@@ -2657,18 +3373,38 @@ setInterval(refreshStatus, 3000);
 </script></body></html>
 """
 
+
 @app.get("/monitor", response_class=HTMLResponse)
 async def monitor_page():
     return MONITOR_HTML
 
+
 @app.on_event("startup")
 async def startup_event():
+    # 1. Загружаем курсы (не зависит от БД)
     _load_server_rates()
+
+    # 2. Создаём / мигрируем таблицы — ОБЯЗАТЕЛЬНО ДО запуска фоновых потоков
+    try:
+        init_db()
+        print("[STARTUP] ✅ Таблицы БД готовы")
+    except Exception as e:
+        print(f"[STARTUP] ❌ Ошибка init_db: {e}")
+
+    try:
+        migrate_ts_once()
+        print("[STARTUP] ✅ Миграция ts выполнена")
+    except Exception as e:
+        print(f"[STARTUP] ⚠️ migrate_ts_once: {e}")
+
+    # 3. Теперь безопасно запускаем фоновые потоки, работающие с БД
     threading.Thread(target=rates_refresh_thread, daemon=True).start()
     threading.Thread(target=dedup_thread, daemon=True).start()
     threading.Thread(target=ticks_cleanup_thread, daemon=True).start()
     threading.Thread(target=promo_parser_thread, daemon=True).start()
     print(f"[PROMO] Поток @{PROMO_CHANNEL} запущен")
+    print("[STARTUP] 🚀 Все потоки запущены")
+
 
 if __name__ == "__main__":
     import uvicorn
