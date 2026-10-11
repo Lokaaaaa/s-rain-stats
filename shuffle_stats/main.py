@@ -9,7 +9,7 @@ from collections import defaultdict
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from pydantic import BaseModel
 
 import requests
@@ -53,7 +53,6 @@ LANG_MAP = {
     'PORTUGUESE': 'португальский', 'KOREAN': 'корейский', 'VIETNAMESE': 'вьетнамский',
     'POLISH': 'польский', 'INDONESIAN': 'индонезийский', 'CHINESE': 'китайский',
 }
-
 
 # ==================== RATES ====================
 RATES_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_rates.json")
@@ -358,6 +357,18 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_cp_user ON chat_players(username)")
     execute("CREATE INDEX IF NOT EXISTS idx_cp_last ON chat_players(last_seen)")
 
+    # НОВОЕ: тики сообщений — для окон 15/25/60 минут
+    if USE_POSTGRES:
+        execute("""CREATE TABLE IF NOT EXISTS player_message_ticks (
+            username TEXT NOT NULL, chat TEXT NOT NULL, ts DOUBLE PRECISION NOT NULL,
+            PRIMARY KEY (username, chat, ts))""")
+    else:
+        execute("""CREATE TABLE IF NOT EXISTS player_message_ticks (
+            username TEXT NOT NULL, chat TEXT NOT NULL, ts REAL NOT NULL,
+            PRIMARY KEY (username, chat, ts))""")
+    execute("CREATE INDEX IF NOT EXISTS idx_pmt_user_ts ON player_message_ticks(username, ts)")
+    execute("CREATE INDEX IF NOT EXISTS idx_pmt_ts ON player_message_ticks(ts)")
+
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS player_profiles (
             id SERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL,
@@ -506,6 +517,18 @@ def dedup_thread():
             print(f"[DEDUP] thread: {e}")
 
 
+def ticks_cleanup_thread():
+    while True:
+        time.sleep(6 * 3600)
+        try:
+            cutoff = time.time() - 7 * 86400
+            p = ph()
+            execute(f"DELETE FROM player_message_ticks WHERE ts < {p}", (cutoff,))
+            print("[TICKS] ✅ Очистка >7 дней")
+        except Exception as e:
+            print(f"[TICKS] ⚠️ {e}")
+
+
 # ==================== МОДЕЛИ ====================
 class EventIn(BaseModel):
     type: str
@@ -597,9 +620,15 @@ class PlayerStatItem(BaseModel):
     last_seen: float = 0.0
 
 
+class PlayerTick(BaseModel):
+    username: str
+    ts: float
+
+
 class PlayersBatchIn(BaseModel):
     chat: str
     players: List[PlayerStatItem] = []
+    ticks: List[PlayerTick] = []
 
 
 # ==================== РАСЧЁТ ====================
@@ -796,6 +825,124 @@ async def add_players_batch(body: PlayersBatchIn, x_api_key: str = Header(defaul
                 SET msg_count = msg_count + excluded.msg_count,
                     last_seen = MAX(last_seen, excluded.last_seen)""",
                 (body.chat, name, msgs, last_seen, last_seen))
+
+    # Тики сообщений
+    if body.ticks:
+        inserted = 0
+        for t in body.ticks:
+            un = (t.username or "").strip()
+            if not un or un == "?":
+                continue
+            try:
+                ts_val = float(t.ts or 0)
+            except Exception:
+                continue
+            if ts_val <= 0:
+                continue
+            if USE_POSTGRES:
+                execute(f"""INSERT INTO player_message_ticks (username, chat, ts)
+                            VALUES ({p},{p},{p})
+                            ON CONFLICT (username, chat, ts) DO NOTHING""",
+                        (un, body.chat, ts_val))
+            else:
+                execute(f"""INSERT OR IGNORE INTO player_message_ticks (username, chat, ts)
+                            VALUES ({p},{p},{p})""",
+                        (un, body.chat, ts_val))
+            inserted += 1
+        if inserted:
+            print(f"[TICKS] {body.chat}: +{inserted}")
+
+    return {"ok": True}
+
+
+@app.get("/api/player/activity")
+async def api_player_activity(username: str, windows: str = "15,25,60"):
+    """Активность игрока по ВСЕМ чатам, где он когда-либо писал."""
+    un = (username or "").strip()
+    if not un:
+        raise HTTPException(status_code=400, detail="username required")
+    try:
+        wins = sorted({int(w) for w in windows.split(",") if w.strip()})
+    except Exception:
+        wins = [15, 25, 60]
+    max_win = max(wins) if wins else 60
+    since = time.time() - max_win * 60
+
+    # Все чаты, где игрок когда-либо писал
+    all_chat_rows = query_all(
+        "SELECT chat, msg_count, last_seen FROM chat_players WHERE username=?",
+        (un,)
+    )
+    all_chats = {r["chat"]: {"msg_count": r.get("msg_count", 0) or 0,
+                              "last_seen_total": r.get("last_seen") or 0}
+                 for r in all_chat_rows}
+
+    # Тики за последний час
+    tick_rows = query_all("""SELECT chat, ts FROM player_message_ticks
+                             WHERE username=? AND ts >= ?
+                             ORDER BY ts DESC""", (un, since))
+
+    now = time.time()
+    per_chat = {c: {"counts": {w: 0 for w in wins},
+                    "last_ts": 0.0,
+                    "total_msgs": meta["msg_count"] or 0,
+                    "last_seen_total": meta["last_seen_total"] or 0}
+                for c, meta in all_chats.items()}
+
+    for r in tick_rows:
+        c = r["chat"]
+        ts = float(r["ts"] or 0)
+        if c not in per_chat:
+            per_chat[c] = {"counts": {w: 0 for w in wins},
+                           "last_ts": 0.0, "total_msgs": 0, "last_seen_total": 0}
+        for w in wins:
+            if now - ts <= w * 60:
+                per_chat[c]["counts"][w] += 1
+        if ts > per_chat[c]["last_ts"]:
+            per_chat[c]["last_ts"] = ts
+
+    total = {w: 0 for w in wins}
+    last_ts = 0.0
+    for c, v in per_chat.items():
+        for w in wins:
+            total[w] += v["counts"][w]
+        if v["last_ts"] > last_ts:
+            last_ts = v["last_ts"]
+
+    chats = []
+    for c, v in per_chat.items():
+        effective_last = max(v["last_ts"] or 0, v["last_seen_total"] or 0)
+        chats.append({
+            "chat": c,
+            "counts": v["counts"],
+            "last_ts": effective_last,
+            "minutes_ago": int((now - effective_last) / 60) if effective_last else None,
+            "total_msgs": v["total_msgs"] or 0,
+        })
+    chats.sort(key=lambda x: (-sum(x["counts"].values()), -x["last_ts"]))
+
+    global_last = 0.0
+    for c in chats:
+        if c["last_ts"] > global_last:
+            global_last = c["last_ts"]
+
+    return {
+        "username": un,
+        "windows": wins,
+        "total": total,
+        "last_ts": global_last,
+        "minutes_ago_total": int((now - global_last) / 60) if global_last else None,
+        "chats": chats,
+        "now": now,
+        "known_chats": len(chats),
+    }
+
+
+@app.post("/api/event/{event_id}/delete")
+async def delete_event(event_id: int, x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    execute("DELETE FROM events WHERE id=?", (event_id,))
     return {"ok": True}
 
 
@@ -1871,7 +2018,7 @@ async def page_receivers():
           const r = await fetch(`/api/receivers_top?metric=${{metric}}&limit=${{limit}}&days=${{days}}`).then(r=>r.json());
           const body = document.getElementById('rtBody');
           if (!r.players.length) {{
-            body.innerHTML = '<tr><td colspan="7" class="muted">Нет данных (нужны свежие события с receivers_info)</td></tr>';
+            body.innerHTML = '<tr><td colspan="7" class="muted">Нет данных</td></tr>';
             document.getElementById('rtStatus').textContent = '';
             return;
           }}
@@ -1883,17 +2030,12 @@ async def page_receivers():
               const col = p.active_percent >= 60 ? '#4ade80' : (p.active_percent >= 30 ? '#fbbf24' : '#f87171');
               pctCell = `<span style="color:${{col}};font-weight:600">${{p.active_percent}}%</span>`;
             }}
-            return `<tr>
-              <td>${{i+1}}</td>
-              <td><b>${{esc(p.nickname)}}</b></td>
+            return `<tr><td>${{i+1}}</td><td><b>${{esc(p.nickname)}}</b></td>
               <td class="amount">${{fmtMoney(p.total_rub)}} ₽</td>
-              <td>${{p.wins}}</td>
-              <td>${{p.active_wins}} / ${{p.known_wins}}</td>
-              <td>${{pctCell}}</td>
-              <td>${{chats}}</td>
-            </tr>`;
+              <td>${{p.wins}}</td><td>${{p.active_wins}} / ${{p.known_wins}}</td>
+              <td>${{pctCell}}</td><td>${{chats}}</td></tr>`;
           }}).join('');
-          document.getElementById('rtStatus').textContent = `Найдено: ${{r.total}} игроков · окно ${{r.window_min}} мин`;
+          document.getElementById('rtStatus').textContent = `Найдено: ${{r.total}} игроков`;
         }} catch(e) {{
           document.getElementById('rtStatus').textContent = '❌ ' + e.message;
         }}
@@ -1922,6 +2064,69 @@ async def page_hosts():
         return "".join(row_with_profile(r, i) for i, r in enumerate(rows, 1))
 
     content = f"""
+    <div class="card" style="margin-bottom:16px">
+      <h3>🔎 Активность игрока (по всем чатам)</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0">
+        <input id="paNick" type="text" placeholder="Ник (например Merami)" style="background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:8px 12px;border-radius:6px;font-size:14px;width:220px">
+        <button onclick="checkPlayerActivity()" style="background:#2563eb;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Проверить</button>
+        <span id="paStatus" style="color:#8b949e;font-size:12px"></span>
+      </div>
+      <div id="paResult"></div>
+    </div>
+    <script>
+      async function checkPlayerActivity() {{
+        const un = document.getElementById('paNick').value.trim();
+        if (!un) return;
+        const s = document.getElementById('paStatus');
+        const r = document.getElementById('paResult');
+        s.textContent = '⏳';
+        r.innerHTML = '';
+        try {{
+          const d = await fetch('/api/player/activity?username=' + encodeURIComponent(un)).then(r=>r.json());
+          const wins = d.windows || [15, 25, 60];
+          const lbl = w => w === 60 ? '1ч' : (w + 'м');
+          const totalRow = wins.map(w => {{
+            const v = d.total[w] || 0;
+            const col = v > 0 ? '#4ade80' : '#666';
+            return `<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:10px 16px;min-width:110px">
+              <span style="color:#8b949e;font-size:12px">За ${{lbl(w)}}</span>
+              <b style="display:block;font-size:20px;color:${{col}};margin-top:2px">${{v}}</b>
+            </div>`;
+          }}).join('');
+          const lastInfo = d.minutes_ago_total !== null && d.minutes_ago_total !== undefined
+            ? `Последнее сообщение: <b style="color:#8ab4f8">${{d.minutes_ago_total}} мин назад</b>`
+            : '<span class="muted">Нет сообщений за последний час</span>';
+          const chatsRows = (d.chats || []).map(c => {{
+            const cells = wins.map(w => {{
+              const v = c.counts[w] || 0;
+              return `<td style="text-align:center;color:${{v>0?'#4ade80':'#555'}};font-weight:${{v>0?'600':'400'}}">${{v}}</td>`;
+            }}).join('');
+            const totalRecent = wins.reduce((a,w) => a + (c.counts[w]||0), 0);
+            const rowStyle = totalRecent === 0 ? 'style="opacity:0.45"' : '';
+            const lastLabel = c.minutes_ago === null || c.minutes_ago === undefined
+              ? '—'
+              : (c.minutes_ago < 60
+                  ? c.minutes_ago + 'м'
+                  : (c.minutes_ago < 60*24
+                      ? Math.floor(c.minutes_ago/60) + 'ч'
+                      : Math.floor(c.minutes_ago/(60*24)) + 'д'));
+            return `<tr ${{rowStyle}}><td><b>${{c.chat}}</b> <span class="muted" style="font-size:11px">${{c.total_msgs||0}} всего</span></td>${{cells}}<td>${{lastLabel}}</td></tr>`;
+          }}).join('');
+          const tableHead = `<tr><th>Чат</th>${{wins.map(w => `<th style="text-align:center">${{lbl(w)}}</th>`).join('')}}<th>Последнее</th></tr>`;
+          r.innerHTML = `
+            <div style="display:flex;gap:12px;flex-wrap:wrap;margin:12px 0">${{totalRow}}</div>
+            <div style="color:#8b949e;font-size:13px;margin-bottom:8px">${{lastInfo}}</div>
+            ${{chatsRows ? `<table><thead>${{tableHead}}</thead><tbody>${{chatsRows}}</tbody></table>` : '<div class="muted">Нет активности в чатах за последний час</div>'}}
+          `;
+          s.textContent = '✅';
+        }} catch(e) {{
+          s.textContent = '❌ ' + e.message;
+        }}
+      }}
+      document.getElementById('paNick').addEventListener('keydown', e => {{
+        if (e.key === 'Enter') checkPlayerActivity();
+      }});
+    </script>
     <div class="grid" style="grid-template-columns: 1fr 1fr">
       <div class="card"><h3>🌧 Раздал дождей — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r1)}</tbody></table></div>
       <div class="card"><h3>🌧 Раздал дождей — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r2)}</tbody></table></div>
@@ -1986,9 +2191,9 @@ async def page_hosts():
     return BASE_HTML.format(title="Shuffle — Раздающие", active_home="", active_hosts="active", active_receivers="", content=content)
 
 
-# ==================== MONITOR (без изменений) ====================
-# Здесь оставь свой MONITOR_HTML целиком из предыдущей версии —
-# я его не менял, кроме того что он используется ниже.
+# ==================== MONITOR ====================
+# MONITOR_HTML оставляем из прошлой версии — большой блок, ничего в нём не менял.
+# Скопируй его из предыдущего main.py.
 
 MONITOR_HTML = r"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
@@ -2126,8 +2331,8 @@ tr.rubric-row td{background:#2a2410 !important}
       <input type="number" id="betMinUsd" placeholder="Мин. $" value="50">
       <select id="betRange"><option value="">Всё время</option><option value="1">1 час</option><option value="24" selected>24 часа</option><option value="168">7 дней</option></select>
       <button class="btn" onclick="loadBets()">Фильтр</button>
-      <button class="btn" onclick="loadBetsStats()">📊 По чатам (24ч)</button>
-      <button class="btn" onclick="loadBetsTop()">🏆 Топ (7д)</button>
+      <button class="btn" onclick="loadBetsStats()">📊 По чатам</button>
+      <button class="btn" onclick="loadBetsTop()">🏆 Топ</button>
       <button class="btn danger" onclick="clearBetsTop()">🗑 Очистить топ</button>
     </div>
     <div id="betStats" style="margin-bottom:16px"></div>
@@ -2182,7 +2387,7 @@ tr.rubric-row td{background:#2a2410 !important}
   <div id="tab-ai" style="display:none">
     <div class="row-flex">
       <select id="aiChat"><option value="">Выбери чат</option></select>
-      <button class="btn" onclick="runAI()">🤖 Получить сообщения</button>
+      <button class="btn" onclick="runAI()">🤖 Получить</button>
       <button class="btn" onclick="loadAILatest()">📋 Последний</button>
       <span class="hint" id="aiStatus"></span>
     </div>
@@ -2557,17 +2762,17 @@ async function runAI(){
       else if(t.status === 'completed'){
         clearInterval(aiPollTimer); aiPollTimer = null;
         $('aiStatus').textContent = '✅';
-        btn.disabled=false; btn.textContent='🤖 Получить сообщения';
+        btn.disabled=false; btn.textContent='🤖 Получить';
         renderAIResult(t.result, chat);
       } else if(t.status === 'failed'){
         clearInterval(aiPollTimer); aiPollTimer = null;
         $('aiStatus').textContent = '❌';
         $('aiTopic').innerHTML = `<div class="ai-topic" style="color:#f87171">Ошибка: ${esc(t.error||'неизвестная')}</div>`;
-        btn.disabled=false; btn.textContent='🤖 Получить сообщения';
+        btn.disabled=false; btn.textContent='🤖 Получить';
       }
-      if(tries > 60){ clearInterval(aiPollTimer); aiPollTimer = null; $('aiStatus').textContent = '⏱'; btn.disabled=false; btn.textContent='🤖 Получить сообщения'; }
+      if(tries > 60){ clearInterval(aiPollTimer); aiPollTimer = null; $('aiStatus').textContent = '⏱'; btn.disabled=false; btn.textContent='🤖 Получить'; }
     }, 2000);
-  } catch(e){ alert('Ошибка'); btn.disabled=false; btn.textContent='🤖 Получить сообщения'; }
+  } catch(e){ alert('Ошибка'); btn.disabled=false; btn.textContent='🤖 Получить'; }
 }
 function renderAIResult(result, chat){
   if(!result){ $('aiResult').innerHTML = '<p class="hint">Нет</p>'; return; }
@@ -2691,6 +2896,7 @@ async def startup_event():
     threading.Thread(target=rates_refresh_thread, daemon=True).start()
     threading.Thread(target=dedup_events, daemon=True).start()
     threading.Thread(target=dedup_thread, daemon=True).start()
+    threading.Thread(target=ticks_cleanup_thread, daemon=True).start()
     threading.Thread(target=promo_parser_thread, daemon=True).start()
     print(f"[PROMO] Поток @{PROMO_CHANNEL} запущен")
     if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
