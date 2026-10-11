@@ -20,11 +20,9 @@ GROQ_MODEL = "openai/gpt-oss-20b"
 
 _default_screenshots = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", _default_screenshots)
-try:
-    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+try: os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 except (PermissionError, OSError):
-    SCREENSHOT_DIR = _default_screenshots
-    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    SCREENSHOT_DIR = _default_screenshots; os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 if USE_POSTGRES:
     import psycopg2, psycopg2.extras
@@ -42,6 +40,10 @@ BET_TO_RAIN_WINDOW_SEC = 900
 LANG_MAP = {'ENGLISH':'английский','RUSSIAN':'русский','JAPANESE':'японский','TURKISH':'турецкий',
             'FRENCH':'французский','SPANISH':'испанский','PORTUGUESE':'португальский','KOREAN':'корейский',
             'VIETNAMESE':'вьетнамский','POLISH':'польский','INDONESIAN':'индонезийский','CHINESE':'китайский'}
+
+# Список валют для автокомплита
+CURRENCIES = ["USDT","USDC","BTC","ETH","SOL","LTC","DOGE","XRP","TRX","BNB","SHIB","SHFL","POL","MATIC",
+              "AVAX","TON","GRAM","BONK","WIF","PUMP","TRUMP","DAI","CASH","USD"]
 
 # ==================== RATES ====================
 RATES_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_rates.json")
@@ -291,7 +293,11 @@ def init_db():
             lang TEXT DEFAULT 'ENGLISH', description TEXT DEFAULT '',
             is_top INTEGER DEFAULT 0, updated_at REAL)""")
 
+    # === ACCOUNT BALANCES (сколько всего на аккаунте) ===
     if USE_POSTGRES:
+        execute("""CREATE TABLE IF NOT EXISTS account_balances (
+            currency TEXT PRIMARY KEY, amount DOUBLE PRECISION DEFAULT 0,
+            amount_usd DOUBLE PRECISION DEFAULT 0, updated_at DOUBLE PRECISION)""")
         execute("""CREATE TABLE IF NOT EXISTS vault_balances (
             currency TEXT PRIMARY KEY, amount DOUBLE PRECISION DEFAULT 0,
             amount_usd DOUBLE PRECISION DEFAULT 0, updated_at DOUBLE PRECISION)""")
@@ -303,6 +309,9 @@ def init_db():
             id INTEGER PRIMARY KEY, amount_required DOUBLE PRECISION DEFAULT 0,
             deadline_ts DOUBLE PRECISION DEFAULT 0, updated_at DOUBLE PRECISION)""")
     else:
+        execute("""CREATE TABLE IF NOT EXISTS account_balances (
+            currency TEXT PRIMARY KEY, amount REAL DEFAULT 0,
+            amount_usd REAL DEFAULT 0, updated_at REAL)""")
         execute("""CREATE TABLE IF NOT EXISTS vault_balances (
             currency TEXT PRIMARY KEY, amount REAL DEFAULT 0,
             amount_usd REAL DEFAULT 0, updated_at REAL)""")
@@ -341,64 +350,44 @@ def migrate_ts_once():
         else:
             execute("""UPDATE events SET ts = CAST(strftime('%s', created_at) AS REAL)
                        WHERE ts IS NULL AND created_at IS NOT NULL""")
-        meta_set("ts_migrated_v1", "1"); print("[DB] ✅ ts миграция")
-    except Exception as e: print(f"[DB] ❌ ts: {e}")
+        meta_set("ts_migrated_v1", "1")
+    except Exception as e: print(f"[DB] ⚠️ ts: {e}")
 
 # ==================== CLEANUP ====================
 def dedup_events():
     try:
-        rows = query_all("""SELECT id, type, chat, sender, amount_text, amount_type, crypto_symbol, amount_rub, amount_usd
-                            FROM events WHERE (amount_rub IS NULL OR amount_rub=0 OR amount_usd IS NULL OR amount_usd=0)
-                            LIMIT 5000""")
-        fixed = 0
+        rows = query_all("""SELECT id, amount_text, crypto_symbol, amount_rub, amount_usd
+                            FROM events WHERE (amount_rub IS NULL OR amount_rub=0 OR amount_usd IS NULL OR amount_usd=0) LIMIT 5000""")
         for r in rows:
             txt = r.get("amount_text") or ""
             crypto = (r.get("crypto_symbol") or "").upper().strip()
             value = None
-            try: value = float(txt.replace("\u00a0", " ").replace(" ", "").replace(",", ".").replace("₽", "").replace("$", "").replace("€", ""))
+            try: value = float(txt.replace("\u00a0"," ").replace(" ","").replace(",",".").replace("₽","").replace("$","").replace("€",""))
             except: pass
             if value is None: continue
             new_rub = r.get("amount_rub") or 0; new_usd = r.get("amount_usd") or 0
-            has_fiat = any(m in txt for m in ("₽", "$", "€", "£"))
+            has_fiat = any(m in txt for m in ("₽","$","€","£"))
             if crypto and not has_fiat:
                 cr = server_rate_rub(crypto); cu = server_rate_usd(crypto)
                 if cr and not new_rub: new_rub = value * cr
                 if cu and not new_usd: new_usd = value * cu
             elif "₽" in txt and not new_rub: new_rub = value
             elif "$" in txt and not new_usd: new_usd = value
-            elif not crypto:
-                if not new_rub: new_rub = value
-                if not new_usd and new_rub:
-                    uu = server_rate_usd("USDT") or 1.0; ur = server_rate_rub("USDT") or 95.0
-                    new_usd = new_rub / ur * uu
             if new_rub != (r.get("amount_rub") or 0) or new_usd != (r.get("amount_usd") or 0):
-                p = ph(); execute(f"UPDATE events SET amount_rub={p}, amount_usd={p} WHERE id={p}", (new_rub, new_usd, r["id"])); fixed += 1
-        if fixed: print(f"[DEDUP] ✅ Пересчитано {fixed}")
-        dups = query_all("""SELECT a.id AS keep_id, b.id AS del_id FROM events a JOIN events b
-            ON a.id < b.id AND a.type=b.type AND a.chat=b.chat AND a.sender=b.sender
-            AND a.receivers=b.receivers AND a.amount_text=b.amount_text
-            AND ABS(COALESCE(a.ts,0)-COALESCE(b.ts,0))<60 LIMIT 2000""")
-        if dups:
-            ids = list({d["del_id"] for d in dups})
-            for i in range(0, len(ids), 500):
-                ch = ids[i:i+500]; phs = ",".join([ph()] * len(ch))
-                execute(f"DELETE FROM events WHERE id IN ({phs})", tuple(ch))
-            print(f"[DEDUP] ✅ Удалено {len(ids)} дублей")
-    except Exception as e: print(f"[DEDUP] ❌ {type(e).__name__}: {e}")
+                p = ph(); execute(f"UPDATE events SET amount_rub={p}, amount_usd={p} WHERE id={p}", (new_rub, new_usd, r["id"]))
+    except Exception as e: print(f"[DEDUP] ❌ {e}")
 
 def dedup_thread():
     while True:
         time.sleep(600)
         try: dedup_events()
-        except Exception as e: print(f"[DEDUP] thread: {e}")
+        except: pass
 
 def ticks_cleanup_thread():
     while True:
         time.sleep(6 * 3600)
-        try:
-            execute(f"DELETE FROM player_message_ticks WHERE ts < {ph()}", (time.time() - 7 * 86400,))
-            print("[TICKS] ✅ Очистка")
-        except Exception as e: print(f"[TICKS] ⚠️ {e}")
+        try: execute(f"DELETE FROM player_message_ticks WHERE ts < {ph()}", (time.time() - 7 * 86400,))
+        except: pass
 
 # ==================== МОДЕЛИ ====================
 class EventIn(BaseModel):
@@ -433,8 +422,7 @@ class InstanceStatus(BaseModel):
 class StatusPayload(BaseModel):
     instances: List[InstanceStatus] = []; screenshot_requests: List[int] = []
 
-class ChatTaskIn(BaseModel):
-    chat: str
+class ChatTaskIn(BaseModel): chat: str
 
 class ChatTaskCompleteIn(BaseModel):
     task_id: int; messages: List[dict] = []; error: str = ""
@@ -448,8 +436,11 @@ class PlayerTick(BaseModel):
 class PlayersBatchIn(BaseModel):
     chat: str; players: List[PlayerStatItem] = []; ticks: List[PlayerTick] = []
 
-class VaultBalanceIn(BaseModel):
+class BalanceIn(BaseModel):
     currency: str; amount: float; amount_usd: Optional[float] = None
+
+class BalanceDeleteIn(BaseModel):
+    currency: str
 
 class VaultTransactionIn(BaseModel):
     type: str; currency: str = "USDT"; amount: float = 0.0
@@ -460,6 +451,11 @@ class VaultWagerIn(BaseModel):
 
 class VaultGoalIn(BaseModel):
     goal_usd: float; goal_text: str = ""
+
+class TransferIn(BaseModel):
+    direction: str  # "to_vault" | "to_account"
+    currency: str
+    amount: float
 
 # ==================== РАСЧЁТ ====================
 def _recalc_amounts(amount_text, amount_type, crypto_symbol):
@@ -535,7 +531,7 @@ async def events_batch(payload: dict, x_api_key: str = Header(default="")):
                      json.dumps(e.get("context_messages", []), ensure_ascii=False),
                      json.dumps(e.get("context_bets", []), ensure_ascii=False)))
             inserted += 1
-        except Exception as ex: print(f"[BATCH] insert err: {ex}")
+        except: pass
     return {"ok": True, "inserted": inserted}
 
 @app.post("/api/bulk_alert")
@@ -630,7 +626,6 @@ async def add_players_batch(body: PlayersBatchIn, x_api_key: str = Header(defaul
                             last_seen=MAX(last_seen,excluded.last_seen)""",
                     (body.chat, name, msgs, last_seen, last_seen))
     if body.ticks:
-        inserted = 0
         for t in body.ticks:
             un = (t.username or "").strip()
             if not un or un == "?": continue
@@ -643,8 +638,6 @@ async def add_players_batch(body: PlayersBatchIn, x_api_key: str = Header(defaul
             else:
                 execute(f"INSERT OR IGNORE INTO player_message_ticks (username,chat,ts) VALUES ({p},{p},{p})",
                         (un, body.chat, ts_val))
-            inserted += 1
-        if inserted: print(f"[TICKS] {body.chat}: +{inserted}")
     return {"ok": True}
 
 @app.get("/api/player/activity")
@@ -805,22 +798,19 @@ def fetch_promo_channel():
             if not text: continue
             messages.append({"tg_msg_id": data_post, "text": text, "link": f"https://t.me/{data_post}", "message_date": msg_date})
         return messages
-    except Exception as e:
-        print(f"[PROMO] ❌ {type(e).__name__}: {e}"); return []
+    except: return []
 
 def promo_parser_thread():
     time.sleep(10)
     while True:
         try:
-            messages = fetch_promo_channel(); new_count = 0
+            messages = fetch_promo_channel()
             for m in messages:
                 if query_one("SELECT id FROM promocodes WHERE tg_msg_id=?", (m["tg_msg_id"],)): continue
                 execute(f"""INSERT INTO promocodes (tg_msg_id,text,link,message_date,discovered_at,used)
                             VALUES ({ph()},{ph()},{ph()},{ph()},{ph()},0)""",
                         (m["tg_msg_id"], m["text"], m["link"], m["message_date"], time.time()))
-                new_count += 1
-            if new_count: print(f"[PROMO] ✅ +{new_count} из @{PROMO_CHANNEL}")
-        except Exception as e: print(f"[PROMO] ❌ {type(e).__name__}: {e}")
+        except: pass
         time.sleep(PROMO_PARSE_INTERVAL)
 
 @app.get("/api/promocodes")
@@ -868,10 +858,39 @@ async def api_promo_test():
         new_count += 1
     return {"ok": True, "found": len(messages), "new": new_count}
 
-# ==================== VAULT ====================
+# ==================== ХРАНИЛИЩЕ / АККАУНТ ====================
+def _balance_upsert(table, cur, amt, amt_usd):
+    p = ph()
+    if USE_POSTGRES:
+        execute(f"""INSERT INTO {table} (currency,amount,amount_usd,updated_at) VALUES ({p},{p},{p},{p})
+                    ON CONFLICT (currency) DO UPDATE SET amount=EXCLUDED.amount,amount_usd=EXCLUDED.amount_usd,updated_at=EXCLUDED.updated_at""",
+                (cur, amt, amt_usd, time.time()))
+    else:
+        execute(f"""INSERT INTO {table} (currency,amount,amount_usd,updated_at) VALUES ({p},{p},{p},{p})
+                    ON CONFLICT (currency) DO UPDATE SET amount=excluded.amount,amount_usd=excluded.amount_usd,updated_at=excluded.updated_at""",
+                (cur, amt, amt_usd, time.time()))
+
+def _balance_get(table, cur):
+    return query_one(f"SELECT amount, amount_usd FROM {table} WHERE currency=?", (cur,))
+
+def _balance_add(table, cur, delta_amt, delta_usd):
+    row = _balance_get(table, cur)
+    new_amt = (float(row["amount"]) if row else 0.0) + delta_amt
+    new_usd = (float(row["amount_usd"]) if row else 0.0) + delta_usd
+    if new_amt < 0: new_amt = 0.0
+    if new_usd < 0: new_usd = 0.0
+    _balance_upsert(table, cur, new_amt, new_usd)
+
+def _calc_usd(cur, amount):
+    cur = (cur or "").upper().strip()
+    if cur in ("USD", "USDT", "USDC", "DAI", "CASH"): return amount
+    rate = server_rate_usd(cur)
+    return amount * rate if rate else 0.0
+
 @app.get("/api/vault")
 async def get_vault():
-    balances = query_all("SELECT * FROM vault_balances ORDER BY currency")
+    account = query_all("SELECT * FROM account_balances ORDER BY currency")
+    vault = query_all("SELECT * FROM vault_balances ORDER BY currency")
     wager = query_one("SELECT * FROM wager_state WHERE id=1") or {"amount_required": 0, "deadline_ts": 0}
     goal_usd = float(vault_meta_get("goal_usd") or 0)
     goal_text = vault_meta_get("goal_text") or ""
@@ -880,61 +899,84 @@ async def get_vault():
     income_week = (query_one("SELECT COALESCE(SUM(amount_usd),0) AS s FROM vault_transactions WHERE ts>=? AND type='income'", (week_ago,)) or {"s": 0})["s"] or 0
     wager_week = (query_one("SELECT COALESCE(SUM(amount_usd),0) AS s FROM vault_transactions WHERE ts>=? AND type='wager_spend'", (week_ago,)) or {"s": 0})["s"] or 0
     vault_add_week = (query_one("SELECT COALESCE(SUM(amount_usd),0) AS s FROM vault_transactions WHERE ts>=? AND type='vault_add'", (week_ago,)) or {"s": 0})["s"] or 0
-    total_usd = sum(float(b.get("amount_usd") or 0) for b in balances)
+    total_account = sum(float(b.get("amount_usd") or 0) for b in account)
+    total_vault = sum(float(b.get("amount_usd") or 0) for b in vault)
     days_left = max(0, int((wager.get("deadline_ts", 0) - now) / 86400)) if wager.get("deadline_ts") else None
     hours_left = max(0, int((wager.get("deadline_ts", 0) - now) / 3600)) if wager.get("deadline_ts") else None
-    return {"balances": balances, "total_usd": round(total_usd, 2),
+    return {"account": account, "vault": vault,
+            "total_account_usd": round(total_account, 2),
+            "total_vault_usd": round(total_vault, 2),
+            "total_usd": round(total_account + total_vault, 2),
             "wager": {"amount_required": wager.get("amount_required", 0),
                       "deadline_ts": wager.get("deadline_ts", 0),
                       "days_left": days_left, "hours_left": hours_left,
                       "is_expired": (wager.get("deadline_ts", 0) > 0 and wager.get("deadline_ts", 0) < now)},
             "goal_usd": goal_usd, "goal_text": goal_text,
             "week": {"income": round(income_week, 2), "wager_spend": round(wager_week, 2), "vault_add": round(vault_add_week, 2)},
+            "currencies": CURRENCIES,
             "now": now}
 
-@app.post("/api/vault/balance")
-async def set_vault_balance(body: VaultBalanceIn):
+@app.post("/api/account/balance")
+async def set_account_balance(body: BalanceIn):
     cur = body.currency.upper().strip()
     if not cur: raise HTTPException(400, "currency required")
-    amt = float(body.amount or 0); amt_usd = body.amount_usd
-    if amt_usd is None:
-        if cur in ("USD", "USDT", "USDC", "DAI", "CASH"): amt_usd = amt
-        else:
-            rate = server_rate_usd(cur); amt_usd = amt * rate if rate else 0.0
-    p = ph()
-    if USE_POSTGRES:
-        execute(f"""INSERT INTO vault_balances (currency,amount,amount_usd,updated_at) VALUES ({p},{p},{p},{p})
-                    ON CONFLICT (currency) DO UPDATE SET amount=EXCLUDED.amount,amount_usd=EXCLUDED.amount_usd,updated_at=EXCLUDED.updated_at""",
-                (cur, amt, amt_usd, time.time()))
-    else:
-        execute(f"""INSERT INTO vault_balances (currency,amount,amount_usd,updated_at) VALUES ({p},{p},{p},{p})
-                    ON CONFLICT (currency) DO UPDATE SET amount=excluded.amount,amount_usd=excluded.amount_usd,updated_at=excluded.updated_at""",
-                (cur, amt, amt_usd, time.time()))
+    amt = float(body.amount or 0)
+    amt_usd = body.amount_usd if body.amount_usd is not None else _calc_usd(cur, amt)
+    _balance_upsert("account_balances", cur, amt, amt_usd)
+    return {"ok": True}
+
+@app.post("/api/account/balance/delete")
+async def delete_account_balance(body: BalanceDeleteIn):
+    cur = (body.currency or "").upper().strip()
+    if not cur: raise HTTPException(400, "currency required")
+    execute("DELETE FROM account_balances WHERE currency=?", (cur,))
+    return {"ok": True}
+
+@app.post("/api/vault/balance")
+async def set_vault_balance(body: BalanceIn):
+    cur = body.currency.upper().strip()
+    if not cur: raise HTTPException(400, "currency required")
+    amt = float(body.amount or 0)
+    amt_usd = body.amount_usd if body.amount_usd is not None else _calc_usd(cur, amt)
+    _balance_upsert("vault_balances", cur, amt, amt_usd)
     return {"ok": True}
 
 @app.post("/api/vault/balance/delete")
-async def delete_vault_balance(body: dict):
-    cur = (body.get("currency") or "").upper().strip()
+async def delete_vault_balance(body: BalanceDeleteIn):
+    cur = (body.currency or "").upper().strip()
     if not cur: raise HTTPException(400, "currency required")
     execute("DELETE FROM vault_balances WHERE currency=?", (cur,))
     return {"ok": True}
 
-def _add_to_balance(cur, delta_amt, delta_usd):
-    cur = cur.upper().strip()
-    row = query_one("SELECT amount, amount_usd FROM vault_balances WHERE currency=?", (cur,))
-    new_amt = (float(row["amount"]) if row else 0.0) + delta_amt
-    new_usd = (float(row["amount_usd"]) if row else 0.0) + delta_usd
-    if new_amt < 0: new_amt = 0.0
-    if new_usd < 0: new_usd = 0.0
-    p = ph()
-    if USE_POSTGRES:
-        execute(f"""INSERT INTO vault_balances (currency,amount,amount_usd,updated_at) VALUES ({p},{p},{p},{p})
-                    ON CONFLICT (currency) DO UPDATE SET amount=EXCLUDED.amount,amount_usd=EXCLUDED.amount_usd,updated_at=EXCLUDED.updated_at""",
-                (cur, new_amt, new_usd, time.time()))
+@app.post("/api/transfer")
+async def transfer(body: TransferIn):
+    """Перевод между account и vault."""
+    direction = body.direction.strip()
+    cur = body.currency.upper().strip()
+    amt = float(body.amount or 0)
+    if direction not in ("to_vault", "to_account"): raise HTTPException(400, "direction must be to_vault or to_account")
+    if amt <= 0: raise HTTPException(400, "amount must be > 0")
+    if not cur: raise HTTPException(400, "currency required")
+    usd = _calc_usd(cur, amt)
+    if direction == "to_vault":
+        row = _balance_get("account_balances", cur)
+        if not row or float(row["amount"]) < amt:
+            raise HTTPException(400, f"Недостаточно {cur} на аккаунте")
+        _balance_add("account_balances", cur, -amt, -usd)
+        _balance_add("vault_balances", cur, amt, usd)
+        execute(f"""INSERT INTO vault_transactions (ts,type,currency,amount,amount_usd,description)
+                    VALUES ({ph()},'vault_add',{ph()},{ph()},{ph()},{ph()})""",
+                (time.time(), cur, amt, usd, f"Перевод в хранилище {amt} {cur}"))
     else:
-        execute(f"""INSERT INTO vault_balances (currency,amount,amount_usd,updated_at) VALUES ({p},{p},{p},{p})
-                    ON CONFLICT (currency) DO UPDATE SET amount=excluded.amount,amount_usd=excluded.amount_usd,updated_at=excluded.updated_at""",
-                (cur, new_amt, new_usd, time.time()))
+        row = _balance_get("vault_balances", cur)
+        if not row or float(row["amount"]) < amt:
+            raise HTTPException(400, f"Недостаточно {cur} в хранилище")
+        _balance_add("vault_balances", cur, -amt, -usd)
+        _balance_add("account_balances", cur, amt, usd)
+        execute(f"""INSERT INTO vault_transactions (ts,type,currency,amount,amount_usd,description)
+                    VALUES ({ph()},'vault_take',{ph()},{ph()},{ph()},{ph()})""",
+                (time.time(), cur, amt, usd, f"Перевод из хранилища {amt} {cur}"))
+    return {"ok": True}
 
 @app.post("/api/vault/transaction")
 async def add_vault_transaction(body: VaultTransactionIn):
@@ -943,16 +985,21 @@ async def add_vault_transaction(body: VaultTransactionIn):
         raise HTTPException(400, "invalid type")
     ts_val = body.ts if body.ts else time.time()
     cur = (body.currency or "USDT").upper().strip()
-    amount = float(body.amount or 0); amount_usd = float(body.amount_usd or 0)
+    amount = float(body.amount or 0)
+    amount_usd = float(body.amount_usd or 0)
     if amount_usd == 0 and amount != 0:
-        if cur in ("USD", "USDT", "USDC", "DAI", "CASH"): amount_usd = amount
-        else:
-            rate = server_rate_usd(cur); amount_usd = amount * rate if rate else 0.0
+        amount_usd = _calc_usd(cur, amount)
     execute(f"""INSERT INTO vault_transactions (ts,type,currency,amount,amount_usd,description)
                 VALUES ({ph()},{ph()},{ph()},{ph()},{ph()},{ph()})""",
             (ts_val, typ, cur, amount, amount_usd, body.description or ""))
-    if typ == "vault_add" and amount: _add_to_balance(cur, amount, amount_usd)
-    if typ == "vault_take" and amount: _add_to_balance(cur, -amount, -amount_usd)
+    if typ == "vault_add" and amount:
+        _balance_add("vault_balances", cur, amount, amount_usd)
+        _balance_add("account_balances", cur, -amount, -amount_usd)
+    if typ == "vault_take" and amount:
+        _balance_add("vault_balances", cur, -amount, -amount_usd)
+        _balance_add("account_balances", cur, amount, amount_usd)
+    if typ == "income" and amount:
+        _balance_add("account_balances", cur, amount, amount_usd)
     return {"ok": True}
 
 @app.get("/api/vault/transactions")
@@ -976,10 +1023,6 @@ async def set_wager(body: VaultWagerIn):
                     ON CONFLICT (id) DO UPDATE SET amount_required=excluded.amount_required,
                     deadline_ts=excluded.deadline_ts,updated_at=excluded.updated_at""",
                 (body.amount_required, body.deadline_ts, time.time()))
-    if body.spent_now is not None and body.spent_now > 0:
-        execute(f"""INSERT INTO vault_transactions (ts,type,currency,amount,amount_usd,description)
-                    VALUES ({ph()},'wager_spend','USD',{ph()},{ph()},'Ручная установка')""",
-                (time.time(), body.spent_now, body.spent_now))
     return {"ok": True}
 
 @app.post("/api/vault/goal")
@@ -1042,7 +1085,6 @@ def _process_chat_task_groq(task_id, chat_name, messages):
     result = {"topic": data.get("topic", ""), "messages": data.get("messages", [])[:5], "phrases": data.get("phrases", [])[:5]}
     execute("UPDATE chat_tasks SET status='completed', result=?, completed_at=? WHERE id=?",
             (json.dumps(result, ensure_ascii=False), time.time(), task_id))
-    print(f"[AI] ✅ Task #{task_id} ({chat_name})")
 
 @app.post("/api/chat/request")
 async def chat_request(body: ChatTaskIn):
@@ -1167,24 +1209,6 @@ async def api_receivers_top(limit: int = 100, metric: str = "total", days: int =
     else: arr.sort(key=lambda x: x["total_rub"], reverse=True)
     return {"players": arr[:limit], "total": len(arr), "window_min": window_min, "days": days}
 
-@app.get("/api/chart")
-async def api_chart(type: Optional[str] = None, chat: Optional[str] = None,
-                    since: Optional[float] = None, until: Optional[float] = None, last_hours: Optional[int] = None):
-    if last_hours: since = time.time() - last_hours * 3600
-    hour_expr = "CAST(EXTRACT(HOUR FROM to_timestamp(ts)) AS INTEGER)" if USE_POSTGRES else "CAST(strftime('%H', ts, 'unixepoch') AS INTEGER)"
-    q = f"SELECT {hour_expr} AS h, COUNT(*) AS c, COALESCE(SUM(amount_rub),0) AS s FROM events WHERE ts IS NOT NULL"
-    p = []
-    if since is not None: q += " AND ts>=?"; p.append(since)
-    if until is not None: q += " AND ts<=?"; p.append(until)
-    if type: q += " AND type=?"; p.append(type)
-    if chat: q += " AND chat=?"; p.append(chat)
-    q += " GROUP BY h"
-    rows = query_all(q, tuple(p))
-    buckets = {h: {"count": 0, "sum": 0.0} for h in range(24)}
-    for r in rows:
-        if r.get("h") is not None: buckets[int(r["h"])] = {"count": r["c"], "sum": r["s"] or 0}
-    return {"buckets": buckets}
-
 @app.get("/api/days")
 async def api_days():
     day_expr = "to_char(to_timestamp(ts),'YYYY-MM-DD')" if USE_POSTGRES else "strftime('%Y-%m-%d',ts,'unixepoch')"
@@ -1271,11 +1295,6 @@ async def api_player(username: Optional[str] = None, chat: Optional[str] = None,
     q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES else " ORDER BY ts DESC, id DESC LIMIT ?"
     p.append(limit)
     return {"rows": query_all(q, tuple(p)), "hourly": {h: 0 for h in range(24)}}
-
-@app.get("/api/player_names")
-async def api_player_names():
-    rows = query_all("SELECT DISTINCT username FROM player_activity ORDER BY username")
-    return {"names": [r["username"] for r in rows]}
 
 @app.get("/api/players")
 async def api_players(chat: Optional[str] = None, username: Optional[str] = None,
@@ -1463,16 +1482,6 @@ def fmt_rub(x):
     try: return f"{x:,.2f}".replace(",", " ").replace(".", ",") + " ₽"
     except: return "0 ₽"
 
-def render_rank_table(rows):
-    if not rows: return "<tr><td colspan='4' class='muted'>Пока нет данных</td></tr>"
-    html = ""
-    for i, r in enumerate(rows, 1):
-        rc = "g" if i == 1 else "s" if i == 2 else "b" if i == 3 else ""
-        html += f"""<tr><td><span class="rank {rc}">{i}</span></td>
-            <td><b>{r['nickname']}</b></td><td>{r['cnt']}</td>
-            <td class="amount">{fmt_rub(r['total'])}</td></tr>"""
-    return html
-
 # ==================== PAGES ====================
 @app.get("/", response_class=HTMLResponse)
 async def page_home():
@@ -1514,7 +1523,7 @@ async def page_home():
 async def page_receivers():
     content = """
     <div class="card">
-      <h3 style="display:flex;align-items:center;gap:6px">🎯 Топ активных получателей<span class="hint-btn" data-hint="Кто чаще всего получает дожди.&#10;&#10;Сортировка:&#10;• По сумме — сколько всего ₽ получил&#10;• По кол-ву — сколько раз попал под дождь&#10;• По % активных — какой процент выигрышей пришёл, когда он писал в чате за 25 мин до дождя.&#10;&#10;Чаты — где именно его дождило.">?</span></h3>
+      <h3 style="display:flex;align-items:center;gap:6px">🎯 Топ активных получателей<span class="hint-btn" data-hint="Кто чаще всего получает дожди.&#10;&#10;Сортировка:&#10;• По сумме — сколько всего ₽ получил&#10;• По кол-ву — сколько раз попал под дождь&#10;• По % активных — какой % выигрышей пришёл, когда он писал в чате за 25 мин до дождя.">?</span></h3>
       <p style="color:#8b949e;font-size:12px">«Активный» = писал в том же чате за 25 минут до дождя.</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
         <select id="rtMetric" onchange="loadReceiversTop()" style="background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:6px;border-radius:5px">
@@ -1569,24 +1578,23 @@ async def page_hosts():
     t1 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY total DESC LIMIT 50")
     t2 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY cnt DESC LIMIT 50")
 
-    def row_with_profile(r, i):
-        rank_cls = "g" if i == 1 else "s" if i == 2 else "b" if i == 3 else ""
-        nick = r['nickname']
-        safe_nick = nick.replace("'", "\\'")
-        return f"""<tr><td><span class="rank {rank_cls}">{i}</span></td>
-            <td><a href="#" onclick="openProfile('{safe_nick}');return false"><b>{nick}</b></a></td>
-            <td>{r['cnt']}</td><td class="amount">{fmt_rub(r['total'])}</td></tr>"""
-
-    def table(rows):
-        if not rows: return "<tr><td colspan='4' class='muted'>Пусто</td></tr>"
-        return "".join(row_with_profile(r, i) for i, r in enumerate(rows, 1))
+    def render_rank_table(rows):
+        if not rows: return "<tr><td colspan='4' class='muted'>Пока нет данных</td></tr>"
+        html = ""
+        for i, r in enumerate(rows, 1):
+            rc = "g" if i == 1 else "s" if i == 2 else "b" if i == 3 else ""
+            nick = r['nickname'].replace("'", "\\'")
+            html += f"""<tr><td><span class="rank {rc}">{i}</span></td>
+                <td><a href="#" onclick="openProfile('{nick}');return false"><b>{r['nickname']}</b></a></td>
+                <td>{r['cnt']}</td><td class="amount">{fmt_rub(r['total'])}</td></tr>"""
+        return html
 
     content = f"""
     <div class="grid" style="grid-template-columns: 1fr 1fr">
-      <div class="card"><h3 style="display:flex;align-items:center;gap:6px">🌧 Раздал дождей — по сумме<span class="hint-btn" data-hint="Кто раздал больше всего ₽ за дожди.&#10;&#10;Клик по нику → профиль с активностью 15/25/60/1440м, ставками и последними сообщениями.">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r1)}</tbody></table></div>
-      <div class="card"><h3 style="display:flex;align-items:center;gap:6px">🌧 Раздал дождей — по кол-ву<span class="hint-btn" data-hint="Кто чаще всего делал дожди.&#10;Даже если суммы маленькие — этот игрок заливает регулярно.">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r2)}</tbody></table></div>
-      <div class="card"><h3 style="display:flex;align-items:center;gap:6px">💸 Отправил чаевых — по сумме<span class="hint-btn" data-hint="Кто раздал больше всего ₽ за чаевые (tips).">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t1)}</tbody></table></div>
-      <div class="card"><h3 style="display:flex;align-items:center;gap:6px">💸 Отправил чаевых — по кол-ву<span class="hint-btn" data-hint="Кто чаще всего отправлял чаевые.">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t2)}</tbody></table></div>
+      <div class="card"><h3 style="display:flex;align-items:center;gap:6px">🌧 Раздал дождей — по сумме<span class="hint-btn" data-hint="Кто раздал больше всего ₽ за дожди.&#10;&#10;Клик по нику → профиль с активностью 15/25/60/1440м, ставками и последними сообщениями.">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(r1)}</tbody></table></div>
+      <div class="card"><h3 style="display:flex;align-items:center;gap:6px">🌧 Раздал дождей — по кол-ву<span class="hint-btn" data-hint="Кто чаще всего делал дожди.&#10;Даже если суммы маленькие — этот игрок заливает регулярно.">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(r2)}</tbody></table></div>
+      <div class="card"><h3 style="display:flex;align-items:center;gap:6px">💸 Отправил чаевых — по сумме<span class="hint-btn" data-hint="Кто раздал больше всего ₽ за чаевые (tips).">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(t1)}</tbody></table></div>
+      <div class="card"><h3 style="display:flex;align-items:center;gap:6px">💸 Отправил чаевых — по кол-ву<span class="hint-btn" data-hint="Кто чаще всего отправлял чаевые.">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(t2)}</tbody></table></div>
     </div>
     <div id="profileModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);align-items:center;justify-content:center;z-index:50;padding:20px">
       <div style="background:#161b22;border:1px solid #26303a;border-radius:12px;max-width:700px;width:100%;padding:24px;max-height:80vh;overflow-y:auto">
@@ -1682,6 +1690,7 @@ tr:hover td{background:#161a22}
 .btn:hover{background:#334055}
 .btn.danger{background:#3a1f1f;border-color:#7f1d1d}
 .btn.green{background:#1e3a26;border-color:#2d5a3a;color:#71d68a}
+.btn.blue{background:#1e40af;border-color:#1e88e5;color:#fff}
 .row-flex{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
 input,select,textarea{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6px 10px;border-radius:5px;font-size:13px;max-width:280px;font-family:inherit}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.8);display:none;align-items:center;justify-content:center;z-index:50}
@@ -1722,21 +1731,33 @@ input,select,textarea{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;
 tr.rubric-row td{background:#2a2410 !important}
 .vault-card{background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px 18px;margin-bottom:12px}
 .vault-card h3{margin:0 0 10px;font-size:13px;color:#8ab4f8;text-transform:uppercase}
-.vault-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1e232e;font-size:13px}
-.vault-row:last-child{border:none}
 .vault-amount{color:#71d68a;font-weight:600}
 .vault-warn{color:#fbbf24}
 .vault-danger{color:#f87171}
 .hint-btn{display:inline-block;width:18px;height:18px;line-height:18px;text-align:center;border-radius:50%;
   background:#1e88e5;color:#fff;font-size:12px;cursor:help;margin-left:8px;font-weight:bold;
-  position:relative;vertical-align:middle;flex-shrink:0;border:none;padding:0;
-  font-family:Arial,sans-serif;user-select:none}
+  position:relative;vertical-align:middle;flex-shrink:0;user-select:none;border:none;padding:0}
 .hint-btn:hover{background:#42a5f5}
 .hint-btn:hover::after{content:attr(data-hint);position:absolute;top:26px;left:-200px;width:420px;
   background:#1a1f28;color:#e6e6e6;border:1px solid #2f3d55;border-radius:8px;padding:14px;
   font-size:12px;font-weight:normal;line-height:1.6;z-index:1000;white-space:pre-wrap;
-  box-shadow:0 8px 30px rgba(0,0,0,.8);text-align:left;
-  pointer-events:none}
+  box-shadow:0 8px 30px rgba(0,0,0,.8);text-align:left;pointer-events:none}
+.balance-grid{display:grid;grid-template-columns:1fr 60px 1fr;gap:12px;align-items:start}
+.balance-col{background:#10131a;border:1px solid #232a37;border-radius:8px;padding:12px}
+.balance-col h4{margin:0 0 10px;font-size:12px;color:#8ab4f8;text-transform:uppercase;letter-spacing:.05em;display:flex;justify-content:space-between;align-items:center}
+.balance-total{font-size:16px;color:#71d68a;font-weight:600}
+.balance-row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #1a1f28;font-size:13px}
+.balance-row:last-child{border:none}
+.balance-cur{font-weight:600;color:#e6e6e6}
+.balance-amt{color:#aab}
+.transfer-arrow{display:flex;flex-direction:column;justify-content:center;align-items:center;padding-top:40px}
+.transfer-arrow .btn{width:44px;height:44px;font-size:18px;padding:0;border-radius:50%}
+.autocomplete-wrap{position:relative;display:inline-block}
+.autocomplete-list{position:absolute;top:100%;left:0;right:0;background:#1a1f28;border:1px solid #2f3d55;
+  border-radius:0 0 6px 6px;max-height:200px;overflow-y:auto;z-index:100;display:none}
+.autocomplete-list.on{display:block}
+.autocomplete-list div{padding:6px 10px;cursor:pointer;font-size:13px}
+.autocomplete-list div:hover,.autocomplete-list div.sel{background:#2f3d55;color:#fff}
 </style></head><body>
 <header>
   <h1>🎰 Shuffle Monitor</h1>
@@ -1745,18 +1766,18 @@ tr.rubric-row td{background:#2a2410 !important}
   <span style="margin-left:auto" class="pill" id="kpiTotal">—</span>
 </header>
 <div class="tabs">
-  <button data-tab="status" class="active">Вкладки<span class="hint-btn" data-hint="Состояние всех Chrome-инстансов.&#10;&#10;📸 — сделать скриншот вкладки.">?</span></button>
-  <button data-tab="events">События<span class="hint-btn" data-hint="Все дожди и типсы.&#10;&#10;Колонки:&#10;• ₽ — сумма в рублях&#10;• ₽/чел — сколько каждому получателю&#10;• $ — сумма в долларах&#10;&#10;«+N ещё» — раскрыть всех получателей.">?</span></button>
-  <button data-tab="bulk">Bulk-раздачи<span class="hint-btn" data-hint="Одинаковая сумма 3+ людям за 20 мин.&#10;&#10;📌 Рубрика — отметить как «это рубрика, не спам».&#10;Строка станет жёлтой.">?</span></button>
-  <button data-tab="bets">Ставки<span class="hint-btn" data-hint="Выигрышные ставки:&#10;• 📊 — из таблицы ставок&#10;• 💬 — из чата (фиолетовый)&#10;&#10;Фильтр по $ и множителю.">?</span></button>
-  <button data-tab="betsrains">Ставки→Дожди<span class="hint-btn" data-hint="Кто после СВОЕЙ ставки САМ залил дождь.&#10;Окно: 15 мин по умолчанию.&#10;&#10;Минимум 3 ставки ≥$20 за период.">?</span></button>
-  <button data-tab="contexts">Контексты<span class="hint-btn" data-hint="Дожди с контекстом:&#10;последние 15 сообщений + 5 ставок до дождя.">?</span></button>
-  <button data-tab="intents">Интенты<span class="hint-btn" data-hint="Обещания сделать дождь (Groq AI).&#10;&#10;AI% — уверенность модели (≥70% — сохраняется).&#10;Δ — через сколько секунд реально залил.">?</span></button>
-  <button data-tab="promos">Промокоды<span class="hint-btn" data-hint="Парсится из Telegram-канала.&#10;✅ — использован.&#10;💰 В хранилище — добавить в учёт хранилища.">?</span></button>
-  <button data-tab="me">👤 Мой профиль<span class="hint-btn" data-hint="Введи свой ник и запомни.&#10;&#10;Показывает:&#10;• Активность по чатам (15м / 25м / 1ч / 24ч)&#10;• Мои выигранные дожди&#10;• Мои ставки&#10;• Хранилище (балансы, вейджер, цель, транзакции)">?</span></button>
-  <button data-tab="ai">🤖 AI<span class="hint-btn" data-hint="AI читает 50 последних сообщений чата и предлагает:&#10;• 5 ответов по теме&#10;• 5 нейтральных фраз">?</span></button>
-  <button data-tab="players">👥 Игроки<span class="hint-btn" data-hint="Все игроки по чатам.&#10;Сообщений / последний раз / онлайн.&#10;↗ Язык — переместить в другой чат.">?</span></button>
-  <button data-tab="langs">🌍 Языки<span class="hint-btn" data-hint="Кто в каких чатах активен.&#10;Сколько сообщений в каждом.">?</span></button>
+  <button data-tab="status" class="active">Вкладки<span class="hint-btn" data-hint="Состояние всех Chrome-инстансов.&#10;📸 — сделать скриншот вкладки.">?</span></button>
+  <button data-tab="events">События<span class="hint-btn" data-hint="Все дожди и типсы.&#10;&#10;Колонки: ₽ / ₽-чел / $.&#10;«+N ещё» — раскрыть всех получателей.">?</span></button>
+  <button data-tab="bulk">Bulk-раздачи<span class="hint-btn" data-hint="Одинаковая сумма 3+ людям за 20 мин.&#10;&#10;📌 Рубрика — отметить (станет жёлтой).">?</span></button>
+  <button data-tab="bets">Ставки<span class="hint-btn" data-hint="Выигрышные ставки:&#10;• 📊 — из таблицы ставок&#10;• 💬 — из чата (фиолетовый)">?</span></button>
+  <button data-tab="betsrains">Ставки→Дожди<span class="hint-btn" data-hint="Кто после СВОЕЙ ставки САМ залил дождь.&#10;Окно: 15 мин.">?</span></button>
+  <button data-tab="contexts">Контексты<span class="hint-btn" data-hint="Дожди с контекстом: 15 сообщений + 5 ставок до дождя.">?</span></button>
+  <button data-tab="intents">Интенты<span class="hint-btn" data-hint="Обещания сделать дождь (Groq AI).&#10;AI% — уверенность модели.">?</span></button>
+  <button data-tab="promos">Промокоды<span class="hint-btn" data-hint="Парсится из TG-канала.&#10;💰 В хранилище — добавить в учёт.">?</span></button>
+  <button data-tab="me">👤 Мой профиль<span class="hint-btn" data-hint="Введи свой ник и запомни.&#10;&#10;Показывает: активность по чатам (15м / 25м / 1ч / 24ч),&#10;мои выигранные дожди, ставки,&#10;и два баланса — Аккаунт + Хранилище с переводом между ними.">?</span></button>
+  <button data-tab="ai">🤖 AI<span class="hint-btn" data-hint="AI читает 50 последних сообщений и предлагает 5 ответов + 5 фраз.">?</span></button>
+  <button data-tab="players">👥 Игроки<span class="hint-btn" data-hint="Все игроки по чатам.&#10;↗ Язык — переместить.">?</span></button>
+  <button data-tab="langs">🌍 Языки<span class="hint-btn" data-hint="Кто в каких чатах активен.">?</span></button>
 </div>
 <main>
   <div id="tab-status"><div class="kpi" id="kpiRow"></div>
@@ -1879,15 +1900,37 @@ tr.rubric-row td{background:#2a2410 !important}
     <div id="vaultKpi" class="kpi"></div>
     <div id="vaultWagerCard" class="vault-card"></div>
 
+    <!-- ДВЕ КОЛОНКИ БАЛАНСОВ -->
     <div class="vault-card">
-      <h3>💼 Балансы валют</h3>
-      <div id="vaultBalances"></div>
-      <div class="row-flex" style="margin-top:12px">
-        <input type="text" id="vbCurrency" placeholder="Валюта (USDT/SHFL/SOL...)" style="width:180px">
-        <input type="number" id="vbAmount" placeholder="Сумма" step="any" style="width:140px">
-        <input type="number" id="vbAmountUsd" placeholder="$ (auto)" step="any" style="width:160px">
-        <button class="btn green" onclick="setVaultBalance()">💾 Сохранить</button>
+      <h3>💼 Балансы</h3>
+      <div class="balance-grid">
+        <div class="balance-col">
+          <h4>💰 Аккаунт <span class="balance-total" id="accTotal">$0</span></h4>
+          <div id="accBalances"></div>
+          <div class="row-flex" style="margin-top:10px">
+            <div class="autocomplete-wrap">
+              <input type="text" id="accCur" placeholder="Валюта" style="width:130px" autocomplete="off">
+            </div>
+            <input type="number" id="accAmt" placeholder="Сумма" step="any" style="width:100px">
+            <button class="btn green" onclick="setAccBalance()">💾</button>
+          </div>
+        </div>
+
+        <div class="transfer-arrow">
+          <button class="btn blue" title="Перевести в хранилище" onclick="doTransfer('to_vault')">→</button>
+          <button class="btn blue" title="Вывести из хранилища" onclick="doTransfer('to_account')" style="margin-top:8px">←</button>
+          <div style="margin-top:8px;color:#666;font-size:10px;text-align:center">перевод</div>
+        </div>
+
+        <div class="balance-col">
+          <h4>🏦 Хранилище <span class="balance-total" id="vaultTotal">$0</span></h4>
+          <div id="vaultBalances"></div>
+        </div>
       </div>
+      <p class="hint" style="margin-top:12px">
+        Чтобы перевести: введи <b>валюту + сумму</b> в поле под "Аккаунт" и нажми стрелку.
+        Для вывода — то же самое, потом стрелку влево (нужно чтобы в хранилище была эта валюта).
+      </p>
     </div>
 
     <div class="vault-card">
@@ -1915,14 +1958,14 @@ tr.rubric-row td{background:#2a2410 !important}
         <select id="txType">
           <option value="income">💰 Получил $</option>
           <option value="wager_spend">🎲 Потратил на вейджер</option>
-          <option value="vault_add">📥 Убрал в хранилище</option>
-          <option value="vault_take">📤 Взял из хранилища</option>
+          <option value="vault_add">📥 Убрал в хранилище (перевод)</option>
+          <option value="vault_take">📤 Взял из хранилища (перевод)</option>
         </select>
-        <select id="txCurrency"><option>USD</option><option>USDT</option><option>USDC</option><option>SHFL</option><option>SOL</option><option>LTC</option><option>ETH</option><option>BTC</option></select>
+        <div class="autocomplete-wrap"><input type="text" id="txCurrency" placeholder="Валюта" style="width:120px" autocomplete="off" value="USDT"></div>
         <input type="number" id="txAmount" placeholder="Сумма" step="any" style="width:120px">
-        <input type="number" id="txAmountUsd" placeholder="$ (auto)" step="any" style="width:160px">
-        <input type="text" id="txDesc" placeholder="Описание" style="width:280px">
-        <button class="btn green" onclick="addTransaction()">➕ Добавить</button>
+        <input type="number" id="txAmountUsd" placeholder="$ (auto)" step="any" style="width:140px">
+        <input type="text" id="txDesc" placeholder="Описание" style="width:220px">
+        <button class="btn green" onclick="addTransaction()">➕</button>
       </div>
     </div>
 
@@ -1969,6 +2012,46 @@ const $ = id => document.getElementById(id);
 const fmtTime = ts => new Date(ts*1000).toLocaleString('ru-RU');
 const fmtMoney = v => (v||0).toLocaleString('ru-RU',{maximumFractionDigits:2});
 const esc = s => (s==null?'':String(s)).replace(/[<>&"]/g, c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+
+const CURRENCIES = ["USDT","USDC","BTC","ETH","SOL","LTC","DOGE","XRP","TRX","BNB","SHIB","SHFL","POL","MATIC","AVAX","TON","GRAM","BONK","WIF","PUMP","TRUMP","DAI","CASH","USD"];
+
+// Автокомплит
+function attachAutocomplete(inputEl) {
+  if (!inputEl) return;
+  inputEl.setAttribute('autocomplete','off');
+  const wrap = inputEl.parentElement;
+  if (!wrap.classList.contains('autocomplete-wrap')) return;
+  let list = wrap.querySelector('.autocomplete-list');
+  if (!list) {
+    list = document.createElement('div');
+    list.className = 'autocomplete-list';
+    wrap.appendChild(list);
+  }
+  let idx = -1;
+  function render(q) {
+    const qq = (q||'').toUpperCase();
+    const matches = qq ? CURRENCIES.filter(c => c.startsWith(qq)) : CURRENCIES;
+    if (!matches.length) { list.classList.remove('on'); return; }
+    list.innerHTML = matches.slice(0,8).map((c,i) => '<div data-c="'+c+'" class="'+(i===0?'sel':'')+'">'+c+'</div>').join('');
+    list.classList.add('on');
+    idx = 0;
+  }
+  inputEl.addEventListener('input', () => render(inputEl.value));
+  inputEl.addEventListener('focus', () => render(inputEl.value));
+  inputEl.addEventListener('blur', () => setTimeout(()=>{list.classList.remove('on');}, 150));
+  inputEl.addEventListener('keydown', (e) => {
+    const items = list.querySelectorAll('div');
+    if (!items.length || !list.classList.contains('on')) return;
+    if (e.key === 'ArrowDown') { idx = Math.min(idx+1, items.length-1); items.forEach((el,i)=>el.classList.toggle('sel', i===idx)); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { idx = Math.max(idx-1, 0); items.forEach((el,i)=>el.classList.toggle('sel', i===idx)); e.preventDefault(); }
+    else if (e.key === 'Enter' || e.key === 'Tab') { if (idx>=0 && items[idx]) { inputEl.value = items[idx].dataset.c; list.classList.remove('on'); e.preventDefault(); } }
+    else if (e.key === 'Escape') { list.classList.remove('on'); }
+  });
+  list.addEventListener('mousedown', (e) => {
+    const t = e.target.closest('div[data-c]');
+    if (t) { inputEl.value = t.dataset.c; list.classList.remove('on'); }
+  });
+}
 
 let bulkChips = [], aiPollTimer = null;
 
@@ -2288,31 +2371,40 @@ async function loadMeBets(){
   if(saved && $('meNick')) $('meNick').value = saved;
 })();
 
-// ===== VAULT =====
+// ===== VAULT / ACCOUNT =====
 async function loadVault(){
   const r = await fetch('/api/vault').then(r=>r.json());
   const w = r.wager; const daysLeft = w.days_left; const hasWager = w.amount_required > 0;
-  $('vaultKpi').innerHTML = '<div>Всего в хранилище<b style="color:#71d68a">$'+fmtMoney(r.total_usd)+'</b></div>'
+
+  // KPI
+  $('vaultKpi').innerHTML = '<div>Аккаунт<b style="color:#8ab4f8">$'+fmtMoney(r.total_account_usd)+'</b></div>'
+    + '<div>Хранилище<b style="color:#71d68a">$'+fmtMoney(r.total_vault_usd)+'</b></div>'
+    + '<div>Всего<b>$'+fmtMoney(r.total_usd)+'</b></div>'
     + (hasWager ? '<div>Вейджер<b style="color:'+(w.is_expired?'#f87171':(daysLeft<7?'#fbbf24':'#8ab4f8'))+'">$'+fmtMoney(w.amount_required)+'</b></div>' : '')
     + (r.goal_usd > 0 ? '<div>Цель<b style="color:#8ab4f8">$'+fmtMoney(r.goal_usd)+'</b><span class="hint">'+esc(r.goal_text||'')+'</span></div>' : '')
     + '<div>Доход 7д<b style="color:#71d68a">+$'+fmtMoney(r.week.income)+'</b></div>'
-    + '<div>Вейджер 7д<b style="color:#f87171">-$'+fmtMoney(r.week.wager_spend)+'</b></div>'
-    + '<div>В хранилище 7д<b style="color:#71d68a">+$'+fmtMoney(r.week.vault_add)+'</b></div>';
+    + '<div>Вейджер 7д<b style="color:#f87171">-$'+fmtMoney(r.week.wager_spend)+'</b></div>';
+
+  // Wager
   if(hasWager){
     const dl = new Date(w.deadline_ts*1000).toLocaleString('ru-RU');
     const exp = w.is_expired; const hrs = w.hours_left;
     const leftText = exp ? '<span class="vault-danger">⚠️ ИСТЁК</span>' : (hrs < 24 ? '<span class="vault-warn">осталось '+hrs+'ч</span>' : 'осталось '+daysLeft+'д');
     $('vaultWagerCard').innerHTML = '<h3>⚙️ Вейджер</h3>'
-      + '<div class="vault-row"><span>Требуется</span><span class="vault-amount">$'+fmtMoney(w.amount_required)+'</span></div>'
-      + '<div class="vault-row"><span>Дедлайн</span><span>'+dl+' · '+leftText+'</span></div>';
+      + '<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1e232e"><span>Требуется</span><span class="vault-amount">$'+fmtMoney(w.amount_required)+'</span></div>'
+      + '<div style="display:flex;justify-content:space-between;padding:6px 0"><span>Дедлайн</span><span>'+dl+' · '+leftText+'</span></div>';
   } else {
     $('vaultWagerCard').innerHTML = '<h3>⚙️ Вейджер</h3><p class="hint">Не задан</p>';
   }
-  const bl = $('vaultBalances');
-  if(!r.balances.length){ bl.innerHTML = '<p class="hint">Пусто</p>'; }
-  else {
-    bl.innerHTML = r.balances.map(b=>'<div class="vault-row"><span><b>'+esc(b.currency)+'</b></span><span><span class="vault-amount">'+fmtMoney(b.amount)+' '+esc(b.currency)+'</span> <span class="hint">≈ $'+fmtMoney(b.amount_usd)+'</span> <button class="btn danger" style="margin-left:8px;padding:2px 6px;font-size:11px" onclick="delBalance(\''+esc(b.currency)+'\')">🗑</button></span></div>').join('');
-  }
+
+  // Балансы — две колонки
+  const accEl = $('accBalances'); const vacEl = $('vaultBalances');
+  accEl.innerHTML = (r.account||[]).length ? r.account.map(b=>'<div class="balance-row"><span class="balance-cur">'+esc(b.currency)+'</span><span><span class="balance-amt">'+fmtMoney(b.amount)+'</span> <span class="hint">≈$'+fmtMoney(b.amount_usd)+'</span> <button class="btn danger" style="margin-left:6px;padding:1px 5px;font-size:10px" onclick="delAccBalance(\''+esc(b.currency)+'\')">🗑</button></span></div>').join('') : '<p class="hint">Пусто</p>';
+  vacEl.innerHTML = (r.vault||[]).length ? r.vault.map(b=>'<div class="balance-row"><span class="balance-cur">'+esc(b.currency)+'</span><span><span class="balance-amt">'+fmtMoney(b.amount)+'</span> <span class="hint">≈$'+fmtMoney(b.amount_usd)+'</span> <button class="btn danger" style="margin-left:6px;padding:1px 5px;font-size:10px" onclick="delVaultBalance(\''+esc(b.currency)+'\')">🗑</button></span></div>').join('') : '<p class="hint">Пусто</p>';
+  $('accTotal').textContent = '$' + fmtMoney(r.total_account_usd);
+  $('vaultTotal').textContent = '$' + fmtMoney(r.total_vault_usd);
+
+  // Формы
   if(hasWager){
     $('wgAmount').value = w.amount_required;
     if(w.deadline_ts){
@@ -2323,17 +2415,36 @@ async function loadVault(){
   }
   if(r.goal_usd > 0) $('goalUsd').value = r.goal_usd;
   if(r.goal_text) $('goalText').value = r.goal_text;
+
+  // Транзакции
   const tr = await fetch('/api/vault/transactions?days=60&limit=200').then(r=>r.json());
   $('txList').innerHTML = (tr.transactions||[]).map(t=>'<tr><td>'+fmtTime(t.ts)+'</td><td><span class="pill">'+esc(t.type)+'</span></td><td>'+esc(t.currency||'')+'</td><td>'+fmtMoney(t.amount)+'</td><td style="color:'+(t.amount_usd>=0?'#71d68a':'#f87171')+'">$'+fmtMoney(t.amount_usd)+'</td><td class="hint">'+esc(t.description||'')+'</td></tr>').join('') || '<tr><td colspan="6" class="hint">Нет</td></tr>';
 }
-async function setVaultBalance(){
-  const c = $('vbCurrency').value.trim().toUpperCase(); if(!c) return alert('Валюта');
-  const a = parseFloat($('vbAmount').value)||0;
-  const au = $('vbAmountUsd').value ? parseFloat($('vbAmountUsd').value) : null;
-  await fetch('/api/vault/balance',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({currency:c,amount:a,amount_usd:au})});
-  $('vbCurrency').value=''; $('vbAmount').value=''; $('vbAmountUsd').value=''; loadVault();
+
+async function setAccBalance(){
+  const c = $('accCur').value.trim().toUpperCase(); if(!c) return alert('Валюта');
+  const a = parseFloat($('accAmt').value)||0;
+  if(!a) return alert('Сумма');
+  await fetch('/api/account/balance',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({currency:c,amount:a})});
+  $('accCur').value=''; $('accAmt').value=''; loadVault();
 }
-async function delBalance(c){ if(!confirm('Удалить '+c+'?')) return; await fetch('/api/vault/balance/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({currency:c})}); loadVault(); }
+async function delAccBalance(c){ if(!confirm('Удалить '+c+' с аккаунта?')) return; await fetch('/api/account/balance/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({currency:c})}); loadVault(); }
+async function delVaultBalance(c){ if(!confirm('Удалить '+c+' из хранилища?')) return; await fetch('/api/vault/balance/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({currency:c})}); loadVault(); }
+
+async function doTransfer(direction){
+  const c = $('accCur').value.trim().toUpperCase(); if(!c) return alert('Введи валюту');
+  const a = parseFloat($('accAmt').value)||0;
+  if(!a) return alert('Введи сумму');
+  try {
+    const r = await fetch('/api/transfer',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({direction:direction, currency:c, amount:a})});
+    const d = await r.json();
+    if(!r.ok){ alert('❌ ' + (d.detail||'Ошибка')); return; }
+    $('accCur').value=''; $('accAmt').value='';
+    loadVault();
+  } catch(e) { alert('Ошибка: ' + e.message); }
+}
+
 async function saveWager(){
   const a = parseFloat($('wgAmount').value)||0; const dl = $('wgDeadline').value;
   let ts = 0; if(dl){ ts = new Date(dl).getTime()/1000; }
@@ -2346,7 +2457,7 @@ async function saveGoal(){
   alert('✅ Сохранена'); loadVault();
 }
 async function addTransaction(){
-  const t = $('txType').value; const c = $('txCurrency').value;
+  const t = $('txType').value; const c = $('txCurrency').value.trim().toUpperCase() || 'USDT';
   const a = parseFloat($('txAmount').value)||0;
   const au = $('txAmountUsd').value ? parseFloat($('txAmountUsd').value) : 0;
   const d = $('txDesc').value.trim();
@@ -2440,6 +2551,10 @@ async function loadLanguages(){
     + (p.chats||[]).map(c=>'<div class="player-row">'+esc(c)+'</div>').join('')+'</div>').join('');
 }
 
+// Init автокомплитов
+attachAutocomplete(document.getElementById('accCur'));
+attachAutocomplete(document.getElementById('txCurrency'));
+
 renderBulkChips();
 loadChats();
 refreshStatus();
@@ -2486,7 +2601,6 @@ migrate_ts_once()
 async def startup_event():
     _load_server_rates()
     threading.Thread(target=rates_refresh_thread, daemon=True).start()
-    threading.Thread(target=dedup_events, daemon=True).start()
     threading.Thread(target=dedup_thread, daemon=True).start()
     threading.Thread(target=ticks_cleanup_thread, daemon=True).start()
     threading.Thread(target=promo_parser_thread, daemon=True).start()
