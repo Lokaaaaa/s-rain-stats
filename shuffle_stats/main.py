@@ -150,7 +150,6 @@ def _try(sql):
     except Exception: pass
 
 def init_db():
-    # EVENTS
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS events (
             id SERIAL PRIMARY KEY, type TEXT NOT NULL, chat TEXT NOT NULL,
@@ -174,7 +173,6 @@ def init_db():
                 "idx_events_ts ON events(ts)", "idx_events_chat ON events(chat)"]:
         execute(f"CREATE INDEX IF NOT EXISTS {idx}")
 
-    # BULK
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS bulk_alerts (
             id SERIAL PRIMARY KEY, ts DOUBLE PRECISION NOT NULL, chat TEXT NOT NULL,
@@ -189,7 +187,6 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_bulk_ts ON bulk_alerts(ts)")
     execute("CREATE INDEX IF NOT EXISTS idx_bulk_sender ON bulk_alerts(sender)")
 
-    # PLAYER ACTIVITY
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS player_activity (
             id SERIAL PRIMARY KEY, ts DOUBLE PRECISION NOT NULL, username TEXT NOT NULL,
@@ -201,7 +198,6 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_player_ts ON player_activity(ts)")
     execute("CREATE INDEX IF NOT EXISTS idx_player_user ON player_activity(username)")
 
-    # BETS
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS bets (
             id SERIAL PRIMARY KEY, ts DOUBLE PRECISION NOT NULL, chat TEXT NOT NULL,
@@ -218,7 +214,6 @@ def init_db():
     for idx in ["idx_bets_ts ON bets(ts)", "idx_bets_chat ON bets(chat)", "idx_bets_sender ON bets(sender)"]:
         execute(f"CREATE INDEX IF NOT EXISTS {idx}")
 
-    # INTENTS
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS intents (
             id SERIAL PRIMARY KEY, ts DOUBLE PRECISION NOT NULL, chat TEXT NOT NULL,
@@ -233,7 +228,6 @@ def init_db():
     for idx in ["idx_intents_ts ON intents(ts)", "idx_intents_chat ON intents(chat)", "idx_intents_sender ON intents(sender)"]:
         execute(f"CREATE INDEX IF NOT EXISTS {idx}")
 
-    # PROMOCODES
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS promocodes (
             id SERIAL PRIMARY KEY, tg_msg_id TEXT UNIQUE, text TEXT NOT NULL, link TEXT,
@@ -250,7 +244,6 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_promo_used ON promocodes(used)")
     execute("CREATE INDEX IF NOT EXISTS idx_promo_date ON promocodes(discovered_at)")
 
-    # CHAT TASKS
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS chat_tasks (
             id SERIAL PRIMARY KEY, chat TEXT NOT NULL, status TEXT DEFAULT 'pending',
@@ -262,7 +255,6 @@ def init_db():
             messages TEXT, result TEXT, error TEXT, created_at REAL, completed_at REAL)""")
     execute("CREATE INDEX IF NOT EXISTS idx_task_status ON chat_tasks(status)")
 
-    # CHAT PLAYERS
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS chat_players (
             id SERIAL PRIMARY KEY, chat TEXT NOT NULL, username TEXT NOT NULL,
@@ -277,7 +269,6 @@ def init_db():
                 "idx_cp_last ON chat_players(last_seen)"]:
         execute(f"CREATE INDEX IF NOT EXISTS {idx}")
 
-    # TICKS
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS player_message_ticks (
             username TEXT NOT NULL, chat TEXT NOT NULL, ts DOUBLE PRECISION NOT NULL,
@@ -289,7 +280,6 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_pmt_user_ts ON player_message_ticks(username, ts)")
     execute("CREATE INDEX IF NOT EXISTS idx_pmt_ts ON player_message_ticks(ts)")
 
-    # PLAYER PROFILES
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS player_profiles (
             id SERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL,
@@ -329,7 +319,6 @@ def init_db():
     execute("CREATE TABLE IF NOT EXISTS vault_meta (k TEXT PRIMARY KEY, v TEXT)")
     execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
 
-
 def meta_get(k, default=None):
     r = query_one("SELECT v FROM meta WHERE k=?", (k,)); return r["v"] if r else default
 
@@ -353,10 +342,10 @@ def migrate_ts_once():
         else:
             execute("""UPDATE events SET ts = CAST(strftime('%s', created_at) AS REAL)
                        WHERE ts IS NULL AND created_at IS NOT NULL""")
-        meta_set("ts_migrated_v1", "1"); print("[DB] ✅ ts миграция ок")
+        meta_set("ts_migrated_v1", "1"); print("[DB] ✅ ts миграция")
     except Exception as e: print(f"[DB] ❌ ts: {e}")
 
-# ==================== ДЕДУП / CLEANUP ====================
+# ==================== CLEANUP ====================
 def dedup_events():
     try:
         rows = query_all("""SELECT id, type, chat, sender, amount_text, amount_type, crypto_symbol, amount_rub, amount_usd
@@ -367,10 +356,8 @@ def dedup_events():
             txt = r.get("amount_text") or ""
             crypto = (r.get("crypto_symbol") or "").upper().strip()
             value = None
-            try:
-                value = float(txt.replace("\u00a0", " ").replace(" ", "").replace(",", ".")
-                              .replace("₽", "").replace("$", "").replace("€", ""))
-            except Exception: pass
+            try: value = float(txt.replace("\u00a0", " ").replace(" ", "").replace(",", ".").replace("₽", "").replace("$", "").replace("€", ""))
+            except: pass
             if value is None: continue
             new_rub = r.get("amount_rub") or 0; new_usd = r.get("amount_usd") or 0
             has_fiat = any(m in txt for m in ("₽", "$", "€", "£"))
@@ -386,9 +373,7 @@ def dedup_events():
                     uu = server_rate_usd("USDT") or 1.0; ur = server_rate_rub("USDT") or 95.0
                     new_usd = new_rub / ur * uu
             if new_rub != (r.get("amount_rub") or 0) or new_usd != (r.get("amount_usd") or 0):
-                p = ph()
-                execute(f"UPDATE events SET amount_rub={p}, amount_usd={p} WHERE id={p}", (new_rub, new_usd, r["id"]))
-                fixed += 1
+                p = ph(); execute(f"UPDATE events SET amount_rub={p}, amount_usd={p} WHERE id={p}", (new_rub, new_usd, r["id"])); fixed += 1
         if fixed: print(f"[DEDUP] ✅ Пересчитано {fixed}")
         dups = query_all("""SELECT a.id AS keep_id, b.id AS del_id FROM events a JOIN events b
             ON a.id < b.id AND a.type=b.type AND a.chat=b.chat AND a.sender=b.sender
@@ -399,7 +384,7 @@ def dedup_events():
             for i in range(0, len(ids), 500):
                 ch = ids[i:i+500]; phs = ",".join([ph()] * len(ch))
                 execute(f"DELETE FROM events WHERE id IN ({phs})", tuple(ch))
-            print(f"[DEDUP] ✅ Удалено {len(ids)} дублей events")
+            print(f"[DEDUP] ✅ Удалено {len(ids)} дублей")
     except Exception as e: print(f"[DEDUP] ❌ {type(e).__name__}: {e}")
 
 def dedup_thread():
@@ -664,12 +649,12 @@ async def add_players_batch(body: PlayersBatchIn, x_api_key: str = Header(defaul
     return {"ok": True}
 
 @app.get("/api/player/activity")
-async def api_player_activity(username: str, windows: str = "15,25,60"):
+async def api_player_activity(username: str, windows: str = "15,25,60,1440"):
     un = (username or "").strip()
     if not un: raise HTTPException(400, "username required")
     try: wins = sorted({int(w) for w in windows.split(",") if w.strip()})
-    except: wins = [15, 25, 60]
-    max_win = max(wins) if wins else 60
+    except: wins = [15, 25, 60, 1440]
+    max_win = max(wins) if wins else 1440
     since = time.time() - max_win * 60
     all_chat_rows = query_all("SELECT chat, msg_count, last_seen FROM chat_players WHERE username=?", (un,))
     all_chats = {r["chat"]: {"msg_count": r.get("msg_count", 0) or 0, "last_seen_total": r.get("last_seen") or 0}
@@ -699,6 +684,27 @@ async def api_player_activity(username: str, windows: str = "15,25,60"):
     gl = max([c["last_ts"] for c in chats], default=0)
     return {"username": un, "windows": wins, "total": total, "last_ts": gl,
             "minutes_ago_total": int((now - gl) / 60) if gl else None, "chats": chats, "now": now, "known_chats": len(chats)}
+
+@app.get("/api/user/{nickname}/rains_received")
+async def user_rains_received(nickname: str, days: int = 30, limit: int = 200):
+    since = time.time() - days * 86400
+    rows = query_all("""SELECT id, ts, chat, sender, receivers, amount_text, amount_rub, amount_usd, crypto_symbol
+                        FROM events WHERE type='rain' AND ts >= ? ORDER BY ts DESC LIMIT 5000""", (since,))
+    out = []; total_rub = 0.0; total_usd = 0.0
+    for r in rows:
+        try: recs = json.loads(r.get("receivers") or "[]")
+        except: recs = []
+        if nickname not in recs: continue
+        n = len(recs) or 1
+        per_rub = (r.get("amount_rub") or 0) / n
+        per_usd = (r.get("amount_usd") or 0) / n
+        total_rub += per_rub; total_usd += per_usd
+        out.append({"id": r["id"], "ts": r["ts"], "chat": r["chat"], "sender": r["sender"],
+                    "amount_text": r["amount_text"], "crypto_symbol": r.get("crypto_symbol", ""),
+                    "share_rub": round(per_rub, 2), "share_usd": round(per_usd, 2), "receivers_count": n})
+        if len(out) >= limit: break
+    return {"nickname": nickname, "wins": len(out), "total_rub": round(total_rub, 2),
+            "total_usd": round(total_usd, 2), "items": out, "days": days}
 
 @app.post("/api/status")
 async def post_status(payload: StatusPayload, x_api_key: str = Header(default="")):
@@ -841,10 +847,9 @@ async def promo_to_vault(promo_id: int, body: dict = None):
     amount_usd = float(body.get("amount_usd") or 0)
     currency = (body.get("currency") or "USD").upper()
     execute("UPDATE promocodes SET used_for_vault=1, vault_amount_usd=? WHERE id=?", (amount_usd, promo_id))
-    ts_val = time.time()
     execute(f"""INSERT INTO vault_transactions (ts,type,currency,amount,amount_usd,description)
                 VALUES ({ph()},{ph()},{ph()},{ph()},{ph()},{ph()})""",
-            (ts_val, "promo_code", currency, amount_usd, amount_usd, f"Промокод: {row['text'][:100]}"))
+            (time.time(), "promo_code", currency, amount_usd, amount_usd, f"Промокод: {row['text'][:100]}"))
     return {"ok": True}
 
 @app.get("/api/promocodes/stats")
@@ -1348,18 +1353,6 @@ async def api_bets_to_rains(window_sec: int = BET_TO_RAIN_WINDOW_SEC, last_hours
     arr.sort(key=lambda x: (-x["percent"], -x["bets"]))
     return {"stats": arr[:100], "window_sec": window_sec}
 
-@app.get("/api/players_stats")
-async def api_players_stats(chat: Optional[str] = None, limit: int = 50):
-    q_base = "SELECT chat,username,msg_count,first_seen,last_seen FROM chat_players WHERE 1=1"; p = []
-    if chat: q_base += " AND chat=?"; p.append(chat)
-    q_base += " ORDER BY msg_count DESC LIMIT ?"; p.append(limit)
-    top = query_all(q_base, tuple(p))
-    q_online = "SELECT chat,username,msg_count,first_seen,last_seen FROM chat_players WHERE last_seen>=?"; p2 = [time.time() - 300]
-    if chat: q_online += " AND chat=?"; p2.append(chat)
-    q_online += " ORDER BY last_seen DESC LIMIT ?"; p2.append(limit)
-    recent = query_all(q_online, tuple(p2))
-    return {"top_by_msgs": top, "recent_online": recent}
-
 @app.get("/api/bets")
 async def api_bets(since: Optional[float] = None, until: Optional[float] = None, chat: Optional[str] = None,
                    sender: Optional[str] = None, min_usd: Optional[float] = None, source: Optional[str] = None,
@@ -1420,7 +1413,7 @@ async def clear_database(body: dict, x_api_key: str = Header(default="")):
     else: execute("DELETE FROM events;")
     return {"ok": True, "message": "Все данные удалены"}
 
-# ==================== BASE HTML (ДВОЙНЫЕ СКОБКИ!) ====================
+# ==================== BASE HTML ====================
 BASE_HTML = """<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title>
@@ -1472,22 +1465,6 @@ def render_rank_table(rows):
             <td><b>{r['nickname']}</b></td><td>{r['cnt']}</td>
             <td class="amount">{fmt_rub(r['total'])}</td></tr>"""
     return html
-
-def compute_receiver_stats(etype):
-    stats = defaultdict(lambda: {"cnt": 0, "total": 0.0})
-    for row in query_all(f"SELECT amount_rub, receivers FROM events WHERE type='{etype}'"):
-        try: rcs = json.loads(row["receivers"] or "[]")
-        except: continue
-        if not rcs: continue
-        sh = (row["amount_rub"] or 0) / len(rcs)
-        for r in rcs:
-            if r: stats[r]["cnt"] += 1; stats[r]["total"] += sh
-    return stats
-
-def sort_receiver_stats(stats, by="total", limit=50):
-    arr = [{"nickname": k, "cnt": v["cnt"], "total": v["total"]} for k, v in stats.items()]
-    arr.sort(key=lambda x: x[by], reverse=True)
-    return arr[:limit]
 
 # ==================== PAGES ====================
 @app.get("/", response_class=HTMLResponse)
@@ -1576,40 +1553,96 @@ async def page_receivers():
 
 @app.get("/hosts", response_class=HTMLResponse)
 async def page_hosts():
-    content = """
-    <div class="card" style="margin-bottom:16px">
-      <h3>🔎 Активность игрока (по всем чатам)</h3>
-      <div style="display:flex;gap:8px;align-items:center;margin:8px 0">
-        <input id="paNick" type="text" placeholder="Ник (напр. Merami)" style="background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:8px 12px;border-radius:6px;width:220px">
-        <button onclick="checkPlayerActivity()" style="background:#2563eb;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer">Проверить</button>
-        <span id="paStatus" style="color:#8b949e;font-size:12px"></span>
+    r1 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='rain' GROUP BY sender ORDER BY total DESC LIMIT 50")
+    r2 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='rain' GROUP BY sender ORDER BY cnt DESC LIMIT 50")
+    t1 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY total DESC LIMIT 50")
+    t2 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY cnt DESC LIMIT 50")
+
+    def row_with_profile(r, i):
+        rank_cls = "g" if i == 1 else "s" if i == 2 else "b" if i == 3 else ""
+        nick = r['nickname']
+        safe_nick = nick.replace("'", "\\'")
+        return f"""<tr><td><span class="rank {rank_cls}">{i}</span></td>
+            <td><a href="#" onclick="openProfile('{safe_nick}');return false"><b>{nick}</b></a></td>
+            <td>{r['cnt']}</td><td class="amount">{fmt_rub(r['total'])}</td></tr>"""
+
+    def table(rows):
+        if not rows: return "<tr><td colspan='4' class='muted'>Пусто</td></tr>"
+        return "".join(row_with_profile(r, i) for i, r in enumerate(rows, 1))
+
+    content = f"""
+    <div class="grid" style="grid-template-columns: 1fr 1fr">
+      <div class="card"><h3>🌧 Раздал дождей — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r1)}</tbody></table></div>
+      <div class="card"><h3>🌧 Раздал дождей — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r2)}</tbody></table></div>
+      <div class="card"><h3>💸 Отправил чаевых — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t1)}</tbody></table></div>
+      <div class="card"><h3>💸 Отправил чаевых — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t2)}</tbody></table></div>
+    </div>
+    <div id="profileModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);align-items:center;justify-content:center;z-index:50;padding:20px">
+      <div style="background:#161b22;border:1px solid #26303a;border-radius:12px;max-width:700px;width:100%;padding:24px;max-height:80vh;overflow-y:auto">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+          <h2 id="profName" style="margin:0;color:#7cc4ff"></h2>
+          <button onclick="document.getElementById('profileModal').style.display='none'" style="background:#2a3340;color:#e6e6e6;border:1px solid #334055;padding:4px 12px;border-radius:5px;cursor:pointer">✕</button>
+        </div>
+        <div style="margin-bottom:12px"><label style="color:#8b949e;font-size:12px">Язык:</label>
+          <select id="profLang" style="background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:6px;border-radius:5px;margin-left:8px">
+            <option>ENGLISH</option><option>RUSSIAN</option><option>JAPANESE</option><option>TURKISH</option>
+            <option>SPANISH</option><option>PORTUGUESE</option><option>FRENCH</option><option>KOREAN</option>
+            <option>CHINESE</option><option>POLISH</option><option>VIETNAMESE</option><option>INDONESIAN</option>
+          </select>
+        </div>
+        <div style="margin-bottom:12px"><label style="color:#8b949e;font-size:12px">Описание:</label>
+          <textarea id="profDesc" style="width:100%;background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:8px;border-radius:5px;margin-top:6px;min-height:80px"></textarea>
+        </div>
+        <div style="margin-bottom:16px"><label style="color:#8b949e;font-size:12px"><input type="checkbox" id="profTop"> Добавить в watch-list</label></div>
+        <div id="profContent"></div>
+        <button onclick="saveProfile()" style="background:#2563eb;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-weight:600">💾 Сохранить</button>
       </div>
-      <div id="paResult"></div>
     </div>
     <script>
-      async function checkPlayerActivity() {
-        const un = document.getElementById('paNick').value.trim(); if(!un) return;
-        const s = document.getElementById('paStatus'); const r = document.getElementById('paResult');
-        s.textContent = '⏳'; r.innerHTML = '';
-        const d = await fetch('/api/player/activity?username='+encodeURIComponent(un)).then(r=>r.json());
-        const wins = d.windows||[15,25,60]; const lbl = w => w===60?'1ч':(w+'м');
-        const totalRow = wins.map(w => { const v = d.total[w]||0; const col = v>0?'#4ade80':'#666';
-          return '<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:10px 16px;min-width:110px"><span style="color:#8b949e;font-size:12px">За '+lbl(w)+'</span><b style="display:block;font-size:20px;color:'+col+'">'+v+'</b></div>'; }).join('');
-        const chatsRows = (d.chats||[]).map(c => { const cells = wins.map(w => { const v = c.counts[w]||0;
-          return '<td style="text-align:center;color:'+(v>0?'#4ade80':'#555')+'">'+v+'</td>'; }).join('');
-          const tr = wins.reduce((a,w)=>a+(c.counts[w]||0),0); const style = tr===0?'style="opacity:0.45"':'';
-          const ll = c.minutes_ago===null?'—':(c.minutes_ago<60?c.minutes_ago+'м':(c.minutes_ago<1440?Math.floor(c.minutes_ago/60)+'ч':Math.floor(c.minutes_ago/1440)+'д'));
-          return '<tr '+style+'><td><b>'+c.chat+'</b> <span class="muted">'+(c.total_msgs||0)+' всего</span></td>'+cells+'<td>'+ll+'</td></tr>'; }).join('');
-        r.innerHTML = '<div style="display:flex;gap:12px;flex-wrap:wrap;margin:12px 0">'+totalRow+'</div>'
-          + '<div style="color:#8b949e;font-size:13px">Последнее: '+(d.minutes_ago_total !== null ? d.minutes_ago_total+'м назад' : '—')+'</div>'
-          + (chatsRows ? '<table><thead><tr><th>Чат</th>'+wins.map(w=>'<th style="text-align:center">'+lbl(w)+'</th>').join('')+'<th>Последнее</th></tr></thead><tbody>'+chatsRows+'</tbody></table>' : '');
-        s.textContent = '✅';
-      }
-      document.getElementById('paNick').addEventListener('keydown', e => { if(e.key==='Enter') checkPlayerActivity(); });
+      let currentNick = null;
+      async function openProfile(nick) {{
+        currentNick = nick;
+        document.getElementById('profileModal').style.display = 'flex';
+        document.getElementById('profName').textContent = nick;
+        const [prof, bets, msgs, activity] = await Promise.all([
+          fetch('/api/profile/' + encodeURIComponent(nick)).then(r=>r.json()),
+          fetch('/api/bets?sender=' + encodeURIComponent(nick) + '&limit=20').then(r=>r.json()),
+          fetch('/api/player?username=' + encodeURIComponent(nick) + '&limit=15').then(r=>r.json()),
+          fetch('/api/player/activity?username=' + encodeURIComponent(nick) + '&windows=15,25,60,1440').then(r=>r.json()).catch(()=>({{}}))
+        ]);
+        document.getElementById('profLang').value = prof.profile.lang || 'ENGLISH';
+        document.getElementById('profDesc').value = prof.profile.description || '';
+        document.getElementById('profTop').checked = !!prof.profile.is_top;
+        const wins = (activity.windows || [15,25,60,1440]);
+        const lbl = w => w === 1440 ? '24ч' : (w === 60 ? '1ч' : (w + 'м'));
+        const actRow = wins.map(w => '<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:8px 14px;min-width:100px">'
+          + '<span style="color:#8b949e;font-size:11px">За ' + lbl(w) + '</span>'
+          + '<b style="display:block;font-size:18px;color:' + (((activity.total||{{}})[w]>0)?'#4ade80':'#666') + '">' + ((activity.total||{{}})[w]||0) + '</b></div>').join('');
+        const chatsAct = (activity.chats||[]).slice(0,10).map(c => {{
+          const cells = wins.map(w => '<td style="text-align:center;color:' + ((c.counts[w]>0)?'#4ade80':'#555') + '">' + (c.counts[w]||0) + '</td>').join('');
+          return '<tr><td><b>' + c.chat + '</b></td>' + cells + '</tr>';
+        }}).join('');
+        const actHtml = (activity.chats && activity.chats.length) ? '<table><thead><tr><th>Чат</th>' + wins.map(w=>'<th style="text-align:center">'+lbl(w)+'</th>').join('') + '</tr></thead><tbody>' + chatsAct + '</tbody></table>' : '<div class="muted">Нет данных</div>';
+        const betsHtml = (bets.bets||[]).map(b => '<div style="padding:6px 10px;border-left:3px solid #71d68a;margin:4px 0;font-size:12px">🎰 ' + b.game + ' · ' + b.multiplier + ' · ' + b.amount_text + ' ' + (b.crypto||'') + ' (~$' + (b.amount_usd||0).toFixed(2) + ')</div>').join('') || '<div class="muted">Нет ставок</div>';
+        const msgsHtml = (msgs.rows||[]).map(m => '<div style="padding:4px 8px;border-left:3px solid #2a2f3a;margin:4px 0;font-size:12px"><b>' + m.chat + '</b>: ' + m.text + '</div>').join('') || '<div class="muted">Нет сообщений</div>';
+        document.getElementById('profContent').innerHTML =
+          '<h4 style="color:#8b949e;font-size:12px;margin:16px 0 8px">📊 Активность</h4>'
+          + '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px">' + actRow + '</div>'
+          + actHtml
+          + '<h4 style="color:#8b949e;font-size:12px;margin:16px 0 8px">Последние ставки</h4>' + betsHtml
+          + '<h4 style="color:#8b949e;font-size:12px;margin:16px 0 8px">Последние сообщения</h4>' + msgsHtml;
+      }}
+      async function saveProfile() {{
+        if(!currentNick) return;
+        const body = {{ lang: document.getElementById('profLang').value, description: document.getElementById('profDesc').value, is_top: document.getElementById('profTop').checked }};
+        await fetch('/api/profile/' + encodeURIComponent(currentNick), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body)}});
+        if(body.is_top) {{ await fetch('/api/watchlist/add', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{name: currentNick}})}}); }}
+        alert('Сохранено');
+      }}
     </script>"""
     return BASE_HTML.format(title="Shuffle — Раздающие", active_home="", active_hosts="active", active_receivers="", content=content)
 
-# ==================== MONITOR (raw string) ====================
+# ==================== MONITOR ====================
 MONITOR_HTML = r"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Shuffle Monitor</title>
@@ -1639,8 +1672,7 @@ tr:hover td{background:#161a22}
 .btn.danger{background:#3a1f1f;border-color:#7f1d1d}
 .btn.green{background:#1e3a26;border-color:#2d5a3a;color:#71d68a}
 .row-flex{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
-input,select,textarea{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6px 10px;border-radius:5px;font-size:13px;max-width:260px;font-family:inherit}
-.chart-wrap{background:#151821;border:1px solid #232a37;border-radius:8px;padding:16px;margin-bottom:16px}
+input,select,textarea{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6px 10px;border-radius:5px;font-size:13px;max-width:280px;font-family:inherit}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.8);display:none;align-items:center;justify-content:center;z-index:50}
 .modal img{max-width:92vw;max-height:92vh;border-radius:8px}
 .modal.on{display:flex}
@@ -1684,6 +1716,10 @@ tr.rubric-row td{background:#2a2410 !important}
 .vault-amount{color:#71d68a;font-weight:600}
 .vault-warn{color:#fbbf24}
 .vault-danger{color:#f87171}
+.me-kpi{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.me-kpi div{background:#151821;border:1px solid #232a37;border-radius:8px;padding:10px 16px;min-width:110px}
+.me-kpi b{display:block;font-size:22px;color:#4ade80;margin-top:2px}
+.me-kpi .off{color:#666}
 </style></head><body>
 <header>
   <h1>🎰 Shuffle Monitor</h1>
@@ -1700,7 +1736,7 @@ tr.rubric-row td{background:#2a2410 !important}
   <button data-tab="contexts">Контексты</button>
   <button data-tab="intents">Интенты</button>
   <button data-tab="promos">Промокоды</button>
-  <button data-tab="vault">💰 Хранилище</button>
+  <button data-tab="me">👤 Мой профиль</button>
   <button data-tab="ai">🤖 AI</button>
   <button data-tab="players">👥 Игроки</button>
   <button data-tab="langs">🌍 Языки</button>
@@ -1785,9 +1821,47 @@ tr.rubric-row td{background:#2a2410 !important}
     </div>
     <div id="promoList"></div></div>
 
-  <div id="tab-vault" style="display:none">
+  <div id="tab-me" style="display:none">
+
+    <div class="vault-card">
+      <div class="row-flex" style="justify-content:space-between;margin-bottom:0">
+        <h3 style="margin:0">👤 Мой профиль</h3>
+        <div class="row-flex" style="margin:0">
+          <input type="text" id="meNick" placeholder="Твой ник (напр. Merami)" style="width:200px">
+          <button class="btn green" onclick="loadMe()" style="font-weight:600">🔎 Проверить</button>
+          <button class="btn" onclick="saveMeNick()">💾 Запомнить</button>
+          <span class="hint" id="meStatus"></span>
+        </div>
+      </div>
+      <div id="meTop"></div>
+    </div>
+
+    <div class="vault-card">
+      <h3>📊 Активность по чатам</h3>
+      <div id="meActivity"></div>
+    </div>
+
+    <div class="vault-card">
+      <h3>🏆 Мои выигранные дожди</h3>
+      <div class="row-flex">
+        <select id="meRainDays" onchange="loadMeRains()" style="max-width:160px">
+          <option value="7">7 дней</option>
+          <option value="30" selected>30 дней</option>
+          <option value="90">90 дней</option>
+        </select>
+        <span class="hint" id="meRainsStatus"></span>
+      </div>
+      <div id="meRains"></div>
+    </div>
+
+    <div class="vault-card">
+      <h3>🎰 Мои последние ставки</h3>
+      <div id="meBets"></div>
+    </div>
+
     <div id="vaultKpi" class="kpi"></div>
     <div id="vaultWagerCard" class="vault-card"></div>
+
     <div class="vault-card">
       <h3>💼 Балансы валют</h3>
       <div id="vaultBalances"></div>
@@ -1798,6 +1872,7 @@ tr.rubric-row td{background:#2a2410 !important}
         <button class="btn green" onclick="setVaultBalance()">💾 Сохранить</button>
       </div>
     </div>
+
     <div class="vault-card">
       <h3>⚙️ Вейджер</h3>
       <div class="row-flex">
@@ -1805,8 +1880,9 @@ tr.rubric-row td{background:#2a2410 !important}
         <input type="datetime-local" id="wgDeadline">
         <button class="btn green" onclick="saveWager()">💾 Сохранить</button>
       </div>
-      <p class="hint">Пример: $3000, дедлайн 16.10.2026 15:00 МСК</p>
+      <p class="hint">Пример: $3000, дедлайн 16.10.2026 15:00</p>
     </div>
+
     <div class="vault-card">
       <h3>🎯 Цель накопления</h3>
       <div class="row-flex">
@@ -1815,6 +1891,7 @@ tr.rubric-row td{background:#2a2410 !important}
         <button class="btn green" onclick="saveGoal()">💾 Сохранить</button>
       </div>
     </div>
+
     <div class="vault-card">
       <h3>➕ Новая транзакция</h3>
       <div class="row-flex">
@@ -1831,11 +1908,13 @@ tr.rubric-row td{background:#2a2410 !important}
         <button class="btn green" onclick="addTransaction()">➕ Добавить</button>
       </div>
     </div>
+
     <div class="vault-card">
       <h3>📜 Последние транзакции</h3>
       <table><thead><tr><th>Время</th><th>Тип</th><th>Валюта</th><th>Сумма</th><th>$</th><th>Описание</th></tr></thead>
       <tbody id="txList"></tbody></table>
     </div>
+
   </div>
 
   <div id="tab-ai" style="display:none">
@@ -1889,7 +1968,7 @@ function renderReceivers(recs, collapseAfter) {
 
 function switchTab(name){
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
-  ['status','events','bulk','bets','betsrains','contexts','intents','promos','vault','ai','players','langs'].forEach(t=>{
+  ['status','events','bulk','bets','betsrains','contexts','intents','promos','ai','players','langs','me'].forEach(t=>{
     const el = $('tab-'+t); if(el) el.style.display = (t===name) ? '' : 'none';
   });
   if(name==='events') { loadChats(); loadEvents(); }
@@ -1899,7 +1978,7 @@ function switchTab(name){
   if(name==='contexts') { loadChats(); loadContexts(); }
   if(name==='intents') { loadChats(); loadIntents(); }
   if(name==='promos') loadPromos();
-  if(name==='vault') loadVault();
+  if(name==='me') { loadVault(); loadMe(); }
   if(name==='ai') { loadChats(); loadAILatest(); }
   if(name==='players') { loadChats(); loadPlayersTab(); }
   if(name==='langs') loadLanguages();
@@ -2107,6 +2186,90 @@ async function testPromo(){
   try { const r = await fetch('/api/promo/test',{method:'POST'}).then(r=>r.json()); alert('Найдено: '+r.found+', новых: '+r.new); loadPromos(); }
   catch(e){ alert('Ошибка'); } finally { btn.disabled=false; btn.textContent='🔍 Проверить'; }
 }
+
+// ===== МОЙ ПРОФИЛЬ =====
+function saveMeNick(){
+  const v = $('meNick').value.trim(); if(!v) return;
+  localStorage.setItem('myNick', v);
+  alert('✅ Ник сохранён: ' + v);
+}
+async function loadMe(){
+  const un = $('meNick').value.trim();
+  if(!un) return;
+  const s = $('meStatus'); if(s) s.textContent = '⏳...';
+  const topEl = $('meTop'); const actEl = $('meActivity');
+  if(topEl) topEl.innerHTML = '';
+  if(actEl) actEl.innerHTML = '';
+  try {
+    const d = await fetch('/api/player/activity?username=' + encodeURIComponent(un) + '&windows=15,25,60,1440').then(r=>r.json());
+    const wins = d.windows || [15,25,60,1440];
+    const lbl = w => w === 1440 ? '24ч' : (w === 60 ? '1ч' : (w + 'м'));
+    const lastInfo = d.minutes_ago_total !== null && d.minutes_ago_total !== undefined
+      ? 'Последнее сообщение: <b style="color:#8ab4f8">' + d.minutes_ago_total + ' мин назад</b>'
+      : '<span class="muted">Нет активности за сутки</span>';
+    if(topEl) topEl.innerHTML = '<div style="color:#8b949e;font-size:13px;margin-top:10px">' + lastInfo + '</div>';
+    const totalRow = wins.map(w => {
+      const v = d.total[w] || 0;
+      const col = v > 0 ? '#4ade80' : '#666';
+      return '<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:10px 16px;min-width:110px">'
+        + '<span style="color:#8b949e;font-size:12px">За ' + lbl(w) + '</span>'
+        + '<b style="display:block;font-size:22px;color:' + col + '">' + v + '</b></div>';
+    }).join('');
+    const rows = (d.chats || []).map(c => {
+      const cells = wins.map(w => {
+        const v = c.counts[w] || 0;
+        return '<td style="text-align:center;color:' + (v>0?'#4ade80':'#555') + ';font-weight:' + (v>0?'600':'400') + '">' + v + '</td>';
+      }).join('');
+      const totalRecent = wins.reduce((a,w) => a + (c.counts[w]||0), 0);
+      const rowStyle = totalRecent === 0 ? 'style="opacity:0.45"' : '';
+      const ll = c.minutes_ago === null || c.minutes_ago === undefined ? '—'
+        : (c.minutes_ago < 60 ? c.minutes_ago + 'м'
+           : (c.minutes_ago < 1440 ? Math.floor(c.minutes_ago/60) + 'ч'
+              : Math.floor(c.minutes_ago/1440) + 'д'));
+      return '<tr ' + rowStyle + '><td><b>' + c.chat + '</b> <span class="muted" style="font-size:11px">' + (c.total_msgs||0) + ' всего</span></td>' + cells + '<td>' + ll + '</td></tr>';
+    }).join('');
+    const head = '<tr><th>Чат</th>' + wins.map(w => '<th style="text-align:center">' + lbl(w) + '</th>').join('') + '<th>Последнее</th></tr>';
+    if(actEl) actEl.innerHTML = '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">' + totalRow + '</div>'
+      + (rows ? '<table><thead>' + head + '</thead><tbody>' + rows + '</tbody></table>' : '<div class="muted">Нет чатов</div>');
+    if(s) s.textContent = '✅';
+    loadMeRains();
+    loadMeBets();
+  } catch(e) {
+    if(s) s.textContent = '❌ ' + e.message;
+  }
+}
+async function loadMeRains(){
+  const un = $('meNick').value.trim(); if(!un) return;
+  const days = $('meRainDays') ? $('meRainDays').value : 30;
+  const st = $('meRainsStatus'); if(st) st.textContent = '⏳';
+  const el = $('meRains'); if(!el) return;
+  const d = await fetch('/api/user/' + encodeURIComponent(un) + '/rains_received?days=' + days).then(r=>r.json());
+  if(st) st.textContent = 'Найдено: ' + d.wins + ' | ' + fmtMoney(d.total_rub) + ' ₽ (~$' + fmtMoney(d.total_usd) + ')';
+  if(!d.items || !d.items.length){ el.innerHTML = '<div class="muted">Нет выигранных дождей за период</div>'; return; }
+  el.innerHTML = '<table><thead><tr><th>Время</th><th>Чат</th><th>От</th><th>Сумма</th><th>Твоя доля ₽</th><th>Доля $</th></tr></thead><tbody>'
+    + d.items.map(i => '<tr><td>' + fmtTime(i.ts) + '</td><td>' + esc(i.chat) + '</td>'
+        + '<td><b>' + esc(i.sender) + '</b></td>'
+        + '<td>' + esc(i.amount_text) + ' ' + esc(i.crypto_symbol||'') + ' <span class="muted">(÷' + i.receivers_count + ')</span></td>'
+        + '<td style="color:#71d68a;font-weight:600">' + fmtMoney(i.share_rub) + ' ₽</td>'
+        + '<td style="color:#8ab4f8">$' + fmtMoney(i.share_usd) + '</td></tr>').join('')
+    + '</tbody></table>';
+}
+async function loadMeBets(){
+  const un = $('meNick').value.trim(); if(!un) return;
+  const el = $('meBets'); if(!el) return;
+  const r = await fetch('/api/bets?sender=' + encodeURIComponent(un) + '&limit=20').then(r=>r.json());
+  if(!r.bets || !r.bets.length){ el.innerHTML = '<div class="muted">Нет ставок</div>'; return; }
+  el.innerHTML = '<table><thead><tr><th>Время</th><th>Чат</th><th>Игра</th><th>Множ.</th><th>Сумма</th><th>$</th></tr></thead><tbody>'
+    + r.bets.map(b => '<tr><td>' + fmtTime(b.ts) + '</td><td>' + esc(b.chat) + '</td>'
+        + '<td>' + esc(b.game) + '</td><td>' + esc(b.multiplier) + '</td>'
+        + '<td>' + esc(b.amount_text) + ' ' + esc(b.crypto||'') + '</td>'
+        + '<td style="color:#71d68a">$' + fmtMoney(b.amount_usd) + '</td></tr>').join('')
+    + '</tbody></table>';
+}
+(function initMe(){
+  const saved = localStorage.getItem('myNick');
+  if(saved && $('meNick')) $('meNick').value = saved;
+})();
 
 // ===== VAULT =====
 async function loadVault(){
