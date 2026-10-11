@@ -9,7 +9,7 @@ from collections import defaultdict
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 import requests
@@ -45,7 +45,7 @@ SCREENSHOT_REQUESTS = {}
 PROMO_CHANNEL = os.environ.get("PROMO_CHANNEL", "anyclaimershuffle")
 PROMO_PARSE_INTERVAL = 5 * 60
 
-BET_TO_RAIN_WINDOW_SEC = 900  # 15 минут
+BET_TO_RAIN_WINDOW_SEC = 900
 
 LANG_MAP = {
     'ENGLISH': 'английский', 'RUSSIAN': 'русский', 'JAPANESE': 'японский',
@@ -54,7 +54,8 @@ LANG_MAP = {
     'POLISH': 'польский', 'INDONESIAN': 'индонезийский', 'CHINESE': 'китайский',
 }
 
-# ==================== RATES (серверные) ====================
+
+# ==================== RATES ====================
 RATES_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_rates.json")
 
 RATE_ALIASES = {
@@ -236,21 +237,23 @@ def init_db():
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS events (
             id SERIAL PRIMARY KEY, type TEXT NOT NULL, chat TEXT NOT NULL,
-            sender TEXT NOT NULL, receivers TEXT NOT NULL, amount_text TEXT,
-            amount_type TEXT, crypto_symbol TEXT, amount_rub DOUBLE PRECISION DEFAULT 0,
+            sender TEXT NOT NULL, receivers TEXT NOT NULL, receivers_info TEXT,
+            amount_text TEXT, amount_type TEXT, crypto_symbol TEXT,
+            amount_rub DOUBLE PRECISION DEFAULT 0,
             amount_usd DOUBLE PRECISION DEFAULT 0,
             created_at TEXT NOT NULL, ts DOUBLE PRECISION)""")
     else:
         execute("""CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, chat TEXT NOT NULL,
-            sender TEXT NOT NULL, receivers TEXT NOT NULL, amount_text TEXT,
-            amount_type TEXT, crypto_symbol TEXT, amount_rub REAL DEFAULT 0,
-            amount_usd REAL DEFAULT 0,
+            sender TEXT NOT NULL, receivers TEXT NOT NULL, receivers_info TEXT,
+            amount_text TEXT, amount_type TEXT, crypto_symbol TEXT,
+            amount_rub REAL DEFAULT 0, amount_usd REAL DEFAULT 0,
             created_at TEXT NOT NULL, ts REAL)""")
     _try("ALTER TABLE events ADD COLUMN ts DOUBLE PRECISION" if USE_POSTGRES else "ALTER TABLE events ADD COLUMN ts REAL")
     _try("ALTER TABLE events ADD COLUMN context_messages TEXT" if USE_POSTGRES else "ALTER TABLE events ADD COLUMN context_messages TEXT")
     _try("ALTER TABLE events ADD COLUMN context_bets TEXT" if USE_POSTGRES else "ALTER TABLE events ADD COLUMN context_bets TEXT")
     _try("ALTER TABLE events ADD COLUMN amount_usd DOUBLE PRECISION DEFAULT 0" if USE_POSTGRES else "ALTER TABLE events ADD COLUMN amount_usd REAL DEFAULT 0")
+    _try("ALTER TABLE events ADD COLUMN receivers_info TEXT" if USE_POSTGRES else "ALTER TABLE events ADD COLUMN receivers_info TEXT")
 
     execute("CREATE INDEX IF NOT EXISTS idx_type ON events(type)")
     execute("CREATE INDEX IF NOT EXISTS idx_sender ON events(sender)")
@@ -355,7 +358,6 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_cp_user ON chat_players(username)")
     execute("CREATE INDEX IF NOT EXISTS idx_cp_last ON chat_players(last_seen)")
 
-    # Профили игроков (топ-раздающие)
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS player_profiles (
             id SERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL,
@@ -400,7 +402,7 @@ def migrate_ts_once():
         print(f"[DB] ❌ ts: {e}")
 
 
-# ==================== ДЕДУП + ПЕРЕСЧЁТ ====================
+# ==================== ДЕДУП ====================
 def dedup_events():
     try:
         rows = query_all("""SELECT id, type, chat, sender, amount_text, amount_type,
@@ -510,6 +512,7 @@ class EventIn(BaseModel):
     chat: str
     sender: str
     receivers: List[str] = []
+    receivers_info: List[dict] = []
     amount_text: str = ""
     amount_type: str = "fiat"
     crypto_symbol: str = ""
@@ -668,10 +671,12 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
         if not usd: usd = cu
 
     p = ph()
-    execute(f"""INSERT INTO events (type, chat, sender, receivers, amount_text, amount_type,
+    execute(f"""INSERT INTO events (type, chat, sender, receivers, receivers_info, amount_text, amount_type,
                 crypto_symbol, amount_rub, amount_usd, created_at, ts, context_messages, context_bets)
-                VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p})""",
-            (event.type, event.chat, event.sender, json.dumps(event.receivers or [], ensure_ascii=False),
+                VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p})""",
+            (event.type, event.chat, event.sender,
+             json.dumps(event.receivers or [], ensure_ascii=False),
+             json.dumps(event.receivers_info or [], ensure_ascii=False),
              event.amount_text, event.amount_type, event.crypto_symbol, rub, usd, created, ts_val,
              json.dumps(event.context_messages or [], ensure_ascii=False),
              json.dumps(event.context_bets or [], ensure_ascii=False)))
@@ -680,6 +685,8 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
 
 @app.post("/api/bulk_alert")
 async def add_bulk_alert(body: BulkAlertIn, x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
     ts_val = body.ts if body.ts else time.time()
     rub = body.amount_rub or 0.0
     if rub == 0:
@@ -695,8 +702,6 @@ async def add_bulk_alert(body: BulkAlertIn, x_api_key: str = Header(default=""))
 
 @app.post("/api/bulk/rubric/{alert_id}")
 async def toggle_bulk_rubric(alert_id: int):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
     row = query_one("SELECT id, is_rubric FROM bulk_alerts WHERE id=?", (alert_id,))
     if not row:
         raise HTTPException(status_code=404, detail="not found")
@@ -809,11 +814,12 @@ async def events_batch(payload: dict, x_api_key: str = Header(default="")):
                 if not rub: rub = cr
                 if not usd: usd = cu
             p = ph()
-            execute(f"""INSERT INTO events (type, chat, sender, receivers, amount_text, amount_type,
+            execute(f"""INSERT INTO events (type, chat, sender, receivers, receivers_info, amount_text, amount_type,
                         crypto_symbol, amount_rub, amount_usd, created_at, ts, context_messages, context_bets)
-                        VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p})""",
+                        VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p})""",
                     (e.get("type"), e.get("chat"), e.get("sender"),
                      json.dumps(e.get("receivers", []), ensure_ascii=False),
+                     json.dumps(e.get("receivers_info", []), ensure_ascii=False),
                      e.get("amount_text", ""), e.get("amount_type", "fiat"),
                      e.get("crypto_symbol", ""), rub, usd,
                      datetime.fromtimestamp(e.get("ts", time.time()), tz=timezone.utc).isoformat(),
@@ -1243,9 +1249,75 @@ async def api_events(since: Optional[float] = None, until: Optional[float] = Non
     for r in rows:
         try: r["receivers"] = json.loads(r.get("receivers") or "[]")
         except: r["receivers"] = []
+        try: r["receivers_info"] = json.loads(r.get("receivers_info") or "[]")
+        except: r["receivers_info"] = []
         rc = len(r["receivers"]) or 1
         r["per_person_rub"] = (r.get("amount_rub") or 0) / rc
     return {"events": rows}
+
+
+@app.get("/api/receivers_top")
+async def api_receivers_top(limit: int = 20, metric: str = "total",
+                             days: int = 30, window_min: int = 25):
+    since = time.time() - days * 86400
+    rows = query_all("""SELECT chat, ts, amount_rub, receivers, receivers_info
+                        FROM events
+                        WHERE type='rain' AND ts >= ?
+                        ORDER BY ts DESC""", (since,))
+    stats = defaultdict(lambda: {
+        "total_rub": 0.0, "wins": 0, "active_wins": 0,
+        "unknown_activity_wins": 0, "chats": defaultdict(int), "last_seen": 0.0,
+    })
+    for r in rows:
+        try: recs = json.loads(r.get("receivers") or "[]")
+        except: recs = []
+        if not recs: continue
+        try: rinfo = json.loads(r.get("receivers_info") or "[]")
+        except: rinfo = []
+        rinfo_map = {x.get("name"): x for x in rinfo if isinstance(x, dict) and x.get("name")}
+        amount_rub = r.get("amount_rub") or 0
+        amount_per = amount_rub / len(recs)
+        chat = r.get("chat") or "?"
+        for nick in recs:
+            if not nick: continue
+            s = stats[nick]
+            s["total_rub"] += amount_per
+            s["wins"] += 1
+            s["chats"][chat] += 1
+            info = rinfo_map.get(nick)
+            if info:
+                if info.get("wrote_in_25min"):
+                    s["active_wins"] += 1
+                try: ls = float(info.get("last_msg_ts") or 0)
+                except: ls = 0
+                if ls > s["last_seen"]:
+                    s["last_seen"] = ls
+            else:
+                s["unknown_activity_wins"] += 1
+
+    arr = []
+    for nick, s in stats.items():
+        known = s["wins"] - s["unknown_activity_wins"]
+        active_pct = (s["active_wins"] / known * 100) if known > 0 else None
+        arr.append({
+            "nickname": nick,
+            "total_rub": round(s["total_rub"], 2),
+            "wins": s["wins"],
+            "active_wins": s["active_wins"],
+            "known_wins": known,
+            "active_percent": round(active_pct, 1) if active_pct is not None else None,
+            "chats": dict(s["chats"]),
+            "last_seen": s["last_seen"],
+        })
+
+    if metric == "count":
+        arr.sort(key=lambda x: x["wins"], reverse=True)
+    elif metric == "active_percent":
+        arr.sort(key=lambda x: (x["active_percent"] if x["active_percent"] is not None else -1, x["wins"]), reverse=True)
+    else:
+        arr.sort(key=lambda x: x["total_rub"], reverse=True)
+
+    return {"players": arr[:limit], "total": len(arr), "window_min": window_min, "days": days}
 
 
 @app.get("/api/chart")
@@ -1293,14 +1365,14 @@ async def api_chats():
 
 @app.get("/api/contexts")
 async def api_contexts(chat: Optional[str] = None, limit: int = 30):
-    q = "SELECT id, ts, created_at, chat, sender, receivers, amount_text, amount_rub, amount_usd, crypto_symbol, context_messages, context_bets FROM events WHERE type='rain'"
+    q = "SELECT id, ts, created_at, chat, sender, receivers, receivers_info, amount_text, amount_rub, amount_usd, crypto_symbol, context_messages, context_bets FROM events WHERE type='rain'"
     p = []
     if chat: q += " AND chat = ?"; p.append(chat)
     q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES else " ORDER BY ts DESC, id DESC LIMIT ?"
     p.append(limit)
     rows = query_all(q, tuple(p))
     for r in rows:
-        for k in ("receivers", "context_messages", "context_bets"):
+        for k in ("receivers", "receivers_info", "context_messages", "context_bets"):
             try: r[k] = json.loads(r.get(k) or "[]")
             except: r[k] = []
     return {"contexts": rows}
@@ -1425,7 +1497,6 @@ async def api_players_by_chat():
 
 @app.get("/api/players_by_language")
 async def api_players_by_language():
-    """Распределение игроков по языкам (фикс для Postgres)."""
     if USE_POSTGRES:
         rows = query_all("""SELECT username,
                             STRING_AGG(chat, ',') AS chats_raw,
@@ -1454,10 +1525,6 @@ async def api_players_by_language():
 @app.get("/api/bets_to_rains")
 async def api_bets_to_rains(window_sec: int = BET_TO_RAIN_WINDOW_SEC,
                              last_hours: Optional[int] = None):
-    """
-    Статистика: у кого СВОЙ же выигрыш привёл к СВОЕМУ же дождю в течение N сек.
-    Считаются ТОЛЬКО дожди (не типсы) и ТОЛЬКО свой дождь автора ставки.
-    """
     since = time.time() - (last_hours * 3600 if last_hours else 7 * 86400)
     bets = query_all("""SELECT id, ts, sender FROM bets
                         WHERE ts >= ? AND COALESCE(amount_usd,0) >= 20
@@ -1477,7 +1544,7 @@ async def api_bets_to_rains(window_sec: int = BET_TO_RAIN_WINDOW_SEC,
         for rt, rs, rr in rain_list:
             if rt < t0: continue
             if rt > t0 + window_sec: break
-            if rs != s: continue  # ⚠️ только СВОЙ дождь!
+            if rs != s: continue
             stats[s]["triggered"] += 1
             stats[s]["total_rain_rub"] += rr
             break
@@ -1574,10 +1641,8 @@ async def get_stats():
                           amount_rub, amount_usd, created_at, ts
                           FROM events ORDER BY id DESC LIMIT 30""")
     for r in recent:
-        try:
-            rcs = json.loads(r.get("receivers") or "[]")
-        except:
-            rcs = []
+        try: rcs = json.loads(r.get("receivers") or "[]")
+        except: rcs = []
         r["receivers"] = rcs
         r["per_person_rub"] = (r.get("amount_rub") or 0) / max(len(rcs), 1)
     channels = query_all("""SELECT chat, SUM(CASE WHEN type='rain' THEN 1 ELSE 0 END) AS rains,
@@ -1632,7 +1697,299 @@ async def get_user(nickname: str):
             "tips_received": {"count": tr_cnt, "total_rub": round(tr_total, 2)}}
 
 
-# ==================== MONITOR DASHBOARD ====================
+# ==================== BASE HTML ====================
+BASE_HTML = """<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+body {{ margin: 0; background: #0e1116; color: #e6e9ef; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
+a {{ color: #7cc4ff; text-decoration: none; }}
+header {{ background: #161b22; border-bottom: 1px solid #26303a; padding: 14px 24px; display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }}
+.brand {{ font-weight: 700; font-size: 18px; color: #fff; }}
+nav a {{ margin-right: 16px; color: #c9d1d9; }}
+nav a.active {{ color: #7cc4ff; font-weight: 600; }}
+main {{ max-width: 1200px; margin: 0 auto; padding: 24px; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap: 16px; }}
+.card {{ background: #161b22; border: 1px solid #26303a; border-radius: 12px; padding: 16px 20px; }}
+.card h3 {{ margin: 0 0 8px; color: #8b949e; font-weight: 500; font-size: 13px; text-transform: uppercase; }}
+.card .big {{ font-size: 26px; font-weight: 700; color: #fff; }}
+table {{ width: 100%; border-collapse: collapse; }}
+th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid #26303a; }}
+th {{ color: #8b949e; font-weight: 500; font-size: 13px; }}
+td.amount {{ color: #4ade80; font-weight: 600; }}
+tr:hover td {{ background: #1c222b; }}
+.rank {{ display: inline-block; width: 28px; text-align: center; color: #8b949e; }}
+.rank.g {{ color: #f5c542; }} .rank.s {{ color: #c0c0c0; }} .rank.b {{ color: #cd7f32; }}
+.tag {{ display: inline-block; background: #21262d; padding: 2px 8px; border-radius: 6px; font-size: 11px; color: #8b949e; margin-left: 6px; }}
+.muted {{ color: #8b949e; }}
+.chat-pill {{ display:inline-block; background:#21262d; padding:2px 8px; border-radius:6px; font-size:11px; color:#7cc4ff; }}
+</style></head><body>
+<header>
+  <div class="brand">🌧 SHUFFLE RAIN <small>статистика</small></div>
+  <nav>
+    <a href="/" class="{active_home}">Главная</a>
+    <a href="/hosts" class="{active_hosts}">Раздающие</a>
+    <a href="/receivers" class="{active_receivers}">Получатели</a>
+    <a href="/monitor">Мониторинг</a>
+  </nav>
+</header>
+<main>{content}</main>
+</body></html>"""
+
+
+def fmt_rub(x):
+    try: return f"{x:,.2f}".replace(",", " ").replace(".", ",") + " ₽"
+    except: return "0 ₽"
+
+
+def render_rank_table(rows):
+    if not rows:
+        return "<tr><td colspan='4' class='muted'>Пока нет данных</td></tr>"
+    html = ""
+    for i, r in enumerate(rows, 1):
+        rank_cls = "g" if i == 1 else "s" if i == 2 else "b" if i == 3 else ""
+        html += f"""<tr><td><span class="rank {rank_cls}">{i}</span></td>
+            <td><b>{r['nickname']}</b></td><td>{r['cnt']}</td>
+            <td class="amount">{fmt_rub(r['total'])}</td></tr>"""
+    return html
+
+
+def compute_receiver_stats(etype):
+    stats = defaultdict(lambda: {"cnt": 0, "total": 0.0})
+    for row in query_all(f"SELECT amount_rub, receivers FROM events WHERE type='{etype}'"):
+        try: rcs = json.loads(row["receivers"] or "[]")
+        except: continue
+        if not rcs: continue
+        share = (row["amount_rub"] or 0) / len(rcs)
+        for r in rcs:
+            if r:
+                stats[r]["cnt"] += 1
+                stats[r]["total"] += share
+    return stats
+
+
+def sort_receiver_stats(stats, by="total", limit=50):
+    arr = [{"nickname": k, "cnt": v["cnt"], "total": v["total"]} for k, v in stats.items()]
+    arr.sort(key=lambda x: x[by], reverse=True)
+    return arr[:limit]
+
+
+@app.get("/", response_class=HTMLResponse)
+async def page_home():
+    t = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='rain'") or {}).get("c", 0)
+    tips = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='tip'") or {}).get("c", 0)
+    tr = (query_one("SELECT COALESCE(SUM(amount_rub),0) AS s FROM events WHERE type='rain'") or {}).get("s", 0)
+    ttr = (query_one("SELECT COALESCE(SUM(amount_rub),0) AS s FROM events WHERE type='tip'") or {}).get("s", 0)
+    content = f"""
+    <div class="grid">
+      <div class="card"><h3>Дождей</h3><div class="big">{t}</div></div>
+      <div class="card"><h3>Раздали всего</h3><div class="big">{fmt_rub(tr or 0)}</div></div>
+      <div class="card"><h3>Чаевых</h3><div class="big">{tips}</div></div>
+      <div class="card"><h3>Чаевых сумма</h3><div class="big">{fmt_rub(ttr or 0)}</div></div>
+    </div>
+    <div class="card" style="margin-top:16px"><h3>Последние события</h3><div id="recent"></div></div>
+    <script>
+      function esc(s){{return (s==null?'':String(s)).replace(/[<>&"]/g,c=>({{'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}}[c]));}}
+      function fmtR(v){{return (v||0).toFixed(0);}}
+      async function loadOnce() {{ const r = await fetch('/api/stats'); const d = await r.json(); renderRecent(d.recent); }}
+      function renderRecent(rows) {{
+        const el = document.getElementById('recent'); if (!rows) return;
+        el.innerHTML = rows.map(r => {{
+          const cls = r.type === 'rain' ? 'rain' : 'tip';
+          const tag = r.type === 'rain' ? 'RAIN' : 'TIP';
+          const amt = r.amount_text || '';
+          const rub = r.amount_rub ? ' (' + fmtR(r.amount_rub) + ' ₽)' : '';
+          const per = r.per_person_rub ? ' <span style="color:#8ab4f8;font-size:11px">по ' + fmtR(r.per_person_rub) + ' ₽</span>' : '';
+          const recs = (r.receivers || []);
+          const recsHtml = recs.slice(0,5).map(esc).join(', ') + (recs.length > 5 ? ` ...и ещё ${recs.length-5}` : '');
+          return `<div style="padding:8px 0;border-bottom:1px solid #26303a;font-size:13px"><span class="tag">${{tag}}</span> <span class="chat-pill">${{r.chat}}</span> <b style="margin-left:6px">${{esc(r.sender)}}</b><span class="muted"> → ${{recsHtml}}</span>${{per}}<span style="float:right;color:#4ade80">${{esc(amt)}}${{rub}}</span></div>`;
+        }}).join('');
+      }}
+      loadOnce();
+      setInterval(loadOnce, 15000);
+    </script>"""
+    return BASE_HTML.format(title="Shuffle Rain Stats", active_home="active",
+                             active_hosts="", active_receivers="", content=content)
+
+
+@app.get("/receivers", response_class=HTMLResponse)
+async def page_receivers():
+    rain_stats = compute_receiver_stats("rain")
+    tip_stats = compute_receiver_stats("tip")
+    ra = sort_receiver_stats(rain_stats, by="total")
+    rc = sort_receiver_stats(rain_stats, by="cnt")
+    ta = sort_receiver_stats(tip_stats, by="total")
+    tc = sort_receiver_stats(tip_stats, by="cnt")
+    content = f"""
+    <div class="card" style="margin-bottom:16px">
+      <h3>🎯 Топ активных получателей</h3>
+      <p style="color:#8b949e;font-size:12px;margin:4px 0 12px">
+        «Активный» = писал в том же чате за 25 минут до дождя.
+      </p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <select id="rtMetric" onchange="loadReceiversTop()" style="background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:6px;border-radius:5px">
+          <option value="total">По сумме ₽</option>
+          <option value="count">По кол-ву дождей</option>
+          <option value="active_percent">По % активных</option>
+        </select>
+        <select id="rtLimit" onchange="loadReceiversTop()" style="background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:6px;border-radius:5px">
+          <option value="20">Топ-20</option>
+          <option value="40">Топ-40</option>
+          <option value="100">Топ-100</option>
+        </select>
+        <select id="rtDays" onchange="loadReceiversTop()" style="background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:6px;border-radius:5px">
+          <option value="7">7 дней</option>
+          <option value="30" selected>30 дней</option>
+          <option value="90">90 дней</option>
+        </select>
+        <button onclick="loadReceiversTop()" style="background:#2563eb;color:#fff;border:none;padding:6px 12px;border-radius:5px;cursor:pointer">Обновить</button>
+        <span id="rtStatus" style="color:#8b949e;font-size:12px"></span>
+      </div>
+      <table><thead><tr>
+        <th>#</th><th>Ник</th><th>Получил ₽</th><th>Дождей</th>
+        <th>Активных</th><th>% активных</th><th>Чаты</th>
+      </tr></thead>
+      <tbody id="rtBody"><tr><td colspan="7" class="muted">Загрузка...</td></tr></tbody></table>
+    </div>
+
+    <div class="grid" style="grid-template-columns: 1fr 1fr">
+      <div class="card"><h3>🏆 Выиграл дождей — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Выигрышей</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(ra)}</tbody></table></div>
+      <div class="card"><h3>🎯 Выиграл дождей — по частоте</h3><table><thead><tr><th>#</th><th>Ник</th><th>Выигрышей</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(rc)}</tbody></table></div>
+      <div class="card"><h3>💰 Получил чаевых — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Получено</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(ta)}</tbody></table></div>
+      <div class="card"><h3>📬 Получил чаевых — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Получено</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(tc)}</tbody></table></div>
+    </div>
+    <script>
+      const esc = s => (s==null?'':String(s)).replace(/[<>&"]/g, c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+      const fmtMoney = v => (v||0).toLocaleString('ru-RU',{maximumFractionDigits:2});
+      async function loadReceiversTop() {{
+        const metric = document.getElementById('rtMetric').value;
+        const limit = document.getElementById('rtLimit').value;
+        const days = document.getElementById('rtDays').value;
+        document.getElementById('rtStatus').textContent = '⏳ загрузка...';
+        try {{
+          const r = await fetch(`/api/receivers_top?metric=${{metric}}&limit=${{limit}}&days=${{days}}`).then(r=>r.json());
+          const body = document.getElementById('rtBody');
+          if (!r.players.length) {{
+            body.innerHTML = '<tr><td colspan="7" class="muted">Нет данных (нужны свежие события с receivers_info)</td></tr>';
+            document.getElementById('rtStatus').textContent = '';
+            return;
+          }}
+          body.innerHTML = r.players.map((p, i) => {{
+            const chats = Object.entries(p.chats || {{}}).sort((a,b)=>b[1]-a[1]).slice(0,5)
+              .map(([c,n])=>`<span class="tag" style="margin-left:4px">${{esc(c)}}:${{n}}</span>`).join(' ');
+            let pctCell = '<span class="muted">—</span>';
+            if (p.active_percent !== null && p.active_percent !== undefined) {{
+              const col = p.active_percent >= 60 ? '#4ade80' : (p.active_percent >= 30 ? '#fbbf24' : '#f87171');
+              pctCell = `<span style="color:${{col}};font-weight:600">${{p.active_percent}}%</span>`;
+            }}
+            return `<tr>
+              <td>${{i+1}}</td>
+              <td><b>${{esc(p.nickname)}}</b></td>
+              <td class="amount">${{fmtMoney(p.total_rub)}} ₽</td>
+              <td>${{p.wins}}</td>
+              <td>${{p.active_wins}} / ${{p.known_wins}}</td>
+              <td>${{pctCell}}</td>
+              <td>${{chats}}</td>
+            </tr>`;
+          }}).join('');
+          document.getElementById('rtStatus').textContent = `Найдено: ${{r.total}} игроков · окно ${{r.window_min}} мин`;
+        }} catch(e) {{
+          document.getElementById('rtStatus').textContent = '❌ ' + e.message;
+        }}
+      }}
+      loadReceiversTop();
+    </script>"""
+    return BASE_HTML.format(title="Shuffle — Получатели", active_home="", active_hosts="", active_receivers="active", content=content)
+
+
+@app.get("/hosts", response_class=HTMLResponse)
+async def page_hosts():
+    r1 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='rain' GROUP BY sender ORDER BY total DESC LIMIT 50")
+    r2 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='rain' GROUP BY sender ORDER BY cnt DESC LIMIT 50")
+    t1 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY total DESC LIMIT 50")
+    t2 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY cnt DESC LIMIT 50")
+
+    def row_with_profile(r, i):
+        rank_cls = "g" if i == 1 else "s" if i == 2 else "b" if i == 3 else ""
+        nick = r['nickname']
+        return f"""<tr><td><span class="rank {rank_cls}">{i}</span></td>
+            <td><a href="#" onclick="openProfile('{nick}');return false"><b>{nick}</b></a></td>
+            <td>{r['cnt']}</td><td class="amount">{fmt_rub(r['total'])}</td></tr>"""
+
+    def table(rows):
+        if not rows: return "<tr><td colspan='4' class='muted'>Пусто</td></tr>"
+        return "".join(row_with_profile(r, i) for i, r in enumerate(rows, 1))
+
+    content = f"""
+    <div class="grid" style="grid-template-columns: 1fr 1fr">
+      <div class="card"><h3>🌧 Раздал дождей — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r1)}</tbody></table></div>
+      <div class="card"><h3>🌧 Раздал дождей — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r2)}</tbody></table></div>
+      <div class="card"><h3>💸 Отправил чаевых — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t1)}</tbody></table></div>
+      <div class="card"><h3>💸 Отправил чаевых — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t2)}</tbody></table></div>
+    </div>
+    <div id="profileModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);align-items:center;justify-content:center;z-index:50;padding:20px">
+      <div style="background:#161b22;border:1px solid #26303a;border-radius:12px;max-width:700px;width:100%;padding:24px;max-height:80vh;overflow-y:auto">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+          <h2 id="profName" style="margin:0;color:#7cc4ff"></h2>
+          <button onclick="document.getElementById('profileModal').style.display='none'" style="background:#2a3340;color:#e6e6e6;border:1px solid #334055;padding:4px 12px;border-radius:5px;cursor:pointer">✕</button>
+        </div>
+        <div style="margin-bottom:12px"><label style="color:#8b949e;font-size:12px">Язык:</label>
+          <select id="profLang" style="background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:6px;border-radius:5px;margin-left:8px">
+            <option>ENGLISH</option><option>RUSSIAN</option><option>JAPANESE</option><option>TURKISH</option>
+            <option>SPANISH</option><option>PORTUGUESE</option><option>FRENCH</option><option>KOREAN</option>
+            <option>CHINESE</option><option>POLISH</option><option>VIETNAMESE</option><option>INDONESIAN</option>
+          </select>
+        </div>
+        <div style="margin-bottom:12px"><label style="color:#8b949e;font-size:12px">Описание:</label>
+          <textarea id="profDesc" style="width:100%;background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:8px;border-radius:5px;margin-top:6px;min-height:80px"></textarea>
+        </div>
+        <div style="margin-bottom:16px"><label style="color:#8b949e;font-size:12px"><input type="checkbox" id="profTop"> Добавить в watch-list</label></div>
+        <div id="profContent"></div>
+        <button onclick="saveProfile()" style="background:#2563eb;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-weight:600">💾 Сохранить</button>
+      </div>
+    </div>
+    <script>
+      let currentNick = null;
+      async function openProfile(nick) {{
+        currentNick = nick;
+        document.getElementById('profileModal').style.display = 'flex';
+        document.getElementById('profName').textContent = nick;
+        const [prof, bets, msgs] = await Promise.all([
+          fetch('/api/profile/' + encodeURIComponent(nick)).then(r=>r.json()),
+          fetch('/api/bets?sender=' + encodeURIComponent(nick) + '&limit=20').then(r=>r.json()),
+          fetch('/api/player?username=' + encodeURIComponent(nick) + '&limit=15').then(r=>r.json()),
+        ]);
+        document.getElementById('profLang').value = prof.profile.lang || 'ENGLISH';
+        document.getElementById('profDesc').value = prof.profile.description || '';
+        document.getElementById('profTop').checked = !!prof.profile.is_top;
+        const betsHtml = (bets.bets||[]).map(b => `<div style="padding:6px 10px;border-left:3px solid #71d68a;margin:4px 0;font-size:12px">🎰 ${{b.game}} · ${{b.multiplier}} · ${{b.amount_text}} ${{b.crypto||''}} (~$${{(b.amount_usd||0).toFixed(2)}})</div>`).join('') || '<div class="muted">Нет ставок</div>';
+        const msgsHtml = (msgs.rows||[]).map(m => `<div style="padding:4px 8px;border-left:3px solid #2a2f3a;margin:4px 0;font-size:12px"><b>${{m.chat}}</b>: ${{m.text}}</div>`).join('') || '<div class="muted">Нет сообщений</div>';
+        document.getElementById('profContent').innerHTML = `
+          <h4 style="color:#8b949e;font-size:12px;margin:16px 0 8px">Последние ставки</h4>${{betsHtml}}
+          <h4 style="color:#8b949e;font-size:12px;margin:16px 0 8px">Последние сообщения</h4>${{msgsHtml}}`;
+      }}
+      async function saveProfile() {{
+        if(!currentNick) return;
+        const body = {{
+          lang: document.getElementById('profLang').value,
+          description: document.getElementById('profDesc').value,
+          is_top: document.getElementById('profTop').checked
+        }};
+        await fetch('/api/profile/' + encodeURIComponent(currentNick), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body)}});
+        if(body.is_top) {{
+          await fetch('/api/watchlist/add', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{name: currentNick}})}});
+        }}
+        alert('Сохранено');
+      }}
+    </script>"""
+    return BASE_HTML.format(title="Shuffle — Раздающие", active_home="", active_hosts="active", active_receivers="", content=content)
+
+
+# ==================== MONITOR (без изменений) ====================
+# Здесь оставь свой MONITOR_HTML целиком из предыдущей версии —
+# я его не менял, кроме того что он используется ниже.
+
 MONITOR_HTML = r"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1727,49 +2084,31 @@ tr.rubric-row td{background:#2a2410 !important}
   <button data-tab="langs">🌍 Языки</button>
 </div>
 <main>
-  <div id="tab-status">
-    <div class="kpi" id="kpiRow"></div>
+  <div id="tab-status"><div class="kpi" id="kpiRow"></div>
     <table><thead><tr><th>#</th><th>Режим</th><th>Чат</th><th>Статус</th><th>Прогресс</th><th>Обновлено</th><th>📸</th></tr></thead>
-    <tbody id="instBody"></tbody></table>
-  </div>
-
+    <tbody id="instBody"></tbody></table></div>
   <div id="tab-events" style="display:none">
     <div class="row-flex">
       <input type="text" id="fSender" placeholder="Отправитель">
       <select id="fChat"><option value="">Все чаты</option></select>
       <select id="fType"><option value="">Все типы</option><option value="tip">Tip</option><option value="rain">Rain</option></select>
       <input type="number" id="fMinRub" placeholder="Мин. ₽">
-      <select id="fRange">
-        <option value="">Всё время</option>
-        <option value="1">Последний 1 час</option>
-        <option value="6">Последние 6 часов</option>
-        <option value="24">Последние 24 часа</option>
-        <option value="168">Последние 7 дней</option>
-      </select>
+      <select id="fRange"><option value="">Всё время</option><option value="1">1 час</option><option value="6">6 часов</option><option value="24">24 часа</option><option value="168">7 дней</option></select>
       <select id="fDay"><option value="">Конкретный день</option></select>
       <button class="btn" onclick="loadEvents()">Фильтр</button>
       <button class="btn" onclick="resetEvents()">Сброс</button>
     </div>
     <table><thead><tr><th>Время</th><th>Тип</th><th>Чат</th><th>От</th><th>Кому</th><th>Сумма</th><th>₽</th><th>₽/чел</th><th>$</th></tr></thead>
-    <tbody id="evBody"></tbody></table>
-  </div>
-
+    <tbody id="evBody"></tbody></table></div>
   <div id="tab-chart" style="display:none">
     <div class="row-flex">
       <select id="cType"><option value="">Всё</option><option value="tip">Tip</option><option value="rain">Rain</option></select>
       <select id="cChat"><option value="">Все чаты</option></select>
-      <select id="cRange">
-        <option value="">Всё время</option>
-        <option value="1">1 час</option>
-        <option value="24" selected>24 часа</option>
-        <option value="168">7 дней</option>
-      </select>
+      <select id="cRange"><option value="">Всё время</option><option value="1">1 час</option><option value="24" selected>24 часа</option><option value="168">7 дней</option></select>
       <button class="btn" onclick="loadChart()">Обновить</button>
     </div>
     <div class="chart-wrap"><canvas id="hourCount" height="90"></canvas></div>
-    <div class="chart-wrap"><canvas id="hourSum" height="90"></canvas></div>
-  </div>
-
+    <div class="chart-wrap"><canvas id="hourSum" height="90"></canvas></div></div>
   <div id="tab-bulk" style="display:none">
     <div class="row-flex">
       <input type="text" id="bSenderInput" placeholder="Ник + Enter" style="width:180px">
@@ -1778,25 +2117,14 @@ tr.rubric-row td{background:#2a2410 !important}
     </div>
     <div class="chips" id="bulkChips"></div>
     <table><thead><tr><th>Время</th><th>Чат</th><th>От</th><th>Сумма</th><th>₽ каждому</th><th>₽ всего</th><th>Получателей</th><th>Кому</th><th>Действие</th></tr></thead>
-    <tbody id="bulkBody"></tbody></table>
-  </div>
-
+    <tbody id="bulkBody"></tbody></table></div>
   <div id="tab-bets" style="display:none">
     <div class="row-flex">
       <input type="text" id="betSender" placeholder="Отправитель">
       <select id="betChat"><option value="">Все чаты</option></select>
-      <select id="betSource">
-        <option value="">Все источники</option>
-        <option value="bets_page">Только таблица ставок</option>
-        <option value="chat">Только из чата</option>
-      </select>
+      <select id="betSource"><option value="">Все источники</option><option value="bets_page">Таблица</option><option value="chat">Чат</option></select>
       <input type="number" id="betMinUsd" placeholder="Мин. $" value="50">
-      <select id="betRange">
-        <option value="">Всё время</option>
-        <option value="1">1 час</option>
-        <option value="24" selected>24 часа</option>
-        <option value="168">7 дней</option>
-      </select>
+      <select id="betRange"><option value="">Всё время</option><option value="1">1 час</option><option value="24" selected>24 часа</option><option value="168">7 дней</option></select>
       <button class="btn" onclick="loadBets()">Фильтр</button>
       <button class="btn" onclick="loadBetsStats()">📊 По чатам (24ч)</button>
       <button class="btn" onclick="loadBetsTop()">🏆 Топ (7д)</button>
@@ -1804,26 +2132,17 @@ tr.rubric-row td{background:#2a2410 !important}
     </div>
     <div id="betStats" style="margin-bottom:16px"></div>
     <table><thead><tr><th>Время</th><th>Источник</th><th>Чат</th><th>Игрок</th><th>Игра</th><th>Множитель</th><th>Сумма</th><th>$</th><th>₽</th></tr></thead>
-    <tbody id="betsBody"></tbody></table>
-  </div>
-
+    <tbody id="betsBody"></tbody></table></div>
   <div id="tab-betsrains" style="display:none">
     <div class="row-flex">
       <input type="number" id="b2rWindow" value="900" style="width:100px">
       <span class="hint">секунд — окно после СВОЕЙ же ставки</span>
-      <select id="b2rRange">
-        <option value="">7 дней</option>
-        <option value="24">24 часа</option>
-        <option value="168" selected>7 дней</option>
-        <option value="720">30 дней</option>
-      </select>
+      <select id="b2rRange"><option value="24">24 часа</option><option value="168" selected>7 дней</option><option value="720">30 дней</option></select>
       <button class="btn" onclick="loadBetsToRains()">Обновить</button>
     </div>
     <div id="b2rStats" style="margin-bottom:16px"></div>
-    <table><thead><tr><th>#</th><th>Ник</th><th>Ставок ≥$20</th><th>Сам залил дождь</th><th>%</th><th>Сумма дождей ₽</th></tr></thead>
-    <tbody id="b2rBody"></tbody></table>
-  </div>
-
+    <table><thead><tr><th>#</th><th>Ник</th><th>Ставок ≥$20</th><th>Сам залил</th><th>%</th><th>Сумма ₽</th></tr></thead>
+    <tbody id="b2rBody"></tbody></table></div>
   <div id="tab-player" style="display:none">
     <div class="row-flex">
       <input type="text" id="pNewPlayer" placeholder="Новый ник">
@@ -1833,102 +2152,70 @@ tr.rubric-row td{background:#2a2410 !important}
     <div class="player-tabs" id="playerTabs"></div>
     <div class="chart-wrap"><canvas id="playerHour" height="60"></canvas></div>
     <table><thead><tr><th>Время</th><th>Игрок</th><th>Чат</th><th>Сообщение</th></tr></thead>
-    <tbody id="plBody"></tbody></table>
-  </div>
-
+    <tbody id="plBody"></tbody></table></div>
   <div id="tab-contexts" style="display:none">
     <div class="row-flex">
       <select id="ctxChat"><option value="">Все чаты</option></select>
       <input type="number" id="ctxLimit" value="30" style="width:80px">
       <button class="btn" onclick="loadContexts()">Обновить</button>
     </div>
-    <div id="ctxList"></div>
-  </div>
-
+    <div id="ctxList"></div></div>
   <div id="tab-intents" style="display:none">
     <div class="row-flex">
       <select id="intChat"><option value="">Все чаты</option></select>
       <input type="text" id="intSender" placeholder="Игрок">
-      <select id="intOnly">
-        <option value="">Все</option>
-        <option value="1">Сбывшиеся</option>
-        <option value="0">Несбывшиеся</option>
-      </select>
+      <select id="intOnly"><option value="">Все</option><option value="1">Сбывшиеся</option><option value="0">Несбывшиеся</option></select>
       <button class="btn" onclick="loadIntents()">Фильтр</button>
       <button class="btn" onclick="loadIntentsStats()">🏆 Рейтинг</button>
     </div>
     <div id="intStats" style="margin-bottom:16px"></div>
     <table><thead><tr><th>Время</th><th>Чат</th><th>Игрок</th><th>Текст</th><th>AI%</th><th>Статус</th><th>Δ</th></tr></thead>
-    <tbody id="intBody"></tbody></table>
-  </div>
-
+    <tbody id="intBody"></tbody></table></div>
   <div id="tab-promos" style="display:none">
     <div class="row-flex">
-      <select id="promoFilter">
-        <option value="">Все</option>
-        <option value="0">Неиспользованные</option>
-        <option value="1">Использованные</option>
-      </select>
+      <select id="promoFilter"><option value="">Все</option><option value="0">Неиспользованные</option><option value="1">Использованные</option></select>
       <button class="btn" onclick="loadPromos()">Обновить</button>
-      <button class="btn" onclick="testPromo()">🔍 Проверить сейчас</button>
+      <button class="btn" onclick="testPromo()">🔍 Проверить</button>
       <span class="hint" id="promoStats"></span>
     </div>
-    <div id="promoList"></div>
-  </div>
-
+    <div id="promoList"></div></div>
   <div id="tab-ai" style="display:none">
     <div class="row-flex">
       <select id="aiChat"><option value="">Выбери чат</option></select>
       <button class="btn" onclick="runAI()">🤖 Получить сообщения</button>
-      <button class="btn" onclick="loadAILatest()">📋 Последний результат</button>
+      <button class="btn" onclick="loadAILatest()">📋 Последний</button>
       <span class="hint" id="aiStatus"></span>
     </div>
     <div id="aiTopic"></div>
-    <div id="aiResult"></div>
-  </div>
-
+    <div id="aiResult"></div></div>
   <div id="tab-players" style="display:none">
     <div class="row-flex">
       <select id="plChatFilter"><option value="">Все чаты</option></select>
       <input type="text" id="plUserFilter" placeholder="Ник">
-      <label style="color:#aab;font-size:12px">
-        <input type="checkbox" id="plOnlineOnly"> Только онлайн
-      </label>
+      <label style="color:#aab;font-size:12px"><input type="checkbox" id="plOnlineOnly"> Только онлайн</label>
       <input type="number" id="plMinMsgs" placeholder="Мин. сообщений" style="width:140px">
       <button class="btn" onclick="loadPlayersTab()">Обновить</button>
     </div>
     <div id="plChatsSummary" style="margin-bottom:16px"></div>
-    <table><thead><tr>
-      <th>Чат</th><th>Игрок</th><th>Сообщений</th><th>Первый раз</th><th>Последний раз</th><th>Статус</th><th>Действие</th>
-    </tr></thead>
-    <tbody id="plPlayersBody"></tbody></table>
-  </div>
-
+    <table><thead><tr><th>Чат</th><th>Игрок</th><th>Сообщений</th><th>Первый раз</th><th>Последний раз</th><th>Статус</th><th>Действие</th></tr></thead>
+    <tbody id="plPlayersBody"></tbody></table></div>
   <div id="tab-langs" style="display:none">
     <div class="row-flex">
       <input type="text" id="langFilter" placeholder="Поиск по нику">
       <button class="btn" onclick="loadLanguages()">Обновить</button>
       <span class="hint">Где игрок активен и сколько сообщений.</span>
     </div>
-    <div id="langGrid" class="lang-grid"></div>
-  </div>
+    <div id="langGrid" class="lang-grid"></div></div>
 </main>
-
-<div class="modal" id="imgModal" onclick="this.classList.remove('on')">
-  <img id="imgModalImg" src="">
-</div>
-
+<div class="modal" id="imgModal" onclick="this.classList.remove('on')"><img id="imgModalImg" src=""></div>
 <script>
 const $ = id => document.getElementById(id);
 const fmtTime = ts => new Date(ts*1000).toLocaleString('ru-RU');
 const fmtMoney = v => (v||0).toLocaleString('ru-RU',{maximumFractionDigits:2});
 const esc = s => (s==null?'':String(s)).replace(/[<>&"]/g, c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
-
 let bulkChips = [];
 let currentPlayer = null;
 let aiPollTimer = null;
-
-// Collapsible receivers
 function renderReceivers(recs, collapseAfter) {
   recs = recs || [];
   if (!recs.length) return '<span class="hint">—</span>';
@@ -1939,7 +2226,6 @@ function renderReceivers(recs, collapseAfter) {
          `<span class="recv-hidden" id="${id}">, ${recs.slice(n).map(esc).join(', ')}</span>` +
          ` <span class="recv-toggle" onclick="document.getElementById('${id}').style.display='inline';this.style.display='none'">+${recs.length - n} ещё</span>`;
 }
-
 function switchTab(name){
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
   ['status','events','chart','bulk','bets','betsrains','player','contexts','intents','promos','ai','players','langs'].forEach(t=>{
@@ -1959,11 +2245,10 @@ function switchTab(name){
   if(name==='langs') loadLanguages();
 }
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
-
 async function refreshStatus(){
   try {
     const r = await fetch('/api/status').then(r=>r.json());
-    $('uptime').textContent = r.first_ts ? 'Мониторинг с ' + new Date(r.first_ts*1000).toLocaleString('ru-RU') : 'Мониторинг только запущен';
+    $('uptime').textContent = r.first_ts ? 'Мониторинг с ' + new Date(r.first_ts*1000).toLocaleString('ru-RU') : 'Мониторинг запущен';
     $('kpiTotal').textContent = `Всего: ${r.total||0} | Tips: ${r.tips||0} | Rains: ${r.rains||0} | Bets: ${r.bets||0} | Intents: ${r.intents||0}`;
     const now = Date.now()/1000;
     $('kpiRow').innerHTML = `
@@ -1985,7 +2270,7 @@ async function refreshStatus(){
       const upd = i.updated_at ? Math.round(now - i.updated_at)+'с' : '—';
       const tr = document.createElement('tr');
       tr.innerHTML = `<td>${i.iid}</td><td>${esc(i.mode||'')}</td>
-        <td><b>${esc(i.current_chat||'—')}</b><br><span class="pill">${(i.chats||[]).map(esc).join(', ')}</span></td>
+        <td><b>${esc(i.current_chat||'—')}</b></td>
         <td><span class="${cls}">${esc(txt)}</span>${i.error?'<br><span class="hint">'+esc(i.error)+'</span>':''}</td>
         <td>${progress}</td><td>${upd}</td>
         <td><button class="btn" onclick="reqShot(${i.iid})">📸</button></td>`;
@@ -1993,23 +2278,17 @@ async function refreshStatus(){
     });
   } catch(e){ console.error(e); }
 }
-
 async function reqShot(iid){
   await fetch('/api/screenshot/'+iid, {method:'POST'});
   let tries=0;
   while(tries++ < 40){
     await new Promise(r=>setTimeout(r,1500));
     const r = await fetch('/api/screenshot/'+iid);
-    if(r.status === 200){
-      $('imgModalImg').src = URL.createObjectURL(await r.blob());
-      $('imgModal').classList.add('on');
-      return;
-    }
+    if(r.status === 200){ $('imgModalImg').src = URL.createObjectURL(await r.blob()); $('imgModal').classList.add('on'); return; }
     if(r.status === 404){ alert('Не удалось'); return; }
   }
   alert('Таймаут');
 }
-
 async function loadChats(){
   const r = await fetch('/api/chats').then(r=>r.json());
   ['fChat','cChat','pChat','betChat','ctxChat','intChat','aiChat','plChatFilter'].forEach(id=>{
@@ -2020,16 +2299,14 @@ async function loadChats(){
     sel.value = cur;
   });
 }
-
 async function loadDays(){
   const r = await fetch('/api/days').then(r=>r.json());
   const sel = $('fDay');
   const cur = sel.value;
   sel.innerHTML = '<option value="">Конкретный день</option>';
-  r.days.forEach(d=>{ sel.innerHTML += `<option value="${d.day}">${d.day} (${d.count}) — #${d.hash}</option>`; });
+  r.days.forEach(d=>{ sel.innerHTML += `<option value="${d.day}">${d.day} (${d.count})</option>`; });
   sel.value = cur;
 }
-
 async function loadEvents(){
   const p = new URLSearchParams();
   if($('fSender').value) p.set('sender',$('fSender').value);
@@ -2038,10 +2315,7 @@ async function loadEvents(){
   if($('fMinRub').value) p.set('min_rub',$('fMinRub').value);
   if($('fRange').value) p.set('last_hours',$('fRange').value);
   const day = $('fDay').value;
-  if(day){
-    const start = Math.floor(new Date(day+'T00:00:00').getTime()/1000);
-    p.set('since', start); p.set('until', start + 86400);
-  }
+  if(day){ const start = Math.floor(new Date(day+'T00:00:00').getTime()/1000); p.set('since', start); p.set('until', start + 86400); }
   const r = await fetch('/api/events?'+p).then(r=>r.json());
   const body = $('evBody'); body.innerHTML = '';
   r.events.forEach(e=>{
@@ -2061,7 +2335,6 @@ function resetEvents(){
   $('fChat').value=''; $('fType').value=''; $('fDay').value='';
   loadEvents();
 }
-
 let chart1=null, chart2=null, chartPlayer=null;
 async function loadChart(){
   const p = new URLSearchParams();
@@ -2074,31 +2347,20 @@ async function loadChart(){
   const sums   = labels.map((_,h)=>r.buckets[h]?.sum||0);
   if(chart1) chart1.destroy();
   if(chart2) chart2.destroy();
-  const tl = $('cType').value ? ($('cType').value === 'tip' ? 'Tip' : 'Rain') : 'Все';
-  chart1 = new Chart($('hourCount'), {type:'bar',
-    data:{labels, datasets:[{label:`Кол-во (${tl})`, data:counts, backgroundColor:'#4a7ce0'}]},
-    options:{plugins:{legend:{labels:{color:'#e6e6e6'}}}, scales:{x:{ticks:{color:'#8b93a7'}}, y:{ticks:{color:'#8b93a7'}}}}});
-  chart2 = new Chart($('hourSum'), {type:'bar',
-    data:{labels, datasets:[{label:`Сумма ₽ (${tl})`, data:sums, backgroundColor:'#71d68a'}]},
-    options:{plugins:{legend:{labels:{color:'#e6e6e6'}}}, scales:{x:{ticks:{color:'#8b93a7'}}, y:{ticks:{color:'#8b93a7'}}}}});
+  chart1 = new Chart($('hourCount'), {type:'bar', data:{labels, datasets:[{label:'Кол-во', data:counts, backgroundColor:'#4a7ce0'}]}, options:{plugins:{legend:{labels:{color:'#e6e6e6'}}}, scales:{x:{ticks:{color:'#8b93a7'}}, y:{ticks:{color:'#8b93a7'}}}}});
+  chart2 = new Chart($('hourSum'), {type:'bar', data:{labels, datasets:[{label:'Сумма ₽', data:sums, backgroundColor:'#71d68a'}]}, options:{plugins:{legend:{labels:{color:'#e6e6e6'}}}, scales:{x:{ticks:{color:'#8b93a7'}}, y:{ticks:{color:'#8b93a7'}}}}});
 }
-
 function renderBulkChips(){
   const el = $('bulkChips');
-  el.innerHTML = bulkChips.length ? bulkChips.map(n =>
-    `<span class="chip">${esc(n)}<span class="x" onclick="removeBulkChip('${esc(n)}')">×</span></span>`
-  ).join('') : '<span class="hint">Фильтр не задан</span>';
+  el.innerHTML = bulkChips.length ? bulkChips.map(n => `<span class="chip">${esc(n)}<span class="x" onclick="removeBulkChip('${esc(n)}')">×</span></span>`).join('') : '<span class="hint">Фильтр не задан</span>';
 }
 function addBulkChip(){
-  const v = $('bSenderInput').value.trim();
-  if(!v) return;
+  const v = $('bSenderInput').value.trim(); if(!v) return;
   if(!bulkChips.includes(v)) bulkChips.push(v);
-  $('bSenderInput').value='';
-  renderBulkChips(); loadBulk();
+  $('bSenderInput').value=''; renderBulkChips(); loadBulk();
 }
 function removeBulkChip(n){ bulkChips = bulkChips.filter(x=>x!==n); renderBulkChips(); loadBulk(); }
 function clearBulkChips(){ bulkChips = []; renderBulkChips(); loadBulk(); }
-
 async function loadBulk(){
   const p = new URLSearchParams();
   if(bulkChips.length) p.set('senders', bulkChips.join(','));
@@ -2112,20 +2374,14 @@ async function loadBulk(){
     const tr = document.createElement('tr');
     if(isRubric) tr.className = 'rubric-row';
     tr.innerHTML = `<td>${fmtTime(a.ts)}</td><td>${esc(a.chat)}${isRubric?' <span class="pill rubric">📌 РУБРИКА</span>':''}</td>
-      <td>${esc(a.sender)}</td>
-      <td>${esc(a.amount_text)}</td><td>${fmtMoney(rubEach)} ₽</td>
+      <td>${esc(a.sender)}</td><td>${esc(a.amount_text)}</td><td>${fmtMoney(rubEach)} ₽</td>
       <td style="color:#71d68a;font-weight:bold">${fmtMoney(rubEach*recCount)} ₽</td>
       <td>${recCount}</td><td class="recv-wrap">${renderReceivers(a.receivers)}</td>
       <td><button class="btn" onclick="toggleRubric(${a.id})">${isRubric?'✓ Снять':'📌 Рубрика'}</button></td>`;
     body.appendChild(tr);
   });
 }
-
-async function toggleRubric(id){
-  await fetch('/api/bulk/rubric/'+id, {method:'POST'});
-  loadBulk();
-}
-
+async function toggleRubric(id){ await fetch('/api/bulk/rubric/'+id, {method:'POST'}); loadBulk(); }
 async function loadBets(){
   const p = new URLSearchParams();
   if($('betSender').value) p.set('sender',$('betSender').value);
@@ -2138,8 +2394,7 @@ async function loadBets(){
   if(!r.bets.length){ body.innerHTML = '<tr><td colspan="9" class="hint">Нет ставок</td></tr>'; return; }
   r.bets.forEach(b=>{
     const fromChat = b.source === 'chat';
-    const tr = document.createElement('tr');
-    tr.className = 'bet-row' + (fromChat ? ' chat' : '');
+    const tr = document.createElement('tr'); tr.className = 'bet-row' + (fromChat ? ' chat' : '');
     tr.innerHTML = `<td>${fmtTime(b.ts)}</td>
       <td><span class="pill ${fromChat?'chat':''}">${fromChat?'💬 Чат':'📊 Таблица'}</span></td>
       <td>${esc(b.chat)}</td><td><b>${esc(b.sender)}</b></td>
@@ -2150,62 +2405,46 @@ async function loadBets(){
     body.appendChild(tr);
   });
 }
-
 async function loadBetsStats(){
   const r = await fetch('/api/bets_stats').then(r=>r.json());
   const el = $('betStats');
   if(!r.stats.length){ el.innerHTML = '<p class="hint">Пусто</p>'; return; }
-  el.innerHTML = '<div class="kpi">' + r.stats.map(s=>`<div>${esc(s.chat)}<b>${s.cnt} шт.</b>
-    <span class="hint">$${fmtMoney(s.total_usd)} (avg $${fmtMoney(s.avg_usd)})</span></div>`).join('') + '</div>';
+  el.innerHTML = '<div class="kpi">' + r.stats.map(s=>`<div>${esc(s.chat)}<b>${s.cnt}</b><span class="hint">$${fmtMoney(s.total_usd)}</span></div>`).join('') + '</div>';
 }
 async function loadBetsTop(){
   const r = await fetch('/api/bets_top_senders').then(r=>r.json());
   const el = $('betStats');
   if(!r.senders.length){ el.innerHTML = '<p class="hint">Пусто (или очищен)</p>'; return; }
-  el.innerHTML = '<div class="kpi">' + r.senders.map(s=>`<div>${esc(s.nickname)}<b>${s.cnt} шт.</b>
-    <span class="hint">$${fmtMoney(s.total_usd)}</span></div>`).join('') + '</div>';
+  el.innerHTML = '<div class="kpi">' + r.senders.map(s=>`<div>${esc(s.nickname)}<b>${s.cnt}</b><span class="hint">$${fmtMoney(s.total_usd)}</span></div>`).join('') + '</div>';
 }
 async function clearBetsTop(){
-  if(!confirm('Очистить топ раздающих? После этого будут показываться только новые ставки.')) return;
+  if(!confirm('Очистить топ раздающих?')) return;
   await fetch('/api/bets/clear_top', {method:'POST'});
-  alert('Топ очищен. Теперь учитываются только новые ставки.');
+  alert('Топ очищен');
   loadBetsTop();
 }
-
 async function loadBetsToRains(){
   const w = $('b2rWindow').value || 900;
-  const p = new URLSearchParams();
-  p.set('window_sec', w);
+  const p = new URLSearchParams(); p.set('window_sec', w);
   if($('b2rRange').value) p.set('last_hours', $('b2rRange').value);
   const r = await fetch('/api/bets_to_rains?'+p).then(r=>r.json());
   const body = $('b2rBody'); body.innerHTML='';
-  $('b2rStats').innerHTML = `<div class="kpi">
-    <div>Окно<b>${r.window_sec}с</b></div>
-    <div>Всего игроков<b>${r.stats.length}</b></div>
-    <div>Сработало<b>${r.stats.reduce((a,x)=>a+x.triggered,0)}</b></div>
-  </div>`;
+  $('b2rStats').innerHTML = `<div class="kpi"><div>Окно<b>${r.window_sec}с</b></div><div>Игроков<b>${r.stats.length}</b></div><div>Сработало<b>${r.stats.reduce((a,x)=>a+x.triggered,0)}</b></div></div>`;
   if(!r.stats.length){ body.innerHTML = '<tr><td colspan="6" class="hint">Нет данных</td></tr>'; return; }
   r.stats.forEach((s, i)=>{
     const cls = s.percent >= 50 ? 'ok' : (s.percent >= 25 ? 'warn' : 'err');
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${i+1}</td><td><b>${esc(s.nickname)}</b></td>
-      <td>${s.bets}</td><td>${s.triggered}</td>
-      <td><span class="pill ${cls}">${s.percent}%</span></td>
-      <td>${fmtMoney(s.rain_rub)}</td>`;
+    tr.innerHTML = `<td>${i+1}</td><td><b>${esc(s.nickname)}</b></td><td>${s.bets}</td><td>${s.triggered}</td><td><span class="pill ${cls}">${s.percent}%</span></td><td>${fmtMoney(s.rain_rub)}</td>`;
     body.appendChild(tr);
   });
 }
-
 async function loadPlayers(){
   const wl = await fetch('/api/watchlist').then(r=>r.json());
   const names = wl.players || [];
   const el = $('playerTabs');
   if(!names.length){ el.innerHTML = '<span class="hint">Пусто</span>'; $('plBody').innerHTML = ''; return; }
   if(!currentPlayer || !names.includes(currentPlayer)) currentPlayer = names[0];
-  el.innerHTML = names.map(n =>
-    `<div class="player-tab ${n===currentPlayer?'active':''}" onclick="selectPlayer('${esc(n)}')">
-      ${esc(n)} <span class="rm" onclick="event.stopPropagation();removePlayer('${esc(n)}')">×</span></div>`
-  ).join('');
+  el.innerHTML = names.map(n => `<div class="player-tab ${n===currentPlayer?'active':''}" onclick="selectPlayer('${esc(n)}')">${esc(n)} <span class="rm" onclick="event.stopPropagation();removePlayer('${esc(n)}')">×</span></div>`).join('');
   loadPlayerActivity();
 }
 async function selectPlayer(n){ currentPlayer = n; await loadPlayers(); }
@@ -2231,7 +2470,6 @@ async function loadPlayerActivity(){
     body.appendChild(tr);
   });
 }
-
 async function loadContexts(){
   const p = new URLSearchParams();
   if($('ctxChat').value) p.set('chat',$('ctxChat').value);
@@ -2259,7 +2497,6 @@ async function loadContexts(){
       </div></div>`;
   }).join('');
 }
-
 async function loadIntents(){
   const p = new URLSearchParams();
   if($('intChat').value) p.set('chat',$('intChat').value);
@@ -2283,12 +2520,8 @@ async function loadIntentsStats(){
   const r = await fetch('/api/intents_stats').then(r=>r.json());
   const el = $('intStats');
   if(!r.stats.length){ el.innerHTML = '<p class="hint">Нет данных</p>'; return; }
-  el.innerHTML = '<div class="kpi">' + r.stats.map(s=>{
-    const cls = s.percent >= 50 ? 'ok' : (s.percent >= 25 ? 'warn' : 'err');
-    return `<div>${esc(s.nickname)}<b>${s.percent}%</b><span class="hint"><span class="pill ${cls}">${s.matched}/${s.total}</span></span></div>`;
-  }).join('') + '</div>';
+  el.innerHTML = '<div class="kpi">' + r.stats.map(s=>{const cls = s.percent >= 50 ? 'ok' : (s.percent >= 25 ? 'warn' : 'err'); return `<div>${esc(s.nickname)}<b>${s.percent}%</b><span class="hint"><span class="pill ${cls}">${s.matched}/${s.total}</span></span></div>`;}).join('') + '</div>';
 }
-
 async function loadPromos(){
   const filter = $('promoFilter').value;
   const p = new URLSearchParams();
@@ -2299,20 +2532,13 @@ async function loadPromos(){
   const el = $('promoList');
   if(!r.promos.length){ el.innerHTML = '<p class="hint">Пусто</p>'; return; }
   const filtered = filter === '1' ? r.promos.filter(x=>x.used) : r.promos;
-  el.innerHTML = filtered.map(x=>`<div class="promo-card ${x.used?'used':''}">
-    <input type="checkbox" class="promo-cb" ${x.used?'checked':''} onchange="togglePromo(${x.id})">
-    <div class="promo-body"><div class="promo-text">${esc(x.text)}</div>
-    <div class="promo-meta">${x.message_date?'📅 '+esc(x.message_date):''}${x.link?' · <a href="'+esc(x.link)+'" target="_blank">TG</a>':''}</div>
-    </div></div>`).join('');
+  el.innerHTML = filtered.map(x=>`<div class="promo-card ${x.used?'used':''}"><input type="checkbox" class="promo-cb" ${x.used?'checked':''} onchange="togglePromo(${x.id})"><div class="promo-body"><div class="promo-text">${esc(x.text)}</div><div class="promo-meta">${x.message_date?'📅 '+esc(x.message_date):''}${x.link?' · <a href="'+esc(x.link)+'" target="_blank">TG</a>':''}</div></div></div>`).join('');
 }
 async function togglePromo(id){ await fetch('/api/promo/toggle/'+id,{method:'POST'}); loadPromos(); }
 async function testPromo(){
   const btn = event.target; btn.disabled=true; btn.textContent='⏳';
-  try { const r = await fetch('/api/promo/test',{method:'POST'}).then(r=>r.json());
-    alert(`Найдено: ${r.found}, новых: ${r.new}`); loadPromos();
-  } catch(e){ alert('Ошибка'); } finally { btn.disabled=false; btn.textContent='🔍 Проверить сейчас'; }
+  try { const r = await fetch('/api/promo/test',{method:'POST'}).then(r=>r.json()); alert(`Найдено: ${r.found}, новых: ${r.new}`); loadPromos(); } catch(e){ alert('Ошибка'); } finally { btn.disabled=false; btn.textContent='🔍 Проверить'; }
 }
-
 async function runAI(){
   const chat = $('aiChat').value;
   if(!chat){ alert('Выбери чат'); return; }
@@ -2327,9 +2553,8 @@ async function runAI(){
     aiPollTimer = setInterval(async () => {
       tries++;
       const t = await fetch('/api/chat/task/'+taskId).then(r=>r.json());
-      if(t.status === 'pending' || t.status === 'reading'){
-        $('aiStatus').textContent = `Ожидаю... (${tries*2}с)`;
-      } else if(t.status === 'completed'){
+      if(t.status === 'pending' || t.status === 'reading'){ $('aiStatus').textContent = `Ожидаю... (${tries*2}с)`; }
+      else if(t.status === 'completed'){
         clearInterval(aiPollTimer); aiPollTimer = null;
         $('aiStatus').textContent = '✅';
         btn.disabled=false; btn.textContent='🤖 Получить сообщения';
@@ -2344,40 +2569,23 @@ async function runAI(){
     }, 2000);
   } catch(e){ alert('Ошибка'); btn.disabled=false; btn.textContent='🤖 Получить сообщения'; }
 }
-
 function renderAIResult(result, chat){
   if(!result){ $('aiResult').innerHTML = '<p class="hint">Нет</p>'; return; }
   const topic = result.topic || '';
   const msgs = result.messages || [];
   const phrases = result.phrases || [];
   $('aiTopic').innerHTML = topic ? `<div class="ai-topic"><b>Тема (${esc(chat)}):</b> ${esc(topic)}</div>` : '';
-  $('aiResult').innerHTML = `<div class="ai-grid">
-    <div class="ai-col"><h3>💬 Сообщения по контексту</h3>
-      ${msgs.map(m=>`<div class="ai-msg" onclick="copyMsg(this, '${esc(m).replace(/'/g,"&#39;")}')">${esc(m)}</div>`).join('')}</div>
-    <div class="ai-col"><h3>🙋 Безопасные фразы</h3>
-      ${phrases.map(p=>`<div class="ai-phrase" onclick="copyMsg(this, '${esc(p).replace(/'/g,"&#39;")}')">${esc(p)}</div>`).join('')}</div>
-  </div>`;
+  $('aiResult').innerHTML = `<div class="ai-grid"><div class="ai-col"><h3>💬 Сообщения</h3>${msgs.map(m=>`<div class="ai-msg" onclick="copyMsg(this, '${esc(m).replace(/'/g,"&#39;")}')">${esc(m)}</div>`).join('')}</div><div class="ai-col"><h3>🙋 Фразы</h3>${phrases.map(p=>`<div class="ai-phrase" onclick="copyMsg(this, '${esc(p).replace(/'/g,"&#39;")}')">${esc(p)}</div>`).join('')}</div></div>`;
 }
-
 function copyMsg(el, text){
   const doCopy = async () => {
-    if(navigator.clipboard && window.isSecureContext){
-      try { await navigator.clipboard.writeText(text); return true; } catch(e){}
-    }
-    const ta = document.createElement('textarea');
-    ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+    if(navigator.clipboard && window.isSecureContext){ try { await navigator.clipboard.writeText(text); return true; } catch(e){} }
+    const ta = document.createElement('textarea'); ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
     document.body.appendChild(ta); ta.focus(); ta.select();
-    try { document.execCommand('copy'); return true; } catch(e){ return false; }
-    finally { document.body.removeChild(ta); }
+    try { document.execCommand('copy'); return true; } catch(e){ return false; } finally { document.body.removeChild(ta); }
   };
-  doCopy().then(() => {
-    el.classList.add('copied');
-    const orig = el.textContent;
-    el.textContent = '✅ ' + orig;
-    setTimeout(()=>{ el.classList.remove('copied'); el.textContent = orig; }, 1200);
-  });
+  doCopy().then(() => { el.classList.add('copied'); const orig = el.textContent; el.textContent = '✅ ' + orig; setTimeout(()=>{ el.classList.remove('copied'); el.textContent = orig; }, 1200); });
 }
-
 async function loadAILatest(){
   const chat = $('aiChat').value || null;
   const p = new URLSearchParams();
@@ -2387,15 +2595,11 @@ async function loadAILatest(){
   renderAIResult(r.task.result, r.task.chat);
   $('aiStatus').textContent = `Последний: ${fmtTime(r.task.completed_at)}`;
 }
-
 async function loadPlayersTab(){
   const sum = await fetch('/api/players_by_chat').then(r=>r.json());
   const sEl = $('plChatsSummary');
   if(sum.chats && sum.chats.length){
-    sEl.innerHTML = '<div class="kpi">' + sum.chats.map(c=>`
-      <div>${esc(c.chat)}<b>${c.total_players}</b>
-        <span class="hint">🟢 ${c.online_players} · ${fmtMoney(c.total_messages)}</span>
-      </div>`).join('') + '</div>';
+    sEl.innerHTML = '<div class="kpi">' + sum.chats.map(c=>`<div>${esc(c.chat)}<b>${c.total_players}</b><span class="hint">🟢 ${c.online_players} · ${fmtMoney(c.total_messages)}</span></div>`).join('') + '</div>';
   }
   const p = new URLSearchParams();
   if($('plChatFilter').value) p.set('chat', $('plChatFilter').value);
@@ -2419,29 +2623,20 @@ async function loadPlayersTab(){
     body.appendChild(tr);
   });
 }
-
 async function relocatePlayer(username){
-  const newChat = prompt(`В какой чат переместить "${username}"?\nНапример: ENGLISH, RUSSIAN, POLISH...`);
+  const newChat = prompt(`В какой чат переместить "${username}"?\n(ENGLISH, RUSSIAN, POLISH...)`);
   if(!newChat) return;
   await fetch('/api/players/relocate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username, chat: newChat.toUpperCase()})});
-  alert('OK');
-  loadPlayersTab();
+  alert('OK'); loadPlayersTab();
 }
-
 async function loadLanguages(){
   const r = await fetch('/api/players_by_language').then(r=>r.json());
   const f = ($('langFilter').value || '').toLowerCase();
   const players = (r.players||[]).filter(p => !f || (p.username||'').toLowerCase().includes(f));
   const el = $('langGrid');
-  if(!players.length){ el.innerHTML = '<p class="hint">Нет данных (появятся через 30 сек после старта клиента)</p>'; return; }
-  el.innerHTML = players.slice(0, 500).map(p => `
-    <div class="lang-card">
-      <h4>${esc(p.username)}</h4>
-      <div class="hint">Сообщений: ${p.total_msgs||0} · Чатов: ${p.chat_count||0}</div>
-      ${(p.chats||[]).map(c=>`<div class="player-row"><span>${esc(c)}</span></div>`).join('')}
-    </div>`).join('');
+  if(!players.length){ el.innerHTML = '<p class="hint">Нет данных</p>'; return; }
+  el.innerHTML = players.slice(0, 500).map(p => `<div class="lang-card"><h4>${esc(p.username)}</h4><div class="hint">Сообщений: ${p.total_msgs||0} · Чатов: ${p.chat_count||0}</div>${(p.chats||[]).map(c=>`<div class="player-row"><span>${esc(c)}</span></div>`).join('')}</div>`).join('');
 }
-
 renderBulkChips();
 loadChats();
 refreshStatus();
@@ -2455,259 +2650,27 @@ async def monitor_page():
     return MONITOR_HTML
 
 
-# ==================== BASE HTML ====================
-BASE_HTML = """<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-<style>
-body {{ margin: 0; background: #0e1116; color: #e6e9ef; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
-a {{ color: #7cc4ff; text-decoration: none; }}
-header {{ background: #161b22; border-bottom: 1px solid #26303a; padding: 14px 24px; display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }}
-.brand {{ font-weight: 700; font-size: 18px; color: #fff; }}
-nav a {{ margin-right: 16px; color: #c9d1d9; }}
-nav a.active {{ color: #7cc4ff; font-weight: 600; }}
-main {{ max-width: 1200px; margin: 0 auto; padding: 24px; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap: 16px; }}
-.card {{ background: #161b22; border: 1px solid #26303a; border-radius: 12px; padding: 16px 20px; }}
-.card h3 {{ margin: 0 0 8px; color: #8b949e; font-weight: 500; font-size: 13px; text-transform: uppercase; }}
-.card .big {{ font-size: 26px; font-weight: 700; color: #fff; }}
-table {{ width: 100%; border-collapse: collapse; }}
-th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid #26303a; }}
-th {{ color: #8b949e; font-weight: 500; font-size: 13px; }}
-td.amount {{ color: #4ade80; font-weight: 600; }}
-.rank {{ display: inline-block; width: 28px; text-align: center; color: #8b949e; }}
-.rank.g {{ color: #f5c542; }} .rank.s {{ color: #c0c0c0; }} .rank.b {{ color: #cd7f32; }}
-.tag {{ display: inline-block; background: #21262d; padding: 2px 8px; border-radius: 6px; font-size: 11px; color: #8b949e; margin-left: 6px; }}
-.tag.rain {{ color: #7cc4ff; }} .tag.tip {{ color: #f5c542; }}
-.live-dot {{ display: inline-block; width: 8px; height: 8px; background: #4ade80; border-radius: 50%; margin-right: 6px; }}
-.recent-row {{ padding: 8px 0; border-bottom: 1px solid #26303a; font-size: 13px; }}
-.muted {{ color: #8b949e; }}
-.chat-pill {{ display:inline-block; background:#21262d; padding:2px 8px; border-radius:6px; font-size:11px; color:#7cc4ff; }}
-.per-person {{ color: #8ab4f8; font-size: 11px; }}
-.recv-toggle {{ color: #7cc4ff; cursor: pointer; font-size: 11px; text-decoration: underline; margin-left: 4px; }}
-</style></head><body>
-<header>
-  <div class="brand">🌧 SHUFFLE RAIN <small>статистика</small></div>
-  <nav>
-    <a href="/" class="{active_home}">Главная</a>
-    <a href="/hosts" class="{active_hosts}">Раздающие</a>
-    <a href="/receivers" class="{active_receivers}">Получатели</a>
-    <a href="/monitor">Мониторинг</a>
-  </nav>
-  <div style="margin-left:auto"><span class="live-dot"></span><span class="muted">LIVE</span></div>
-</header>
-<main>{content}</main>
-</body></html>"""
-
-
-def fmt_rub(x):
-    try: return f"{x:,.2f}".replace(",", " ").replace(".", ",") + " ₽"
-    except: return "0 ₽"
-
-
-def render_rank_table(rows):
-    if not rows:
-        return "<tr><td colspan='4' class='muted'>Пока нет данных</td></tr>"
-    html = ""
-    for i, r in enumerate(rows, 1):
-        rank_cls = "g" if i == 1 else "s" if i == 2 else "b" if i == 3 else ""
-        html += f"""<tr><td><span class="rank {rank_cls}">{i}</span></td>
-            <td><b>{r['nickname']}</b></td><td>{r['cnt']}</td>
-            <td class="amount">{fmt_rub(r['total'])}</td></tr>"""
-    return html
-
-
-def compute_receiver_stats(etype):
-    stats = defaultdict(lambda: {"cnt": 0, "total": 0.0})
-    for row in query_all(f"SELECT amount_rub, receivers FROM events WHERE type='{etype}'"):
-        try: rcs = json.loads(row["receivers"] or "[]")
-        except: continue
-        if not rcs: continue
-        share = (row["amount_rub"] or 0) / len(rcs)
-        for r in rcs:
-            if r:
-                stats[r]["cnt"] += 1
-                stats[r]["total"] += share
-    return stats
-
-
-def sort_receiver_stats(stats, by="total", limit=50):
-    arr = [{"nickname": k, "cnt": v["cnt"], "total": v["total"]} for k, v in stats.items()]
-    arr.sort(key=lambda x: x[by], reverse=True)
-    return arr[:limit]
-
-
-@app.get("/", response_class=HTMLResponse)
-async def page_home():
-    t = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='rain'") or {}).get("c", 0)
-    tips = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='tip'") or {}).get("c", 0)
-    tr = (query_one("SELECT COALESCE(SUM(amount_rub),0) AS s FROM events WHERE type='rain'") or {}).get("s", 0)
-    ttr = (query_one("SELECT COALESCE(SUM(amount_rub),0) AS s FROM events WHERE type='tip'") or {}).get("s", 0)
-    content = f"""
-    <div class="grid">
-      <div class="card"><h3>Дождей</h3><div class="big">{t}</div></div>
-      <div class="card"><h3>Раздали всего</h3><div class="big">{fmt_rub(tr or 0)}</div></div>
-      <div class="card"><h3>Чаевых</h3><div class="big">{tips}</div></div>
-      <div class="card"><h3>Чаевых сумма</h3><div class="big">{fmt_rub(ttr or 0)}</div></div>
-    </div>
-    <div class="card" style="margin-top:16px"><h3>Последние события</h3><div id="recent"></div></div>
-    <script>
-      function esc(s){{return (s==null?'':String(s)).replace(/[<>&"]/g,c=>({{'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}}[c]));}}
-      function fmtR(v){{return (v||0).toFixed(0);}}
-      async function loadOnce() {{ const r = await fetch('/api/stats'); const d = await r.json(); renderRecent(d.recent); }}
-      function renderRecent(rows) {{
-        const el = document.getElementById('recent'); if (!rows) return;
-        el.innerHTML = rows.map(r => {{
-          const cls = r.type === 'rain' ? 'rain' : 'tip';
-          const tag = r.type === 'rain' ? 'RAIN' : 'TIP';
-          const amt = r.amount_text || '';
-          const rub = r.amount_rub ? ' (' + fmtR(r.amount_rub) + ' ₽)' : '';
-          const per = r.per_person_rub ? ' <span class="per-person">по ' + fmtR(r.per_person_rub) + ' ₽</span>' : '';
-          const recs = (r.receivers || []);
-          const recsHtml = recs.length > 5
-            ? recs.slice(0,5).map(esc).join(', ') + ' <span id="rm_' + Math.random().toString(36).slice(2,7) + '" data-rest="' + esc(recs.slice(5).join(', ')) + '"></span><span class="recv-toggle" onclick="this.previousElementSibling.textContent=\\' , \\'+this.previousElementSibling.dataset.rest;this.style.display=\\'none\\'">+' + (recs.length-5) + ' ещё</span>'
-            : recs.map(esc).join(', ');
-          return `<div class="recent-row"><span class="tag ${{cls}}">${{tag}}</span> <span class="chat-pill">${{r.chat}}</span> <b style="margin-left:6px">${{esc(r.sender)}}</b><span class="muted"> → ${{recsHtml}}</span>${{per}}<span style="float:right" class="amount">${{esc(amt)}}${{rub}}</span></div>`;
-        }}).join('');
-      }}
-      loadOnce();
-      setInterval(loadOnce, 15000);
-    </script>"""
-    return BASE_HTML.format(title="Shuffle Rain Stats", active_home="active",
-                             active_hosts="", active_receivers="", content=content)
-
-
-@app.get("/hosts", response_class=HTMLResponse)
-async def page_hosts():
-    r1 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='rain' GROUP BY sender ORDER BY total DESC LIMIT 50")
-    r2 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='rain' GROUP BY sender ORDER BY cnt DESC LIMIT 50")
-    t1 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY total DESC LIMIT 50")
-    t2 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY cnt DESC LIMIT 50")
-
-    def row_with_profile(r, i):
-        rank_cls = "g" if i == 1 else "s" if i == 2 else "b" if i == 3 else ""
-        nick = r['nickname']
-        return f"""<tr><td><span class="rank {rank_cls}">{i}</span></td>
-            <td><a href="#" onclick="openProfile('{nick}');return false"><b>{nick}</b></a></td>
-            <td>{r['cnt']}</td><td class="amount">{fmt_rub(r['total'])}</td></tr>"""
-
-    def table(rows):
-        if not rows: return "<tr><td colspan='4' class='muted'>Пусто</td></tr>"
-        return "".join(row_with_profile(r, i) for i, r in enumerate(rows, 1))
-
-    content = f"""
-    <div class="grid" style="grid-template-columns: 1fr 1fr">
-      <div class="card"><h3>🌧 Раздал дождей — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r1)}</tbody></table></div>
-      <div class="card"><h3>🌧 Раздал дождей — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r2)}</tbody></table></div>
-      <div class="card"><h3>💸 Отправил чаевых — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t1)}</tbody></table></div>
-      <div class="card"><h3>💸 Отправил чаевых — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t2)}</tbody></table></div>
-    </div>
-    <div id="profileModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);align-items:center;justify-content:center;z-index:50;padding:20px">
-      <div style="background:#161b22;border:1px solid #26303a;border-radius:12px;max-width:700px;width:100%;padding:24px;max-height:80vh;overflow-y:auto">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-          <h2 id="profName" style="margin:0;color:#7cc4ff"></h2>
-          <button onclick="document.getElementById('profileModal').style.display='none'" style="background:#2a3340;color:#e6e6e6;border:1px solid #334055;padding:4px 12px;border-radius:5px;cursor:pointer">✕</button>
-        </div>
-        <div style="margin-bottom:12px"><label style="color:#8b949e;font-size:12px">Язык:</label>
-          <select id="profLang" style="background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:6px;border-radius:5px;margin-left:8px">
-            <option>ENGLISH</option><option>RUSSIAN</option><option>JAPANESE</option><option>TURKISH</option>
-            <option>SPANISH</option><option>PORTUGUESE</option><option>FRENCH</option><option>KOREAN</option>
-            <option>CHINESE</option><option>POLISH</option><option>VIETNAMESE</option><option>INDONESIAN</option>
-          </select>
-        </div>
-        <div style="margin-bottom:12px"><label style="color:#8b949e;font-size:12px">Описание:</label>
-          <textarea id="profDesc" style="width:100%;background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:8px;border-radius:5px;margin-top:6px;min-height:80px"></textarea>
-        </div>
-        <div style="margin-bottom:16px"><label style="color:#8b949e;font-size:12px"><input type="checkbox" id="profTop"> Добавить в watch-list</label></div>
-        <div id="profContent"></div>
-        <button onclick="saveProfile()" style="background:#2563eb;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-weight:600">💾 Сохранить</button>
-      </div>
-    </div>
-    <script>
-      let currentNick = null;
-      async function openProfile(nick) {{
-        currentNick = nick;
-        document.getElementById('profileModal').style.display = 'flex';
-        document.getElementById('profName').textContent = nick;
-        const [prof, bets, msgs] = await Promise.all([
-          fetch('/api/profile/' + encodeURIComponent(nick)).then(r=>r.json()),
-          fetch('/api/bets?sender=' + encodeURIComponent(nick) + '&limit=20').then(r=>r.json()),
-          fetch('/api/player?username=' + encodeURIComponent(nick) + '&limit=15').then(r=>r.json()),
-        ]);
-        document.getElementById('profLang').value = prof.profile.lang || 'ENGLISH';
-        document.getElementById('profDesc').value = prof.profile.description || '';
-        document.getElementById('profTop').checked = !!prof.profile.is_top;
-        const betsHtml = (bets.bets||[]).map(b => `<div style="padding:6px 10px;border-left:3px solid #71d68a;margin:4px 0;font-size:12px">🎰 ${{b.game}} · ${{b.multiplier}} · ${{b.amount_text}} ${{b.crypto||''}} (~$${{(b.amount_usd||0).toFixed(2)}})</div>`).join('') || '<div class="muted">Нет ставок</div>';
-        const msgsHtml = (msgs.rows||[]).map(m => `<div style="padding:4px 8px;border-left:3px solid #2a2f3a;margin:4px 0;font-size:12px"><b>${{m.chat}}</b>: ${{m.text}}</div>`).join('') || '<div class="muted">Нет сообщений</div>';
-        document.getElementById('profContent').innerHTML = `
-          <h4 style="color:#8b949e;font-size:12px;margin:16px 0 8px">Последние ставки</h4>${{betsHtml}}
-          <h4 style="color:#8b949e;font-size:12px;margin:16px 0 8px">Последние сообщения</h4>${{msgsHtml}}`;
-      }}
-      async function saveProfile() {{
-        if(!currentNick) return;
-        const body = {{
-          lang: document.getElementById('profLang').value,
-          description: document.getElementById('profDesc').value,
-          is_top: document.getElementById('profTop').checked
-        }};
-        await fetch('/api/profile/' + encodeURIComponent(currentNick), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body)}});
-        if(body.is_top) {{
-          await fetch('/api/watchlist/add', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{name: currentNick}})}});
-        }}
-        alert('Сохранено');
-      }}
-    </script>"""
-    return BASE_HTML.format(title="Shuffle — Раздающие", active_home="", active_hosts="active", active_receivers="", content=content)
-
-
-@app.get("/receivers", response_class=HTMLResponse)
-async def page_receivers():
-    rain_stats = compute_receiver_stats("rain")
-    tip_stats = compute_receiver_stats("tip")
-    ra = sort_receiver_stats(rain_stats, by="total")
-    rc = sort_receiver_stats(rain_stats, by="cnt")
-    ta = sort_receiver_stats(tip_stats, by="total")
-    tc = sort_receiver_stats(tip_stats, by="cnt")
-    content = f"""
-    <div class="grid" style="grid-template-columns: 1fr 1fr">
-      <div class="card"><h3>🏆 Выиграл дождей — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Выигрышей</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(ra)}</tbody></table></div>
-      <div class="card"><h3>🎯 Выиграл дождей — по частоте</h3><table><thead><tr><th>#</th><th>Ник</th><th>Выигрышей</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(rc)}</tbody></table></div>
-      <div class="card"><h3>💰 Получил чаевых — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Получено</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(ta)}</tbody></table></div>
-      <div class="card"><h3>📬 Получил чаевых — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Получено</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(tc)}</tbody></table></div>
-    </div>"""
-    return BASE_HTML.format(title="Shuffle — Получатели", active_home="", active_hosts="", active_receivers="active", content=content)
-
-
 # ==================== ADMIN ====================
-ADMIN_HTML = """<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Admin</title>
-<style>
-body{margin:0;background:#0e1116;color:#e6e9ef;font-family:sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}
+ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Admin</title>
+<style>body{margin:0;background:#0e1116;color:#e6e9ef;font-family:sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}
 .box{background:#161b22;border:1px solid #26303a;border-radius:12px;padding:32px 40px;max-width:520px;width:100%}
-h1{margin:0 0 8px}.sub{color:#8b949e;margin-bottom:24px;font-size:14px}
-input{width:100%;background:#0d1117;border:1px solid #30363d;color:#e6e9ef;padding:10px 12px;border-radius:8px;font-size:14px;margin-bottom:16px;font-family:monospace;box-sizing:border-box}
+input{width:100%;background:#0d1117;border:1px solid #30363d;color:#e6e9ef;padding:10px;border-radius:8px;margin-bottom:16px;font-family:monospace;box-sizing:border-box}
 button{width:100%;padding:12px;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;background:#dc2626;color:#fff}
-.result{margin-top:16px;padding:12px;border-radius:8px;font-size:13px;display:none}
-.result.ok{background:#052e16;color:#4ade80;display:block}
-.result.err{background:#2d0f0f;color:#f87171;display:block}
 </style></head><body><div class="box">
-<h1>⚙️ Админ</h1><div class="sub">Shuffle Rain Stats</div>
+<h2>⚙️ Admin</h2>
 <input id="apiKey" type="password" placeholder="X-API-Key">
 <input id="confirm" type="text" placeholder="DELETE_ALL">
 <button onclick="clearDb()">🗑 Очистить БД</button>
-<div id="result" class="result"></div>
-</div><script>
-async function clearDb(){{
+<div id="r"></div></div><script>
+async function clearDb(){
   const k=document.getElementById('apiKey').value.trim();
   const c=document.getElementById('confirm').value.trim();
-  const r=document.getElementById('result');
-  if(!k||c!=='DELETE_ALL'){{r.className='result err';r.textContent='Заполни оба поля';return;}}
-  if(!confirm('Точно удалить?')) return;
-  const res=await fetch('/api/clear',{{method:'POST',headers:{{'Content-Type':'application/json','X-API-Key':k}},body:JSON.stringify({{confirm:'DELETE_ALL'}})}});
+  const r=document.getElementById('r');
+  if(!k||c!=='DELETE_ALL'){r.textContent='Заполни';return;}
+  const res=await fetch('/api/clear',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':k},body:JSON.stringify({confirm:'DELETE_ALL'})});
   const d=await res.json();
-  r.className='result '+(res.ok?'ok':'err');
-  r.textContent=res.ok?'✅ Готово':'❌ '+(d.detail||'Ошибка');
-}}
+  r.textContent = res.ok ? '✅ Готово' : '❌ '+(d.detail||'Ошибка');
+}
 </script></body></html>"""
 
 
