@@ -680,8 +680,6 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
 
 @app.post("/api/bulk_alert")
 async def add_bulk_alert(body: BulkAlertIn, x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
     ts_val = body.ts if body.ts else time.time()
     rub = body.amount_rub or 0.0
     if rub == 0:
@@ -696,7 +694,7 @@ async def add_bulk_alert(body: BulkAlertIn, x_api_key: str = Header(default=""))
 
 
 @app.post("/api/bulk/rubric/{alert_id}")
-async def toggle_bulk_rubric(alert_id: int, x_api_key: str = Header(default="")):
+async def toggle_bulk_rubric(alert_id: int):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     row = query_one("SELECT id, is_rubric FROM bulk_alerts WHERE id=?", (alert_id,))
@@ -739,9 +737,7 @@ async def add_bet(body: BetIn, x_api_key: str = Header(default="")):
 
 
 @app.post("/api/bets/clear_top")
-async def clear_bets_top(x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+async def clear_bets_top():
     meta_set("bets_top_cleared_at", time.time())
     return {"ok": True}
 
@@ -1399,9 +1395,7 @@ async def api_players(chat: Optional[str] = None, username: Optional[str] = None
 
 
 @app.post("/api/players/relocate")
-async def api_players_relocate(body: dict, x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+async def api_players_relocate(body: dict):
     username = (body.get("username") or "").strip()
     new_chat = (body.get("chat") or "").strip()
     if not username or not new_chat:
