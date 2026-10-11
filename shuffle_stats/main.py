@@ -1438,14 +1438,14 @@ tr:hover td{{background:#1c222b}}
 .tag{{display:inline-block;background:#21262d;padding:2px 8px;border-radius:6px;font-size:11px;color:#8b949e;margin-left:6px}}
 .muted{{color:#8b949e}}
 .chat-pill{{display:inline-block;background:#21262d;padding:2px 8px;border-radius:6px;font-size:11px;color:#7cc4ff}}
-.hint-btn{{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;
-  background:#232a37;color:#8ab4f8;font-size:12px;cursor:help;font-weight:bold;margin-left:6px;
-  position:relative;vertical-align:middle}}
-.hint-btn:hover{{background:#2f3d55}}
-.hint-btn:hover::after{{content:attr(data-hint);position:absolute;top:26px;left:-180px;width:380px;
-  background:#1a1f28;color:#e6e6e6;border:1px solid #2f3d55;border-radius:8px;padding:12px;
-  font-size:12px;font-weight:normal;line-height:1.5;z-index:100;white-space:pre-wrap;
-  box-shadow:0 4px 20px rgba(0,0,0,.6);text-align:left}}
+.hint-btn{{display:inline-block;width:18px;height:18px;line-height:18px;text-align:center;border-radius:50%;
+  background:#1e88e5;color:#fff;font-size:12px;cursor:help;font-weight:bold;margin-left:8px;
+  position:relative;vertical-align:middle;flex-shrink:0;user-select:none}}
+.hint-btn:hover{{background:#42a5f5}}
+.hint-btn:hover::after{{content:attr(data-hint);position:absolute;top:26px;left:-200px;width:420px;
+  background:#1a1f28;color:#e6e6e6;border:1px solid #2f3d55;border-radius:8px;padding:14px;
+  font-size:12px;font-weight:normal;line-height:1.6;z-index:1000;white-space:pre-wrap;
+  box-shadow:0 8px 30px rgba(0,0,0,.8);text-align:left;pointer-events:none}}
 </style></head><body>
 <header>
   <div class="brand">🌧 SHUFFLE RAIN <small>статистика</small></div>
@@ -1727,14 +1727,16 @@ tr.rubric-row td{background:#2a2410 !important}
 .vault-amount{color:#71d68a;font-weight:600}
 .vault-warn{color:#fbbf24}
 .vault-danger{color:#f87171}
-.hint-btn{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
-  background:#232a37;color:#8ab4f8;font-size:11px;cursor:help;margin-left:6px;font-weight:bold;
-  position:relative;vertical-align:middle}
-.hint-btn:hover{background:#2f3d55}
-.hint-btn:hover::after{content:attr(data-hint);position:absolute;top:24px;left:-180px;width:380px;
-  background:#1a1f28;color:#e6e6e6;border:1px solid #2f3d55;border-radius:8px;padding:12px;
-  font-size:12px;font-weight:normal;line-height:1.5;z-index:100;white-space:pre-wrap;
-  box-shadow:0 4px 20px rgba(0,0,0,.6);text-align:left}
+.hint-btn{display:inline-block;width:18px;height:18px;line-height:18px;text-align:center;border-radius:50%;
+  background:#1e88e5;color:#fff;font-size:12px;cursor:help;margin-left:8px;font-weight:bold;
+  position:relative;vertical-align:middle;flex-shrink:0;border:none;padding:0;
+  font-family:Arial,sans-serif;user-select:none}
+.hint-btn:hover{background:#42a5f5}
+.hint-btn:hover::after{content:attr(data-hint);position:absolute;top:26px;left:-200px;width:420px;
+  background:#1a1f28;color:#e6e6e6;border:1px solid #2f3d55;border-radius:8px;padding:14px;
+  font-size:12px;font-weight:normal;line-height:1.6;z-index:1000;white-space:pre-wrap;
+  box-shadow:0 8px 30px rgba(0,0,0,.8);text-align:left;
+  pointer-events:none}
 </style></head><body>
 <header>
   <h1>🎰 Shuffle Monitor</h1>
