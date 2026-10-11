@@ -45,7 +45,6 @@ SCREENSHOT_REQUESTS = {}
 PROMO_CHANNEL = os.environ.get("PROMO_CHANNEL", "anyclaimershuffle")
 PROMO_PARSE_INTERVAL = 5 * 60
 
-# Окно для связки "ставка → дождь"
 BET_TO_RAIN_WINDOW_SEC = 900  # 15 минут
 
 LANG_MAP = {
@@ -55,20 +54,12 @@ LANG_MAP = {
     'POLISH': 'польский', 'INDONESIAN': 'индонезийский', 'CHINESE': 'китайский',
 }
 
-
 # ==================== RATES (серверные) ====================
 RATES_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_rates.json")
 
-# Алиасы иконок Shuffle → ключ в rates
 RATE_ALIASES = {
-    "TON": "GRAM",
-    "MATIC": "POL",
-    "POLYGON": "POL",
-    "USD": "USDT",
-    "USDC": "USDT",
-    "DAI": "USDT",
-    "BUSD": "USDT",
-    "TUSD": "USDT",
+    "TON": "GRAM", "MATIC": "POL", "POLYGON": "POL",
+    "USD": "USDT", "USDC": "USDT", "DAI": "USDT", "BUSD": "USDT", "TUSD": "USDT",
 }
 
 _server_rates = {}
@@ -130,7 +121,6 @@ def _fetch_server_rates():
                     new[sym] = data[cg]["rub"]
                 if "usd" in data[cg]:
                     new[f"{sym}_USD"] = data[cg]["usd"]
-        # TON = GRAM (тот же токен)
         if "GRAM" in new:
             new["TON"] = new["GRAM"]
         if "GRAM_USD" in new:
@@ -169,7 +159,6 @@ def server_rate_usd(symbol):
 
 
 def rates_refresh_thread():
-    # первое обновление сразу
     _fetch_server_rates()
     while True:
         time.sleep(3600)
@@ -272,12 +261,15 @@ def init_db():
         execute("""CREATE TABLE IF NOT EXISTS bulk_alerts (
             id SERIAL PRIMARY KEY, ts DOUBLE PRECISION NOT NULL, chat TEXT NOT NULL,
             sender TEXT NOT NULL, amount_text TEXT, amount_rub DOUBLE PRECISION DEFAULT 0,
-            crypto TEXT, receivers TEXT NOT NULL, window_sec INTEGER DEFAULT 0)""")
+            crypto TEXT, receivers TEXT NOT NULL, window_sec INTEGER DEFAULT 0,
+            is_rubric INTEGER DEFAULT 0)""")
     else:
         execute("""CREATE TABLE IF NOT EXISTS bulk_alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, chat TEXT NOT NULL,
             sender TEXT NOT NULL, amount_text TEXT, amount_rub REAL DEFAULT 0,
-            crypto TEXT, receivers TEXT NOT NULL, window_sec INTEGER DEFAULT 0)""")
+            crypto TEXT, receivers TEXT NOT NULL, window_sec INTEGER DEFAULT 0,
+            is_rubric INTEGER DEFAULT 0)""")
+    _try("ALTER TABLE bulk_alerts ADD COLUMN is_rubric INTEGER DEFAULT 0" if USE_POSTGRES else "ALTER TABLE bulk_alerts ADD COLUMN is_rubric INTEGER DEFAULT 0")
     execute("CREATE INDEX IF NOT EXISTS idx_bulk_ts ON bulk_alerts(ts)")
     execute("CREATE INDEX IF NOT EXISTS idx_bulk_sender ON bulk_alerts(sender)")
 
@@ -297,12 +289,14 @@ def init_db():
             id SERIAL PRIMARY KEY, ts DOUBLE PRECISION NOT NULL, chat TEXT NOT NULL,
             sender TEXT NOT NULL, game TEXT, multiplier TEXT, amount_text TEXT,
             amount_rub DOUBLE PRECISION DEFAULT 0, amount_usd DOUBLE PRECISION DEFAULT 0,
-            crypto TEXT, outcome TEXT)""")
+            crypto TEXT, outcome TEXT, source TEXT DEFAULT 'bets_page')""")
     else:
         execute("""CREATE TABLE IF NOT EXISTS bets (
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, chat TEXT NOT NULL,
             sender TEXT NOT NULL, game TEXT, multiplier TEXT, amount_text TEXT,
-            amount_rub REAL DEFAULT 0, amount_usd REAL DEFAULT 0, crypto TEXT, outcome TEXT)""")
+            amount_rub REAL DEFAULT 0, amount_usd REAL DEFAULT 0, crypto TEXT,
+            outcome TEXT, source TEXT DEFAULT 'bets_page')""")
+    _try("ALTER TABLE bets ADD COLUMN source TEXT DEFAULT 'bets_page'" if USE_POSTGRES else "ALTER TABLE bets ADD COLUMN source TEXT DEFAULT 'bets_page'")
     execute("CREATE INDEX IF NOT EXISTS idx_bets_ts ON bets(ts)")
     execute("CREATE INDEX IF NOT EXISTS idx_bets_chat ON bets(chat)")
     execute("CREATE INDEX IF NOT EXISTS idx_bets_sender ON bets(sender)")
@@ -361,6 +355,18 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_cp_user ON chat_players(username)")
     execute("CREATE INDEX IF NOT EXISTS idx_cp_last ON chat_players(last_seen)")
 
+    # Профили игроков (топ-раздающие)
+    if USE_POSTGRES:
+        execute("""CREATE TABLE IF NOT EXISTS player_profiles (
+            id SERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL,
+            lang TEXT DEFAULT 'ENGLISH', description TEXT DEFAULT '',
+            is_top BOOLEAN DEFAULT FALSE, updated_at DOUBLE PRECISION)""")
+    else:
+        execute("""CREATE TABLE IF NOT EXISTS player_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
+            lang TEXT DEFAULT 'ENGLISH', description TEXT DEFAULT '',
+            is_top INTEGER DEFAULT 0, updated_at REAL)""")
+
     execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
 
 
@@ -396,9 +402,7 @@ def migrate_ts_once():
 
 # ==================== ДЕДУП + ПЕРЕСЧЁТ ====================
 def dedup_events():
-    """Удаляет дубликаты событий и пересчитывает нулевые суммы."""
     try:
-        # 1) Пересчёт нулевых amount_rub / amount_usd у events
         rows = query_all("""SELECT id, type, chat, sender, amount_text, amount_type,
                             crypto_symbol, amount_rub, amount_usd
                             FROM events
@@ -411,7 +415,8 @@ def dedup_events():
             crypto = (r.get("crypto_symbol") or "").upper().strip()
             value = None
             try:
-                value = float(txt.replace("\u00a0", " ").replace(" ", "").replace(",", ".").replace("₽", "").replace("$", "").replace("€", ""))
+                value = float(txt.replace("\u00a0", " ").replace(" ", "").replace(",", ".")
+                              .replace("₽", "").replace("$", "").replace("€", ""))
             except Exception:
                 pass
             if value is None:
@@ -419,7 +424,6 @@ def dedup_events():
             new_rub = r.get("amount_rub") or 0
             new_usd = r.get("amount_usd") or 0
             has_fiat_marker = any(m in txt for m in ("₽", "$", "€", "£"))
-            # Если есть крипто-символ и нет фиат-маркера — конвертим из крипты
             if crypto and not has_fiat_marker:
                 cr = server_rate_rub(crypto)
                 cu = server_rate_usd(crypto)
@@ -432,7 +436,6 @@ def dedup_events():
             elif "$" in txt and not new_usd:
                 new_usd = value
             elif not crypto:
-                # нет символа — оставляем как рубли
                 if not new_rub:
                     new_rub = value
                 if not new_usd and new_rub:
@@ -447,7 +450,6 @@ def dedup_events():
         if fixed:
             print(f"[DEDUP] ✅ Пересчитано {fixed} событий с 0-суммой")
 
-        # 2) Удаление дублей events: (type, chat, sender, amount_rub, receivers, ts в пределах 60с)
         dups = query_all("""
             SELECT a.id AS keep_id, b.id AS del_id
             FROM events a
@@ -470,7 +472,6 @@ def dedup_events():
                 execute(f"DELETE FROM events WHERE id IN ({phs})", tuple(chunk))
             print(f"[DEDUP] ✅ Удалено {len(ids)} дублей events")
 
-        # 3) Удаление дублей bulk_alerts
         dups_b = query_all("""
             SELECT a.id AS keep_id, b.id AS del_id
             FROM bulk_alerts a
@@ -557,6 +558,7 @@ class BetIn(BaseModel):
     amount_usd: float = 0.0
     crypto: str = ""
     outcome: str = "win"
+    source: str = "bets_page"
 
 
 class InstanceStatus(BaseModel):
@@ -597,9 +599,8 @@ class PlayersBatchIn(BaseModel):
     players: List[PlayerStatItem] = []
 
 
-# ==================== API ДЛЯ СКРИПТА ====================
+# ==================== РАСЧЁТ ====================
 def _recalc_amounts(amount_text, amount_type, crypto_symbol):
-    """Пересчитывает 0-суммы используя серверные курсы. Возвращает (rub, usd)."""
     txt = amount_text or ""
     crypto = (crypto_symbol or "").upper().strip()
     value = None
@@ -639,13 +640,13 @@ def _recalc_amounts(amount_text, amount_type, crypto_symbol):
         uu = server_rate_usd("USDT") or 1.0
         rub = usd / uu * ur if uu else usd * ur
         return rub, usd
-    # нет символа — рубли по-умолчанию
     rub = value
     ur = server_rate_rub("USDT") or 95.0
     uu = server_rate_usd("USDT") or 1.0
     return rub, rub / ur * uu
 
 
+# ==================== API ДЛЯ СКРИПТА ====================
 @app.post("/api/event")
 async def add_event(event: EventIn, x_api_key: str = Header(default="")):
     if x_api_key != API_KEY:
@@ -661,7 +662,6 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
 
     rub = event.amount_rub or 0.0
     usd = event.amount_usd or 0.0
-    # серверный fallback если клиент не смог посчитать
     if rub == 0 or usd == 0:
         cr, cu = _recalc_amounts(event.amount_text, event.amount_type, event.crypto_symbol)
         if not rub: rub = cr
@@ -695,6 +695,18 @@ async def add_bulk_alert(body: BulkAlertIn, x_api_key: str = Header(default=""))
     return {"ok": True}
 
 
+@app.post("/api/bulk/rubric/{alert_id}")
+async def toggle_bulk_rubric(alert_id: int, x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    row = query_one("SELECT id, is_rubric FROM bulk_alerts WHERE id=?", (alert_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="not found")
+    new_val = 0 if row.get("is_rubric") else 1
+    execute("UPDATE bulk_alerts SET is_rubric=? WHERE id=?", (new_val, alert_id))
+    return {"ok": True, "is_rubric": new_val}
+
+
 @app.post("/api/player_activity")
 async def add_player_activity(body: PlayerActivityIn, x_api_key: str = Header(default="")):
     if x_api_key != API_KEY:
@@ -719,9 +731,18 @@ async def add_bet(body: BetIn, x_api_key: str = Header(default="")):
         if not usd: usd = cu
     p = ph()
     execute(f"""INSERT INTO bets (ts, chat, sender, game, multiplier, amount_text,
-                amount_rub, amount_usd, crypto, outcome) VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p})""",
+                amount_rub, amount_usd, crypto, outcome, source)
+                VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p})""",
             (ts_val, body.chat, body.sender, body.game, body.multiplier, body.amount_text,
-             rub, usd, body.crypto, body.outcome))
+             rub, usd, body.crypto, body.outcome, body.source or "bets_page"))
+    return {"ok": True}
+
+
+@app.post("/api/bets/clear_top")
+async def clear_bets_top(x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    meta_set("bets_top_cleared_at", time.time())
     return {"ok": True}
 
 
@@ -745,7 +766,6 @@ async def add_intent(body: IntentIn, x_api_key: str = Header(default="")):
         delta = int(rain["ts"] - ts_val)
         execute("UPDATE intents SET matched_rain_id=?, matched_delta_sec=? WHERE chat=? AND sender=? AND text=? AND ABS(ts-?) < 60",
                 (rain["id"], delta, body.chat, body.sender, body.text, ts_val))
-        print(f"[INTENT] ✅ {body.sender} обещал и залил через {delta}с ({body.chat})")
     return {"ok": True}
 
 
@@ -780,7 +800,6 @@ async def add_players_batch(body: PlayersBatchIn, x_api_key: str = Header(defaul
 
 @app.post("/api/events_batch")
 async def events_batch(payload: dict, x_api_key: str = Header(default="")):
-    """Батчевая вставка событий от клиента."""
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     events = payload.get("events", [])
@@ -894,14 +913,46 @@ async def watchlist_remove(body: dict):
     return {"ok": True, "players": players}
 
 
+# ==================== PLAYER PROFILES ====================
+@app.get("/api/profile/{username}")
+async def get_profile(username: str):
+    p = query_one("SELECT * FROM player_profiles WHERE username=?", (username,))
+    if not p:
+        return {"profile": {"username": username, "lang": "ENGLISH",
+                             "description": "", "is_top": False}}
+    return {"profile": p}
+
+
+@app.post("/api/profile/{username}")
+async def upsert_profile(username: str, body: dict):
+    lang = (body.get("lang") or "ENGLISH").strip()
+    desc = (body.get("description") or "").strip()
+    is_top = 1 if body.get("is_top") else 0
+    p = ph()
+    if USE_POSTGRES:
+        execute(f"""INSERT INTO player_profiles (username, lang, description, is_top, updated_at)
+                    VALUES ({p},{p},{p},{p},{p})
+                    ON CONFLICT (username) DO UPDATE
+                    SET lang=EXCLUDED.lang, description=EXCLUDED.description,
+                        is_top=EXCLUDED.is_top, updated_at=EXCLUDED.updated_at""",
+                (username, lang, desc, is_top, time.time()))
+    else:
+        execute(f"""INSERT INTO player_profiles (username, lang, description, is_top, updated_at)
+                    VALUES ({p},{p},{p},{p},{p})
+                    ON CONFLICT (username) DO UPDATE
+                    SET lang=excluded.lang, description=excluded.description,
+                        is_top=excluded.is_top, updated_at=excluded.updated_at""",
+                (username, lang, desc, is_top, time.time()))
+    return {"ok": True}
+
+
 # ==================== ПРОМОКОДЫ ====================
 def fetch_promo_channel():
     url = f"https://t.me/s/{PROMO_CHANNEL}"
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"}
+        headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, headers=headers, timeout=15)
         if r.status_code != 200:
-            print(f"[PROMO] ⚠️ HTTP {r.status_code}")
             return []
         soup = BeautifulSoup(r.text, "html.parser")
         messages = []
@@ -1031,14 +1082,10 @@ def _process_chat_task_groq(task_id, chat_name, messages):
         f"Ты носитель {lang} языка и активный участник игрового чата казино. "
         f"Тебе дан контекст из последних 50 сообщений чата. "
         f"Твоя задача — предложить 5 живых коротких сообщений на {lang} языке, "
-        f"которые я мог бы отправить в чат, чтобы выглядеть как носитель и не отходить от текущей темы беседы. "
-        f"Сообщения должны быть естественными, короткими (до 100 символов), в стиле чата. "
-        f"Также предложи 5 нейтральных фраз типа 'всем удачи', 'добрый вечер', 'как у вас успехи' — "
-        f"которые можно вставить в любой момент.\n\n"
-        f"ВАЖНО: ответь СТРОГО в формате JSON без пояснений, вот такой структуры:\n"
-        f'{{"topic": "короткое описание текущей темы беседы на русском", '
-        f'"messages": ["сообщение 1", "сообщение 2", "сообщение 3", "сообщение 4", "сообщение 5"], '
-        f'"phrases": ["фраза 1", "фраза 2", "фраза 3", "фраза 4", "фраза 5"]}}'
+        f"которые я мог бы отправить в чат. Сообщения до 100 символов. "
+        f"Также предложи 5 нейтральных фраз. "
+        f"Ответь СТРОГО JSON: "
+        f'{{"topic": "...", "messages": ["..."], "phrases": ["..."]}}'
     )
 
     models_to_try = [GROQ_MODEL, "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
@@ -1067,10 +1114,10 @@ def _process_chat_task_groq(task_id, chat_name, messages):
                 last_error = f"{model_name} not found"
                 continue
             else:
-                last_error = f"HTTP {r.status_code}: {r.text[:150]}"
+                last_error = f"HTTP {r.status_code}"
                 break
         except Exception as e:
-            last_error = f"{type(e).__name__}: {str(e)[:150]}"
+            last_error = f"{type(e).__name__}"
 
     if not content:
         execute("UPDATE chat_tasks SET status='failed', error=?, completed_at=? WHERE id=?",
@@ -1183,8 +1230,11 @@ async def get_screenshot(iid: int):
 @app.get("/api/events")
 async def api_events(since: Optional[float] = None, until: Optional[float] = None,
                      type: Optional[str] = None, chat: Optional[str] = None,
-                     sender: Optional[str] = None, min_rub: Optional[float] = None, limit: int = 500):
+                     sender: Optional[str] = None, min_rub: Optional[float] = None,
+                     last_hours: Optional[int] = None, limit: int = 500):
     q = "SELECT * FROM events WHERE 1=1"; p = []
+    if last_hours:
+        since = time.time() - last_hours * 3600
     if since is not None: q += " AND ts >= ?"; p.append(since)
     if until is not None: q += " AND ts <= ?"; p.append(until)
     if type: q += " AND type = ?"; p.append(type)
@@ -1197,7 +1247,6 @@ async def api_events(since: Optional[float] = None, until: Optional[float] = Non
     for r in rows:
         try: r["receivers"] = json.loads(r.get("receivers") or "[]")
         except: r["receivers"] = []
-        # добавляем per-person
         rc = len(r["receivers"]) or 1
         r["per_person_rub"] = (r.get("amount_rub") or 0) / rc
     return {"events": rows}
@@ -1205,7 +1254,10 @@ async def api_events(since: Optional[float] = None, until: Optional[float] = Non
 
 @app.get("/api/chart")
 async def api_chart(type: Optional[str] = None, chat: Optional[str] = None,
-                    since: Optional[float] = None, until: Optional[float] = None):
+                    since: Optional[float] = None, until: Optional[float] = None,
+                    last_hours: Optional[int] = None):
+    if last_hours:
+        since = time.time() - last_hours * 3600
     hour_expr = "CAST(EXTRACT(HOUR FROM to_timestamp(ts)) AS INTEGER)" if USE_POSTGRES else "CAST(strftime('%H', ts, 'unixepoch') AS INTEGER)"
     q = f"SELECT {hour_expr} AS h, COUNT(*) AS c, COALESCE(SUM(amount_rub),0) AS s FROM events WHERE ts IS NOT NULL"
     p = []
@@ -1322,17 +1374,7 @@ async def api_player(username: Optional[str] = None, chat: Optional[str] = None,
     q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES else " ORDER BY ts DESC, id DESC LIMIT ?"
     p.append(limit)
     rows = query_all(q, tuple(p))
-    hour_expr = "CAST(EXTRACT(HOUR FROM to_timestamp(ts)) AS INTEGER)" if USE_POSTGRES else "CAST(strftime('%H', ts, 'unixepoch') AS INTEGER)"
-    hq = f"SELECT {hour_expr} AS h, COUNT(*) AS c FROM player_activity WHERE 1=1"; hp = []
-    if username: hq += " AND username LIKE ?"; hp.append(f"%{username}%")
-    if chat: hq += " AND chat = ?"; hp.append(chat)
-    hq += " GROUP BY h"
-    hrows = query_all(hq, tuple(hp))
-    hourly = {h: 0 for h in range(24)}
-    for r in hrows:
-        if r.get("h") is not None:
-            hourly[int(r["h"])] = r["c"]
-    return {"rows": rows, "hourly": hourly}
+    return {"rows": rows, "hourly": {h: 0 for h in range(24)}}
 
 
 @app.get("/api/player_names")
@@ -1356,6 +1398,27 @@ async def api_players(chat: Optional[str] = None, username: Optional[str] = None
     return {"players": query_all(q, tuple(p))}
 
 
+@app.post("/api/players/relocate")
+async def api_players_relocate(body: dict, x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    username = (body.get("username") or "").strip()
+    new_chat = (body.get("chat") or "").strip()
+    if not username or not new_chat:
+        raise HTTPException(status_code=400, detail="username, chat required")
+    p = ph()
+    if USE_POSTGRES:
+        execute(f"""INSERT INTO chat_players (chat, username, msg_count, first_seen, last_seen)
+                    VALUES ({p},{p},0,{p},{p})
+                    ON CONFLICT (chat, username) DO NOTHING""",
+                (new_chat, username, time.time(), time.time()))
+    else:
+        execute(f"""INSERT OR IGNORE INTO chat_players (chat, username, msg_count, first_seen, last_seen)
+                    VALUES ({p},{p},0,{p},{p})""",
+                (new_chat, username, time.time(), time.time()))
+    return {"ok": True}
+
+
 @app.get("/api/players_by_chat")
 async def api_players_by_chat():
     cutoff = time.time() - 300
@@ -1368,14 +1431,23 @@ async def api_players_by_chat():
 
 @app.get("/api/players_by_language")
 async def api_players_by_language():
-    """Распределение игроков по языковым чатам."""
-    rows = query_all("""SELECT username,
-                        GROUP_CONCAT(chat) AS chats_raw,
-                        COUNT(DISTINCT chat) AS chat_count,
-                        SUM(msg_count) AS total_msgs,
-                        MAX(last_seen) AS last_seen
-                        FROM chat_players GROUP BY username
-                        ORDER BY total_msgs DESC LIMIT 2000""")
+    """Распределение игроков по языкам (фикс для Postgres)."""
+    if USE_POSTGRES:
+        rows = query_all("""SELECT username,
+                            STRING_AGG(chat, ',') AS chats_raw,
+                            COUNT(DISTINCT chat) AS chat_count,
+                            SUM(msg_count) AS total_msgs,
+                            MAX(last_seen) AS last_seen
+                            FROM chat_players GROUP BY username
+                            ORDER BY SUM(msg_count) DESC LIMIT 3000""")
+    else:
+        rows = query_all("""SELECT username,
+                            GROUP_CONCAT(chat) AS chats_raw,
+                            COUNT(DISTINCT chat) AS chat_count,
+                            SUM(msg_count) AS total_msgs,
+                            MAX(last_seen) AS last_seen
+                            FROM chat_players GROUP BY username
+                            ORDER BY SUM(msg_count) DESC LIMIT 3000""")
     out = []
     for r in rows:
         chats = list(set((r.get("chats_raw") or "").split(",")))
@@ -1386,30 +1458,32 @@ async def api_players_by_language():
 
 
 @app.get("/api/bets_to_rains")
-async def api_bets_to_rains(window_sec: int = BET_TO_RAIN_WINDOW_SEC):
+async def api_bets_to_rains(window_sec: int = BET_TO_RAIN_WINDOW_SEC,
+                             last_hours: Optional[int] = None):
     """
-    Статистика: у кого после выигрышной ставки был дождь в течение N секунд.
+    Статистика: у кого СВОЙ же выигрыш привёл к СВОЕМУ же дождю в течение N сек.
+    Считаются ТОЛЬКО дожди (не типсы) и ТОЛЬКО свой дождь автора ставки.
     """
-    since = time.time() - 7 * 86400
+    since = time.time() - (last_hours * 3600 if last_hours else 7 * 86400)
     bets = query_all("""SELECT id, ts, sender FROM bets
                         WHERE ts >= ? AND COALESCE(amount_usd,0) >= 20
                         ORDER BY ts ASC""", (since,))
     rains = query_all("""SELECT ts, sender, amount_rub FROM events
                         WHERE type='rain' AND ts >= ? AND ts IS NOT NULL
                         ORDER BY ts ASC""", (since,))
-    # индексируем дожди по времени
-    rain_list = sorted([(r["ts"], r["sender"], r.get("amount_rub") or 0) for r in rains if r.get("ts")])
+    rain_list = sorted([(r["ts"], (r.get("sender") or "").strip(), r.get("amount_rub") or 0)
+                        for r in rains if r.get("ts")])
+
     stats = defaultdict(lambda: {"bets": 0, "triggered": 0, "total_rain_rub": 0.0})
     for b in bets:
         s = (b.get("sender") or "").strip()
         if not s: continue
         stats[s]["bets"] += 1
         t0 = b["ts"]
-        # ищем ближайший rain в течение window
         for rt, rs, rr in rain_list:
             if rt < t0: continue
             if rt > t0 + window_sec: break
-            # сам игрок или любой другой раздал
+            if rs != s: continue  # ⚠️ только СВОЙ дождь!
             stats[s]["triggered"] += 1
             stats[s]["total_rain_rub"] += rr
             break
@@ -1445,13 +1519,17 @@ async def api_players_stats(chat: Optional[str] = None, limit: int = 50):
 @app.get("/api/bets")
 async def api_bets(since: Optional[float] = None, until: Optional[float] = None,
                    chat: Optional[str] = None, sender: Optional[str] = None,
-                   min_usd: Optional[float] = None, limit: int = 500):
+                   min_usd: Optional[float] = None, source: Optional[str] = None,
+                   last_hours: Optional[int] = None, limit: int = 500):
+    if last_hours:
+        since = time.time() - last_hours * 3600
     q = "SELECT * FROM bets WHERE 1=1"; p = []
     if since is not None: q += " AND ts >= ?"; p.append(since)
     if until is not None: q += " AND ts <= ?"; p.append(until)
     if chat: q += " AND chat = ?"; p.append(chat)
     if sender: q += " AND sender LIKE ?"; p.append(f"%{sender}%")
     if min_usd is not None: q += " AND amount_usd >= ?"; p.append(min_usd)
+    if source: q += " AND source = ?"; p.append(source)
     q += " ORDER BY ts DESC NULLS LAST, id DESC LIMIT ?" if USE_POSTGRES else " ORDER BY ts DESC, id DESC LIMIT ?"
     p.append(limit)
     return {"bets": query_all(q, tuple(p))}
@@ -1467,11 +1545,15 @@ async def api_bets_stats():
 
 
 @app.get("/api/bets_top_senders")
-async def api_bets_top_senders():
-    since = time.time() - 7 * 86400
-    rows = query_all("""SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_usd),0) AS total_usd
-                        FROM bets WHERE ts >= ? GROUP BY sender ORDER BY total_usd DESC LIMIT 30""", (since,))
-    return {"senders": rows}
+async def api_bets_top_senders(last_hours: Optional[int] = None):
+    cleared = float(meta_get("bets_top_cleared_at") or 0)
+    since = time.time() - (last_hours * 3600 if last_hours else 7 * 86400)
+    since = max(since, cleared)
+    rows = query_all("""SELECT sender AS nickname, COUNT(*) AS cnt,
+                        COALESCE(SUM(amount_usd),0) AS total_usd
+                        FROM bets WHERE ts >= ? GROUP BY sender
+                        ORDER BY total_usd DESC LIMIT 30""", (since,))
+    return {"senders": rows, "cleared_at": cleared, "since": since}
 
 
 @app.get("/api/health")
@@ -1494,18 +1576,8 @@ async def get_stats():
                             GROUP BY sender ORDER BY wins DESC LIMIT 100""")
     top_tips = query_all("""SELECT sender AS nickname, COUNT(*) AS tips_sent, COALESCE(SUM(amount_rub),0) AS total
                             FROM events WHERE type='tip' GROUP BY sender ORDER BY total DESC LIMIT 100""")
-    top_tip_receivers = defaultdict(lambda: {"count": 0, "total": 0.0})
-    for row in query_all("SELECT receivers, amount_rub FROM events WHERE type='tip'"):
-        try:
-            rcs = json.loads(row["receivers"] or "[]")
-            for r in rcs:
-                top_tip_receivers[r]["count"] += 1
-                top_tip_receivers[r]["total"] += (row["amount_rub"] or 0) / max(len(rcs), 1)
-        except: pass
-    top_tip_recv = sorted([{"nickname": k, "tips_received": v["count"], "total": v["total"]}
-                           for k, v in top_tip_receivers.items()],
-                          key=lambda x: x["total"], reverse=True)[:100]
-    recent = query_all("""SELECT type, chat, sender, receivers, amount_text, crypto_symbol, amount_rub, amount_usd, created_at, ts
+    recent = query_all("""SELECT type, chat, sender, receivers, amount_text, crypto_symbol,
+                          amount_rub, amount_usd, created_at, ts
                           FROM events ORDER BY id DESC LIMIT 30""")
     for r in recent:
         try:
@@ -1518,17 +1590,11 @@ async def get_stats():
                             SUM(CASE WHEN type='tip' THEN 1 ELSE 0 END) AS tips,
                             COALESCE(SUM(amount_rub),0) AS total_rub
                             FROM events GROUP BY chat ORDER BY total_rub DESC""")
-    winners = set()
-    for row in query_all("SELECT receivers FROM events WHERE type='rain'"):
-        try:
-            for r in json.loads(row["receivers"] or "[]"): winners.add(r)
-        except: pass
     return {"totals": {"rains": total_rains, "tips": total_tips,
                        "rain_rub": round(total_rain_rub or 0, 2),
-                       "tip_rub": round(total_tip_rub or 0, 2),
-                       "unique_winners": len(winners)},
+                       "tip_rub": round(total_tip_rub or 0, 2)},
             "top_amount": top_amount, "top_wins": top_wins, "top_tips": top_tips,
-            "top_tip_receivers": top_tip_recv, "channels": channels, "recent": recent,
+            "channels": channels, "recent": recent,
             "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
@@ -1597,8 +1663,11 @@ tr:hover td{background:#161a22}
 .pill.ok{background:#1e3a26;color:#71d68a}
 .pill.warn{background:#3a3520;color:#e0c66a}
 .pill.err{background:#3a1f1f;color:#e07a7a}
+.pill.chat{background:#2a1f3a;color:#c58af9}
+.pill.rubric{background:#3a2f1f;color:#e0c66a}
 .btn{background:#2a3340;color:#e6e6e6;border:1px solid #334055;padding:5px 10px;border-radius:5px;cursor:pointer;font-size:12px}
 .btn:hover{background:#334055}
+.btn.danger{background:#3a1f1f;border-color:#7f1d1d}
 .row-flex{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
 input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6px 10px;border-radius:5px;font-size:13px;max-width:220px}
 .chart-wrap{background:#151821;border:1px solid #232a37;border-radius:8px;padding:16px;margin-bottom:16px}
@@ -1606,13 +1675,6 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
 .modal img{max-width:92vw;max-height:92vh;border-radius:8px;border:1px solid #333}
 .modal.on{display:flex}
 .hint{color:#8b93a7;font-size:12px}
-.hint-btn{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;
-  background:#232a37;color:#8ab4f8;font-size:12px;cursor:help;margin-left:6px;font-weight:bold;
-  position:relative}
-.hint-btn:hover::after{content:attr(data-hint);position:absolute;top:24px;left:-200px;width:420px;
-  background:#1a1f28;color:#e6e6e6;border:1px solid #2f3d55;border-radius:8px;padding:12px;
-  font-size:12px;font-weight:normal;line-height:1.5;z-index:100;white-space:pre-wrap;
-  box-shadow:0 4px 20px rgba(0,0,0,.5)}
 .kpi{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
 .kpi div{background:#151821;border:1px solid #232a37;border-radius:8px;padding:10px 16px;min-width:140px}
 .kpi b{display:block;font-size:20px;color:#8ab4f8;margin-top:2px}
@@ -1624,27 +1686,30 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
 .player-tab.active{background:#202633;color:#fff;border-color:#2f3d55}
 .player-tab .rm{color:#f87171;margin-left:8px;cursor:pointer;font-weight:bold}
 .bet-row{color:#71d68a}
+.bet-row.chat{color:#c58af9}
 .promo-card{background:#151821;border:1px solid #232a37;border-radius:8px;padding:12px 16px;margin-bottom:10px;display:flex;gap:12px;align-items:flex-start}
 .promo-card.used{opacity:0.5}
 .promo-cb{width:22px;height:22px;margin-top:3px;cursor:pointer;accent-color:#71d68a}
 .promo-body{flex:1}
 .promo-text{white-space:pre-wrap;font-size:13px;line-height:1.5;color:#e6e6e6}
 .promo-meta{font-size:11px;color:#8b93a7;margin-top:6px}
-.promo-meta a{color:#7cc4ff;text-decoration:none}
 .ai-grid{display:grid;grid-template-columns:2fr 1fr;gap:16px}
 .ai-col{background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px}
-.ai-col h3{margin:0 0 10px;font-size:12px;color:#8b93a7;text-transform:uppercase;letter-spacing:.05em;font-weight:500}
+.ai-col h3{margin:0 0 10px;font-size:12px;color:#8b93a7;text-transform:uppercase;font-weight:500}
 .ai-msg{padding:10px 12px;background:#1a1f28;border-left:3px solid #7cc4ff;border-radius:4px;margin-bottom:8px;font-size:13px;cursor:pointer}
-.ai-msg:hover{background:#232a37}
 .ai-msg.copied{border-left-color:#71d68a;background:#1e3a26}
 .ai-phrase{padding:8px 12px;background:#1a1f28;border-left:3px solid #c58af9;border-radius:4px;margin-bottom:6px;font-size:13px;cursor:pointer}
-.ai-phrase:hover{background:#232a37}
 .ai-phrase.copied{border-left-color:#71d68a;background:#1e3a26}
 .ai-topic{background:#202633;border:1px solid #2f3d55;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px}
 .lang-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
 .lang-card{background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px}
 .lang-card h4{margin:0 0 8px;font-size:13px;color:#8ab4f8}
 .lang-card .player-row{display:flex;justify-content:space-between;padding:4px 0;font-size:12px;border-bottom:1px solid #1e232e}
+.recv-wrap{max-width:420px;font-size:12px}
+.recv-visible{color:#aab}
+.recv-hidden{display:none;color:#aab}
+.recv-toggle{color:#7cc4ff;cursor:pointer;font-size:11px;margin-left:4px;text-decoration:underline}
+tr.rubric-row td{background:#2a2410 !important}
 </style></head><body>
 <header>
   <h1>🎰 Shuffle Monitor</h1>
@@ -1680,7 +1745,14 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
       <select id="fChat"><option value="">Все чаты</option></select>
       <select id="fType"><option value="">Все типы</option><option value="tip">Tip</option><option value="rain">Rain</option></select>
       <input type="number" id="fMinRub" placeholder="Мин. ₽">
-      <select id="fDay"><option value="">Все дни</option></select>
+      <select id="fRange">
+        <option value="">Всё время</option>
+        <option value="1">Последний 1 час</option>
+        <option value="6">Последние 6 часов</option>
+        <option value="24">Последние 24 часа</option>
+        <option value="168">Последние 7 дней</option>
+      </select>
+      <select id="fDay"><option value="">Конкретный день</option></select>
       <button class="btn" onclick="loadEvents()">Фильтр</button>
       <button class="btn" onclick="resetEvents()">Сброс</button>
     </div>
@@ -1692,6 +1764,12 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     <div class="row-flex">
       <select id="cType"><option value="">Всё</option><option value="tip">Tip</option><option value="rain">Rain</option></select>
       <select id="cChat"><option value="">Все чаты</option></select>
+      <select id="cRange">
+        <option value="">Всё время</option>
+        <option value="1">1 час</option>
+        <option value="24" selected>24 часа</option>
+        <option value="168">7 дней</option>
+      </select>
       <button class="btn" onclick="loadChart()">Обновить</button>
     </div>
     <div class="chart-wrap"><canvas id="hourCount" height="90"></canvas></div>
@@ -1705,7 +1783,7 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
       <button class="btn" onclick="clearBulkChips()">Очистить</button>
     </div>
     <div class="chips" id="bulkChips"></div>
-    <table><thead><tr><th>Время</th><th>Чат</th><th>От</th><th>Сумма</th><th>₽ каждому</th><th>₽ всего</th><th>Получателей</th><th>Кому</th></tr></thead>
+    <table><thead><tr><th>Время</th><th>Чат</th><th>От</th><th>Сумма</th><th>₽ каждому</th><th>₽ всего</th><th>Получателей</th><th>Кому</th><th>Действие</th></tr></thead>
     <tbody id="bulkBody"></tbody></table>
   </div>
 
@@ -1713,24 +1791,42 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     <div class="row-flex">
       <input type="text" id="betSender" placeholder="Отправитель">
       <select id="betChat"><option value="">Все чаты</option></select>
+      <select id="betSource">
+        <option value="">Все источники</option>
+        <option value="bets_page">Только таблица ставок</option>
+        <option value="chat">Только из чата</option>
+      </select>
       <input type="number" id="betMinUsd" placeholder="Мин. $" value="50">
+      <select id="betRange">
+        <option value="">Всё время</option>
+        <option value="1">1 час</option>
+        <option value="24" selected>24 часа</option>
+        <option value="168">7 дней</option>
+      </select>
       <button class="btn" onclick="loadBets()">Фильтр</button>
       <button class="btn" onclick="loadBetsStats()">📊 По чатам (24ч)</button>
       <button class="btn" onclick="loadBetsTop()">🏆 Топ (7д)</button>
+      <button class="btn danger" onclick="clearBetsTop()">🗑 Очистить топ</button>
     </div>
     <div id="betStats" style="margin-bottom:16px"></div>
-    <table><thead><tr><th>Время</th><th>Чат</th><th>Игрок</th><th>Игра</th><th>Множитель</th><th>Сумма</th><th>$</th><th>₽</th></tr></thead>
+    <table><thead><tr><th>Время</th><th>Источник</th><th>Чат</th><th>Игрок</th><th>Игра</th><th>Множитель</th><th>Сумма</th><th>$</th><th>₽</th></tr></thead>
     <tbody id="betsBody"></tbody></table>
   </div>
 
   <div id="tab-betsrains" style="display:none">
     <div class="row-flex">
       <input type="number" id="b2rWindow" value="900" style="width:100px">
-      <span class="hint">секунд — окно после ставки</span>
+      <span class="hint">секунд — окно после СВОЕЙ же ставки</span>
+      <select id="b2rRange">
+        <option value="">7 дней</option>
+        <option value="24">24 часа</option>
+        <option value="168" selected>7 дней</option>
+        <option value="720">30 дней</option>
+      </select>
       <button class="btn" onclick="loadBetsToRains()">Обновить</button>
     </div>
     <div id="b2rStats" style="margin-bottom:16px"></div>
-    <table><thead><tr><th>#</th><th>Ник</th><th>Ставок ≥$20</th><th>Привели к дождю</th><th>%</th><th>Сумма дождей ₽</th></tr></thead>
+    <table><thead><tr><th>#</th><th>Ник</th><th>Ставок ≥$20</th><th>Сам залил дождь</th><th>%</th><th>Сумма дождей ₽</th></tr></thead>
     <tbody id="b2rBody"></tbody></table>
   </div>
 
@@ -1809,7 +1905,7 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     </div>
     <div id="plChatsSummary" style="margin-bottom:16px"></div>
     <table><thead><tr>
-      <th>Чат</th><th>Игрок</th><th>Сообщений</th><th>Первый раз</th><th>Последний раз</th><th>Статус</th>
+      <th>Чат</th><th>Игрок</th><th>Сообщений</th><th>Первый раз</th><th>Последний раз</th><th>Статус</th><th>Действие</th>
     </tr></thead>
     <tbody id="plPlayersBody"></tbody></table>
   </div>
@@ -1818,7 +1914,7 @@ input,select{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;padding:6
     <div class="row-flex">
       <input type="text" id="langFilter" placeholder="Поиск по нику">
       <button class="btn" onclick="loadLanguages()">Обновить</button>
-      <span class="hint">Показывает где игрок активен (EN/RU/…) и сколько сообщений в каждом чате.</span>
+      <span class="hint">Где игрок активен и сколько сообщений.</span>
     </div>
     <div id="langGrid" class="lang-grid"></div>
   </div>
@@ -1837,6 +1933,18 @@ const esc = s => (s==null?'':String(s)).replace(/[<>&"]/g, c=>({'<':'&lt;','>':'
 let bulkChips = [];
 let currentPlayer = null;
 let aiPollTimer = null;
+
+// Collapsible receivers
+function renderReceivers(recs, collapseAfter) {
+  recs = recs || [];
+  if (!recs.length) return '<span class="hint">—</span>';
+  const n = collapseAfter || 5;
+  if (recs.length <= n) return `<span class="recv-visible">${recs.map(esc).join(', ')}</span>`;
+  const id = 'recv_' + Math.random().toString(36).slice(2, 9);
+  return `<span class="recv-visible">${recs.slice(0, n).map(esc).join(', ')}</span>` +
+         `<span class="recv-hidden" id="${id}">, ${recs.slice(n).map(esc).join(', ')}</span>` +
+         ` <span class="recv-toggle" onclick="document.getElementById('${id}').style.display='inline';this.style.display='none'">+${recs.length - n} ещё</span>`;
+}
 
 function switchTab(name){
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
@@ -1923,7 +2031,7 @@ async function loadDays(){
   const r = await fetch('/api/days').then(r=>r.json());
   const sel = $('fDay');
   const cur = sel.value;
-  sel.innerHTML = '<option value="">Все дни</option>';
+  sel.innerHTML = '<option value="">Конкретный день</option>';
   r.days.forEach(d=>{ sel.innerHTML += `<option value="${d.day}">${d.day} (${d.count}) — #${d.hash}</option>`; });
   sel.value = cur;
 }
@@ -1934,6 +2042,7 @@ async function loadEvents(){
   if($('fChat').value) p.set('chat',$('fChat').value);
   if($('fType').value) p.set('type',$('fType').value);
   if($('fMinRub').value) p.set('min_rub',$('fMinRub').value);
+  if($('fRange').value) p.set('last_hours',$('fRange').value);
   const day = $('fDay').value;
   if(day){
     const start = Math.floor(new Date(day+'T00:00:00').getTime()/1000);
@@ -1946,7 +2055,7 @@ async function loadEvents(){
     const per = e.per_person_rub || 0;
     tr.innerHTML = `<td>${e.ts?fmtTime(e.ts):esc(e.created_at)}</td>
       <td><span class="pill">${esc(e.type)}</span></td><td>${esc(e.chat)}</td>
-      <td>${esc(e.sender)}</td><td>${(e.receivers||[]).map(esc).join(', ')}</td>
+      <td>${esc(e.sender)}</td><td class="recv-wrap">${renderReceivers(e.receivers)}</td>
       <td>${esc(e.amount_text)}</td><td>${fmtMoney(e.amount_rub)}</td>
       <td style="color:#8ab4f8">${per?fmtMoney(per):'—'}</td>
       <td style="color:#71d68a">$${fmtMoney(e.amount_usd||0)}</td>`;
@@ -1954,7 +2063,7 @@ async function loadEvents(){
   });
 }
 function resetEvents(){
-  ['fSender','fMinRub'].forEach(id=>$(id).value='');
+  ['fSender','fMinRub','fRange'].forEach(id=>$(id).value='');
   $('fChat').value=''; $('fType').value=''; $('fDay').value='';
   loadEvents();
 }
@@ -1964,6 +2073,7 @@ async function loadChart(){
   const p = new URLSearchParams();
   if($('cType').value) p.set('type',$('cType').value);
   if($('cChat').value) p.set('chat',$('cChat').value);
+  if($('cRange').value) p.set('last_hours',$('cRange').value);
   const r = await fetch('/api/chart?'+p).then(r=>r.json());
   const labels = [...Array(24).keys()].map(h=>String(h).padStart(2,'0')+':00');
   const counts = labels.map((_,h)=>r.buckets[h]?.count||0);
@@ -1973,12 +2083,10 @@ async function loadChart(){
   const tl = $('cType').value ? ($('cType').value === 'tip' ? 'Tip' : 'Rain') : 'Все';
   chart1 = new Chart($('hourCount'), {type:'bar',
     data:{labels, datasets:[{label:`Кол-во (${tl})`, data:counts, backgroundColor:'#4a7ce0'}]},
-    options:{plugins:{legend:{labels:{color:'#e6e6e6'}}, title:{display:true,text:`События — ${tl}`,color:'#e6e6e6'}},
-             scales:{x:{ticks:{color:'#8b93a7'}}, y:{ticks:{color:'#8b93a7'}}}}});
+    options:{plugins:{legend:{labels:{color:'#e6e6e6'}}}, scales:{x:{ticks:{color:'#8b93a7'}}, y:{ticks:{color:'#8b93a7'}}}}});
   chart2 = new Chart($('hourSum'), {type:'bar',
     data:{labels, datasets:[{label:`Сумма ₽ (${tl})`, data:sums, backgroundColor:'#71d68a'}]},
-    options:{plugins:{legend:{labels:{color:'#e6e6e6'}}, title:{display:true,text:`Сумма — ${tl}`,color:'#e6e6e6'}},
-             scales:{x:{ticks:{color:'#8b93a7'}}, y:{ticks:{color:'#8b93a7'}}}}});
+    options:{plugins:{legend:{labels:{color:'#e6e6e6'}}}, scales:{x:{ticks:{color:'#8b93a7'}}, y:{ticks:{color:'#8b93a7'}}}}});
 }
 
 function renderBulkChips(){
@@ -1996,37 +2104,51 @@ function addBulkChip(){
 }
 function removeBulkChip(n){ bulkChips = bulkChips.filter(x=>x!==n); renderBulkChips(); loadBulk(); }
 function clearBulkChips(){ bulkChips = []; renderBulkChips(); loadBulk(); }
-$('bSenderInput') && $('bSenderInput').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); addBulkChip(); }});
 
 async function loadBulk(){
   const p = new URLSearchParams();
   if(bulkChips.length) p.set('senders', bulkChips.join(','));
   const r = await fetch('/api/bulk?'+p).then(r=>r.json());
   const body = $('bulkBody'); body.innerHTML='';
-  if(!r.alerts.length){ body.innerHTML = '<tr><td colspan="8" class="hint">Нет данных</td></tr>'; return; }
+  if(!r.alerts.length){ body.innerHTML = '<tr><td colspan="9" class="hint">Нет данных</td></tr>'; return; }
   r.alerts.forEach(a=>{
     const recCount = (a.receivers||[]).length;
     const rubEach = a.amount_rub || 0;
+    const isRubric = a.is_rubric ? true : false;
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${fmtTime(a.ts)}</td><td>${esc(a.chat)}</td><td>${esc(a.sender)}</td>
+    if(isRubric) tr.className = 'rubric-row';
+    tr.innerHTML = `<td>${fmtTime(a.ts)}</td><td>${esc(a.chat)}${isRubric?' <span class="pill rubric">📌 РУБРИКА</span>':''}</td>
+      <td>${esc(a.sender)}</td>
       <td>${esc(a.amount_text)}</td><td>${fmtMoney(rubEach)} ₽</td>
       <td style="color:#71d68a;font-weight:bold">${fmtMoney(rubEach*recCount)} ₽</td>
-      <td>${recCount}</td><td>${(a.receivers||[]).map(esc).join(', ')}</td>`;
+      <td>${recCount}</td><td class="recv-wrap">${renderReceivers(a.receivers)}</td>
+      <td><button class="btn" onclick="toggleRubric(${a.id})">${isRubric?'✓ Снять':'📌 Рубрика'}</button></td>`;
     body.appendChild(tr);
   });
+}
+
+async function toggleRubric(id){
+  await fetch('/api/bulk/rubric/'+id, {method:'POST'});
+  loadBulk();
 }
 
 async function loadBets(){
   const p = new URLSearchParams();
   if($('betSender').value) p.set('sender',$('betSender').value);
   if($('betChat').value) p.set('chat',$('betChat').value);
+  if($('betSource').value) p.set('source',$('betSource').value);
   if($('betMinUsd').value) p.set('min_usd',$('betMinUsd').value);
+  if($('betRange').value) p.set('last_hours',$('betRange').value);
   const r = await fetch('/api/bets?'+p).then(r=>r.json());
   const body = $('betsBody'); body.innerHTML='';
-  if(!r.bets.length){ body.innerHTML = '<tr><td colspan="8" class="hint">Нет ставок</td></tr>'; return; }
+  if(!r.bets.length){ body.innerHTML = '<tr><td colspan="9" class="hint">Нет ставок</td></tr>'; return; }
   r.bets.forEach(b=>{
-    const tr = document.createElement('tr'); tr.className='bet-row';
-    tr.innerHTML = `<td>${fmtTime(b.ts)}</td><td>${esc(b.chat)}</td><td><b>${esc(b.sender)}</b></td>
+    const fromChat = b.source === 'chat';
+    const tr = document.createElement('tr');
+    tr.className = 'bet-row' + (fromChat ? ' chat' : '');
+    tr.innerHTML = `<td>${fmtTime(b.ts)}</td>
+      <td><span class="pill ${fromChat?'chat':''}">${fromChat?'💬 Чат':'📊 Таблица'}</span></td>
+      <td>${esc(b.chat)}</td><td><b>${esc(b.sender)}</b></td>
       <td>${esc(b.game)}</td><td>${esc(b.multiplier)}</td>
       <td>${esc(b.amount_text)} ${esc(b.crypto)}</td>
       <td style="color:#71d68a;font-weight:bold">$${fmtMoney(b.amount_usd)}</td>
@@ -2045,19 +2167,28 @@ async function loadBetsStats(){
 async function loadBetsTop(){
   const r = await fetch('/api/bets_top_senders').then(r=>r.json());
   const el = $('betStats');
-  if(!r.senders.length){ el.innerHTML = '<p class="hint">Пусто</p>'; return; }
+  if(!r.senders.length){ el.innerHTML = '<p class="hint">Пусто (или очищен)</p>'; return; }
   el.innerHTML = '<div class="kpi">' + r.senders.map(s=>`<div>${esc(s.nickname)}<b>${s.cnt} шт.</b>
     <span class="hint">$${fmtMoney(s.total_usd)}</span></div>`).join('') + '</div>';
+}
+async function clearBetsTop(){
+  if(!confirm('Очистить топ раздающих? После этого будут показываться только новые ставки.')) return;
+  await fetch('/api/bets/clear_top', {method:'POST'});
+  alert('Топ очищен. Теперь учитываются только новые ставки.');
+  loadBetsTop();
 }
 
 async function loadBetsToRains(){
   const w = $('b2rWindow').value || 900;
-  const r = await fetch('/api/bets_to_rains?window_sec='+w).then(r=>r.json());
+  const p = new URLSearchParams();
+  p.set('window_sec', w);
+  if($('b2rRange').value) p.set('last_hours', $('b2rRange').value);
+  const r = await fetch('/api/bets_to_rains?'+p).then(r=>r.json());
   const body = $('b2rBody'); body.innerHTML='';
   $('b2rStats').innerHTML = `<div class="kpi">
     <div>Окно<b>${r.window_sec}с</b></div>
     <div>Всего игроков<b>${r.stats.length}</b></div>
-    <div>Всего сработавших<b>${r.stats.reduce((a,x)=>a+x.triggered,0)}</b></div>
+    <div>Сработало<b>${r.stats.reduce((a,x)=>a+x.triggered,0)}</b></div>
   </div>`;
   if(!r.stats.length){ body.innerHTML = '<tr><td colspan="6" class="hint">Нет данных</td></tr>'; return; }
   r.stats.forEach((s, i)=>{
@@ -2105,14 +2236,7 @@ async function loadPlayerActivity(){
     tr.innerHTML = `<td>${fmtTime(x.ts)}</td><td><b>${esc(x.username)}</b></td><td>${esc(x.chat)}</td><td>${esc(x.text)}</td>`;
     body.appendChild(tr);
   });
-  const labels = [...Array(24).keys()].map(h=>String(h).padStart(2,'0')+':00');
-  const vals = labels.map((_,h)=>r.hourly[h]||0);
-  if(chartPlayer) chartPlayer.destroy();
-  chartPlayer = new Chart($('playerHour'), {type:'bar',
-    data:{labels, datasets:[{label:`Сообщений — ${currentPlayer}`, data:vals, backgroundColor:'#c58af9'}]},
-    options:{plugins:{legend:{labels:{color:'#e6e6e6'}}}, scales:{x:{ticks:{color:'#8b93a7'}},y:{ticks:{color:'#8b93a7'}}}}});
 }
-$('pChat') && $('pChat').addEventListener('change', loadPlayerActivity);
 
 async function loadContexts(){
   const p = new URLSearchParams();
@@ -2123,19 +2247,19 @@ async function loadContexts(){
   if(!r.contexts.length){ el.innerHTML = '<p class="hint">Нет контекстов</p>'; return; }
   el.innerHTML = r.contexts.map(c => {
     const rub = c.amount_rub ? fmtMoney(c.amount_rub) + ' ₽' : '';
-    const recs = (c.receivers||[]).slice(0,10).join(', ');
     const msgs = (c.context_messages||[]).slice(-15);
     const bets = (c.context_bets||[]).slice(-5);
-    const msgsHtml = msgs.length ? msgs.map((m,i)=>`<div style="padding:4px 8px;border-left:3px solid #2a2f3a;margin:4px 0;color:#aab;font-size:12px"><span style="color:#666">${i+1}.</span> ${esc(m)}</div>`).join('') : '<div class="hint">Пусто</div>';
-    const betsHtml = bets.length ? bets.map(b=>`<div style="padding:4px 8px;border-left:3px solid #71d68a;margin:4px 0;color:#71d68a;font-size:12px">🎰 <b>${esc(b.sender||'?')}</b> · ${esc(b.game||'')} · ${esc(b.multiplier||'')} · ${esc(b.amount_text||'')}</div>`).join('') : '<div class="hint">Пусто</div>';
+    const msgsHtml = msgs.length ? msgs.map((m,i)=>`<div style="padding:4px 8px;border-left:3px solid #2a2f3a;margin:4px 0;color:#aab;font-size:12px">${i+1}. ${esc(m)}</div>`).join('') : '<div class="hint">Пусто</div>';
+    const betsHtml = bets.length ? bets.map(b=>`<div style="padding:4px 8px;border-left:3px solid #71d68a;margin:4px 0;color:#71d68a;font-size:12px">🎰 <b>${esc(b.sender||'?')}</b> · ${esc(b.game||'')} · ${esc(b.multiplier||'')}</div>`).join('') : '<div class="hint">Пусто</div>';
     return `<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px;margin-bottom:12px">
       <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
         <span class="pill">🌧 RAIN</span><b>${esc(c.chat)}</b>
         <span style="color:#8b93a7;font-size:12px">${c.ts?fmtTime(c.ts):esc(c.created_at)}</span>
         <span style="margin-left:auto;color:#71d68a;font-weight:bold">${esc(c.amount_text)} ${esc(c.crypto_symbol||'')} ${rub?'· '+rub:''}</span>
       </div>
-      <div style="color:#aab;font-size:12px;margin-bottom:6px">👤 <b>${esc(c.sender)}</b> → ${(c.receivers||[]).length} получ.: ${esc(recs)}</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+      <div style="color:#aab;font-size:12px;margin-bottom:6px">👤 <b>${esc(c.sender)}</b> → ${(c.receivers||[]).length} получ.</div>
+      <div class="recv-wrap" style="margin-bottom:8px">${renderReceivers(c.receivers, 8)}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
         <div><div style="color:#8b93a7;font-size:11px;text-transform:uppercase;margin-bottom:6px">Сообщения до</div>${msgsHtml}</div>
         <div><div style="color:#8b93a7;font-size:11px;text-transform:uppercase;margin-bottom:6px">Ставки до</div>${betsHtml}</div>
       </div></div>`;
@@ -2156,7 +2280,7 @@ async function loadIntents(){
     tr.innerHTML = `<td>${fmtTime(x.ts)}</td><td>${esc(x.chat)}</td><td><b>${esc(x.sender)}</b></td>
       <td>${esc(x.text)}</td>
       <td><span class="pill ${x.percent>=70?'ok':'warn'}">${x.percent||100}%</span></td>
-      <td><span class="pill ${matched?'ok':'err'}">${matched?'✅ сбылось':'❌ не сбылось'}</span></td>
+      <td><span class="pill ${matched?'ok':'err'}">${matched?'✅':'❌'}</span></td>
       <td>${x.matched_delta_sec ? Math.round(x.matched_delta_sec)+'с' : '—'}</td>`;
     body.appendChild(tr);
   });
@@ -2167,7 +2291,7 @@ async function loadIntentsStats(){
   if(!r.stats.length){ el.innerHTML = '<p class="hint">Нет данных</p>'; return; }
   el.innerHTML = '<div class="kpi">' + r.stats.map(s=>{
     const cls = s.percent >= 50 ? 'ok' : (s.percent >= 25 ? 'warn' : 'err');
-    return `<div>${esc(s.nickname)}<b>${s.percent}%</b><span class="hint"><span class="pill ${cls}">${s.matched}/${s.total}</span> AI:${s.avg_percent||'—'}%</span></div>`;
+    return `<div>${esc(s.nickname)}<b>${s.percent}%</b><span class="hint"><span class="pill ${cls}">${s.matched}/${s.total}</span></span></div>`;
   }).join('') + '</div>';
 }
 
@@ -2179,13 +2303,12 @@ async function loadPromos(){
   const stats = await fetch('/api/promocodes/stats').then(r=>r.json());
   $('promoStats').textContent = `Всего: ${stats.total} | Исп: ${stats.used} | Осталось: ${stats.unused}`;
   const el = $('promoList');
-  if(!r.promos.length){ el.innerHTML = '<p class="hint">Пусто. Нажми «🔍 Проверить сейчас».</p>'; return; }
+  if(!r.promos.length){ el.innerHTML = '<p class="hint">Пусто</p>'; return; }
   const filtered = filter === '1' ? r.promos.filter(x=>x.used) : r.promos;
-  if(!filtered.length){ el.innerHTML = '<p class="hint">Пусто по фильтру</p>'; return; }
   el.innerHTML = filtered.map(x=>`<div class="promo-card ${x.used?'used':''}">
     <input type="checkbox" class="promo-cb" ${x.used?'checked':''} onchange="togglePromo(${x.id})">
     <div class="promo-body"><div class="promo-text">${esc(x.text)}</div>
-    <div class="promo-meta">${x.message_date?'📅 '+esc(x.message_date):''}${x.link?' · <a href="'+esc(x.link)+'" target="_blank">TG</a>':''}${x.used&&x.used_at?' · ✅ '+fmtTime(x.used_at):''}</div>
+    <div class="promo-meta">${x.message_date?'📅 '+esc(x.message_date):''}${x.link?' · <a href="'+esc(x.link)+'" target="_blank">TG</a>':''}</div>
     </div></div>`).join('');
 }
 async function togglePromo(id){ await fetch('/api/promo/toggle/'+id,{method:'POST'}); loadPromos(); }
@@ -2199,52 +2322,46 @@ async function testPromo(){
 async function runAI(){
   const chat = $('aiChat').value;
   if(!chat){ alert('Выбери чат'); return; }
-  const btn = event.target; btn.disabled=true; btn.textContent='⏳ Читаю чат...';
+  const btn = event.target; btn.disabled=true; btn.textContent='⏳';
   $('aiStatus').textContent = 'Отправляю задачу...';
-  $('aiTopic').innerHTML = '';
-  $('aiResult').innerHTML = '';
   try {
     const r = await fetch('/api/chat/request', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({chat})}).then(r=>r.json());
     const taskId = r.task_id;
-    if(!taskId){ alert('Не удалось создать задачу'); return; }
+    if(!taskId){ alert('Не удалось'); return; }
     if(aiPollTimer) clearInterval(aiPollTimer);
     let tries = 0;
     aiPollTimer = setInterval(async () => {
       tries++;
       const t = await fetch('/api/chat/task/'+taskId).then(r=>r.json());
       if(t.status === 'pending' || t.status === 'reading'){
-        $('aiStatus').textContent = `Ожидаю чтения чата клиентом... (${tries*2}с)`;
+        $('aiStatus').textContent = `Ожидаю... (${tries*2}с)`;
       } else if(t.status === 'completed'){
         clearInterval(aiPollTimer); aiPollTimer = null;
-        $('aiStatus').textContent = '✅ Готово';
+        $('aiStatus').textContent = '✅';
         btn.disabled=false; btn.textContent='🤖 Получить сообщения';
         renderAIResult(t.result, chat);
       } else if(t.status === 'failed'){
         clearInterval(aiPollTimer); aiPollTimer = null;
-        $('aiStatus').textContent = '❌ Ошибка';
+        $('aiStatus').textContent = '❌';
         $('aiTopic').innerHTML = `<div class="ai-topic" style="color:#f87171">Ошибка: ${esc(t.error||'неизвестная')}</div>`;
         btn.disabled=false; btn.textContent='🤖 Получить сообщения';
       }
-      if(tries > 60){ clearInterval(aiPollTimer); aiPollTimer = null; $('aiStatus').textContent = '⏱ Таймаут'; btn.disabled=false; btn.textContent='🤖 Получить сообщения'; }
+      if(tries > 60){ clearInterval(aiPollTimer); aiPollTimer = null; $('aiStatus').textContent = '⏱'; btn.disabled=false; btn.textContent='🤖 Получить сообщения'; }
     }, 2000);
-  } catch(e){ alert('Ошибка: '+e.message); btn.disabled=false; btn.textContent='🤖 Получить сообщения'; }
+  } catch(e){ alert('Ошибка'); btn.disabled=false; btn.textContent='🤖 Получить сообщения'; }
 }
 
 function renderAIResult(result, chat){
-  if(!result){ $('aiResult').innerHTML = '<p class="hint">Нет результата</p>'; return; }
+  if(!result){ $('aiResult').innerHTML = '<p class="hint">Нет</p>'; return; }
   const topic = result.topic || '';
   const msgs = result.messages || [];
   const phrases = result.phrases || [];
-  $('aiTopic').innerHTML = topic ? `<div class="ai-topic"><b>Тема беседы (${esc(chat)}):</b> ${esc(topic)}</div>` : '';
+  $('aiTopic').innerHTML = topic ? `<div class="ai-topic"><b>Тема (${esc(chat)}):</b> ${esc(topic)}</div>` : '';
   $('aiResult').innerHTML = `<div class="ai-grid">
-    <div class="ai-col">
-      <h3>💬 5 сообщений по контексту (клик = копировать)</h3>
-      ${msgs.map((m,i)=>`<div class="ai-msg" onclick="copyMsg(this, '${esc(m).replace(/'/g,"&#39;")}')">${esc(m)}</div>`).join('')}
-    </div>
-    <div class="ai-col">
-      <h3>🙋 5 безопасных фраз</h3>
-      ${phrases.map((p,i)=>`<div class="ai-phrase" onclick="copyMsg(this, '${esc(p).replace(/'/g,"&#39;")}')">${esc(p)}</div>`).join('')}
-    </div>
+    <div class="ai-col"><h3>💬 Сообщения по контексту</h3>
+      ${msgs.map(m=>`<div class="ai-msg" onclick="copyMsg(this, '${esc(m).replace(/'/g,"&#39;")}')">${esc(m)}</div>`).join('')}</div>
+    <div class="ai-col"><h3>🙋 Безопасные фразы</h3>
+      ${phrases.map(p=>`<div class="ai-phrase" onclick="copyMsg(this, '${esc(p).replace(/'/g,"&#39;")}')">${esc(p)}</div>`).join('')}</div>
   </div>`;
 }
 
@@ -2272,11 +2389,7 @@ async function loadAILatest(){
   const p = new URLSearchParams();
   if(chat) p.set('chat', chat);
   const r = await fetch('/api/chat/latest?'+p).then(r=>r.json());
-  if(!r.task){
-    $('aiTopic').innerHTML = '';
-    $('aiResult').innerHTML = '<p class="hint">Нет сохранённых результатов</p>';
-    return;
-  }
+  if(!r.task){ $('aiResult').innerHTML = '<p class="hint">Нет</p>'; return; }
   renderAIResult(r.task.result, r.task.chat);
   $('aiStatus').textContent = `Последний: ${fmtTime(r.task.completed_at)}`;
 }
@@ -2286,11 +2399,9 @@ async function loadPlayersTab(){
   const sEl = $('plChatsSummary');
   if(sum.chats && sum.chats.length){
     sEl.innerHTML = '<div class="kpi">' + sum.chats.map(c=>`
-      <div>${esc(c.chat)}<b>${c.total_players} игроков</b>
-        <span class="hint">🟢 ${c.online_players} онлайн · ${fmtMoney(c.total_messages)} сообщений</span>
+      <div>${esc(c.chat)}<b>${c.total_players}</b>
+        <span class="hint">🟢 ${c.online_players} · ${fmtMoney(c.total_messages)}</span>
       </div>`).join('') + '</div>';
-  } else {
-    sEl.innerHTML = '<p class="hint">Пока нет данных</p>';
   }
   const p = new URLSearchParams();
   if($('plChatFilter').value) p.set('chat', $('plChatFilter').value);
@@ -2300,10 +2411,7 @@ async function loadPlayersTab(){
   p.set('limit', '1000');
   const r = await fetch('/api/players?'+p).then(r=>r.json());
   const body = $('plPlayersBody'); body.innerHTML='';
-  if(!r.players.length){
-    body.innerHTML = '<tr><td colspan="6" class="hint">Нет данных по фильтру</td></tr>';
-    return;
-  }
+  if(!r.players.length){ body.innerHTML = '<tr><td colspan="7" class="hint">Нет</td></tr>'; return; }
   const now = Date.now()/1000;
   r.players.forEach(x=>{
     const online = (now - (x.last_seen||0)) < 300;
@@ -2312,9 +2420,18 @@ async function loadPlayersTab(){
       <td style="color:#8ab4f8;font-weight:bold">${x.msg_count}</td>
       <td>${x.first_seen?fmtTime(x.first_seen):'—'}</td>
       <td>${x.last_seen?fmtTime(x.last_seen):'—'}</td>
-      <td>${online?'<span class="pill ok">🟢 online</span>':'<span class="pill">offline</span>'}</td>`;
+      <td>${online?'<span class="pill ok">🟢</span>':'<span class="pill">off</span>'}</td>
+      <td><button class="btn" onclick="relocatePlayer('${esc(x.username)}')">↗ Язык</button></td>`;
     body.appendChild(tr);
   });
+}
+
+async function relocatePlayer(username){
+  const newChat = prompt(`В какой чат переместить "${username}"?\nНапример: ENGLISH, RUSSIAN, POLISH...`);
+  if(!newChat) return;
+  await fetch('/api/players/relocate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username, chat: newChat.toUpperCase()})});
+  alert('OK');
+  loadPlayersTab();
 }
 
 async function loadLanguages(){
@@ -2322,11 +2439,11 @@ async function loadLanguages(){
   const f = ($('langFilter').value || '').toLowerCase();
   const players = (r.players||[]).filter(p => !f || (p.username||'').toLowerCase().includes(f));
   const el = $('langGrid');
-  if(!players.length){ el.innerHTML = '<p class="hint">Нет данных</p>'; return; }
-  el.innerHTML = players.map(p => `
+  if(!players.length){ el.innerHTML = '<p class="hint">Нет данных (появятся через 30 сек после старта клиента)</p>'; return; }
+  el.innerHTML = players.slice(0, 500).map(p => `
     <div class="lang-card">
       <h4>${esc(p.username)}</h4>
-      <div class="hint">Всего сообщений: ${p.total_msgs||0} · чатов: ${p.chat_count||0}</div>
+      <div class="hint">Сообщений: ${p.total_msgs||0} · Чатов: ${p.chat_count||0}</div>
       ${(p.chats||[]).map(c=>`<div class="player-row"><span>${esc(c)}</span></div>`).join('')}
     </div>`).join('');
 }
@@ -2344,43 +2461,37 @@ async def monitor_page():
     return MONITOR_HTML
 
 
-# ==================== BASE HTML (главная, /hosts, /receivers) ====================
+# ==================== BASE HTML ====================
 BASE_HTML = """<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <style>
-* {{ box-sizing: border-box; }}
 body {{ margin: 0; background: #0e1116; color: #e6e9ef; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
 a {{ color: #7cc4ff; text-decoration: none; }}
-a:hover {{ text-decoration: underline; }}
 header {{ background: #161b22; border-bottom: 1px solid #26303a; padding: 14px 24px; display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }}
 .brand {{ font-weight: 700; font-size: 18px; color: #fff; }}
-.brand small {{ color: #8b949e; font-weight: 400; margin-left: 8px; }}
 nav a {{ margin-right: 16px; color: #c9d1d9; }}
 nav a.active {{ color: #7cc4ff; font-weight: 600; }}
 main {{ max-width: 1200px; margin: 0 auto; padding: 24px; }}
 .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap: 16px; }}
 .card {{ background: #161b22; border: 1px solid #26303a; border-radius: 12px; padding: 16px 20px; }}
-.card h3 {{ margin: 0 0 8px; color: #8b949e; font-weight: 500; font-size: 13px; text-transform: uppercase; letter-spacing: .5px; }}
+.card h3 {{ margin: 0 0 8px; color: #8b949e; font-weight: 500; font-size: 13px; text-transform: uppercase; }}
 .card .big {{ font-size: 26px; font-weight: 700; color: #fff; }}
-.card .sub {{ color: #6e7681; font-size: 12px; margin-top: 4px; }}
 table {{ width: 100%; border-collapse: collapse; }}
 th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid #26303a; }}
 th {{ color: #8b949e; font-weight: 500; font-size: 13px; }}
 td.amount {{ color: #4ade80; font-weight: 600; }}
-tr:hover td {{ background: #1c222b; }}
 .rank {{ display: inline-block; width: 28px; text-align: center; color: #8b949e; }}
 .rank.g {{ color: #f5c542; }} .rank.s {{ color: #c0c0c0; }} .rank.b {{ color: #cd7f32; }}
 .tag {{ display: inline-block; background: #21262d; padding: 2px 8px; border-radius: 6px; font-size: 11px; color: #8b949e; margin-left: 6px; }}
 .tag.rain {{ color: #7cc4ff; }} .tag.tip {{ color: #f5c542; }}
-.live-dot {{ display: inline-block; width: 8px; height: 8px; background: #4ade80; border-radius: 50%; margin-right: 6px; animation: pulse 1.5s infinite; }}
-@keyframes pulse {{ 0%,100% {{ opacity: 1; }} 50% {{ opacity: 0.3; }} }}
+.live-dot {{ display: inline-block; width: 8px; height: 8px; background: #4ade80; border-radius: 50%; margin-right: 6px; }}
 .recent-row {{ padding: 8px 0; border-bottom: 1px solid #26303a; font-size: 13px; }}
-.recent-row:last-child {{ border-bottom: none; }}
 .muted {{ color: #8b949e; }}
 .chat-pill {{ display:inline-block; background:#21262d; padding:2px 8px; border-radius:6px; font-size:11px; color:#7cc4ff; }}
-.per-person {{ color: #8ab4f8; font-size: 11px; margin-left: 4px; }}
+.per-person {{ color: #8ab4f8; font-size: 11px; }}
+.recv-toggle {{ color: #7cc4ff; cursor: pointer; font-size: 11px; text-decoration: underline; margin-left: 4px; }}
 </style></head><body>
 <header>
   <div class="brand">🌧 SHUFFLE RAIN <small>статистика</small></div>
@@ -2393,15 +2504,6 @@ tr:hover td {{ background: #1c222b; }}
   <div style="margin-left:auto"><span class="live-dot"></span><span class="muted">LIVE</span></div>
 </header>
 <main>{content}</main>
-<script>
-setInterval(async () => {{
-  try {{
-    const r = await fetch('/api/stats');
-    const data = await r.json();
-    document.dispatchEvent(new CustomEvent('stats-updated', {{ detail: data }}));
-  }} catch(e) {{}}
-}}, 10000);
-</script>
 </body></html>"""
 
 
@@ -2457,7 +2559,8 @@ async def page_home():
     </div>
     <div class="card" style="margin-top:16px"><h3>Последние события</h3><div id="recent"></div></div>
     <script>
-      document.addEventListener('stats-updated', (e) => renderRecent(e.detail.recent));
+      function esc(s){{return (s==null?'':String(s)).replace(/[<>&"]/g,c=>({{'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}}[c]));}}
+      function fmtR(v){{return (v||0).toFixed(0);}}
       async function loadOnce() {{ const r = await fetch('/api/stats'); const d = await r.json(); renderRecent(d.recent); }}
       function renderRecent(rows) {{
         const el = document.getElementById('recent'); if (!rows) return;
@@ -2465,13 +2568,17 @@ async def page_home():
           const cls = r.type === 'rain' ? 'rain' : 'tip';
           const tag = r.type === 'rain' ? 'RAIN' : 'TIP';
           const amt = r.amount_text || '';
-          const rub = r.amount_rub ? ' (' + Number(r.amount_rub).toFixed(0) + ' ₽)' : '';
-          const per = r.per_person_rub ? ' <span class="per-person">по ' + Number(r.per_person_rub).toFixed(0) + ' ₽</span>' : '';
-          let recs = ''; try {{ recs = (r.receivers || []).slice(0,5).join(', '); }} catch(e) {{}}
-          return `<div class="recent-row"><span class="tag ${{cls}}">${{tag}}</span> <span class="chat-pill">${{r.chat}}</span> <b style="margin-left:6px">${{r.sender}}</b><span class="muted"> → ${{recs}}</span>${{per}}<span style="float:right" class="amount">${{amt}}${{rub}}</span></div>`;
+          const rub = r.amount_rub ? ' (' + fmtR(r.amount_rub) + ' ₽)' : '';
+          const per = r.per_person_rub ? ' <span class="per-person">по ' + fmtR(r.per_person_rub) + ' ₽</span>' : '';
+          const recs = (r.receivers || []);
+          const recsHtml = recs.length > 5
+            ? recs.slice(0,5).map(esc).join(', ') + ' <span id="rm_' + Math.random().toString(36).slice(2,7) + '" data-rest="' + esc(recs.slice(5).join(', ')) + '"></span><span class="recv-toggle" onclick="this.previousElementSibling.textContent=\\' , \\'+this.previousElementSibling.dataset.rest;this.style.display=\\'none\\'">+' + (recs.length-5) + ' ещё</span>'
+            : recs.map(esc).join(', ');
+          return `<div class="recent-row"><span class="tag ${{cls}}">${{tag}}</span> <span class="chat-pill">${{r.chat}}</span> <b style="margin-left:6px">${{esc(r.sender)}}</b><span class="muted"> → ${{recsHtml}}</span>${{per}}<span style="float:right" class="amount">${{esc(amt)}}${{rub}}</span></div>`;
         }}).join('');
       }}
       loadOnce();
+      setInterval(loadOnce, 15000);
     </script>"""
     return BASE_HTML.format(title="Shuffle Rain Stats", active_home="active",
                              active_hosts="", active_receivers="", content=content)
@@ -2483,13 +2590,80 @@ async def page_hosts():
     r2 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='rain' GROUP BY sender ORDER BY cnt DESC LIMIT 50")
     t1 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY total DESC LIMIT 50")
     t2 = query_all("SELECT sender AS nickname, COUNT(*) AS cnt, COALESCE(SUM(amount_rub),0) AS total FROM events WHERE type='tip' GROUP BY sender ORDER BY cnt DESC LIMIT 50")
+
+    def row_with_profile(r, i):
+        rank_cls = "g" if i == 1 else "s" if i == 2 else "b" if i == 3 else ""
+        nick = r['nickname']
+        return f"""<tr><td><span class="rank {rank_cls}">{i}</span></td>
+            <td><a href="#" onclick="openProfile('{nick}');return false"><b>{nick}</b></a></td>
+            <td>{r['cnt']}</td><td class="amount">{fmt_rub(r['total'])}</td></tr>"""
+
+    def table(rows):
+        if not rows: return "<tr><td colspan='4' class='muted'>Пусто</td></tr>"
+        return "".join(row_with_profile(r, i) for i, r in enumerate(rows, 1))
+
     content = f"""
     <div class="grid" style="grid-template-columns: 1fr 1fr">
-      <div class="card"><h3>🌧 Раздал дождей — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(r1)}</tbody></table></div>
-      <div class="card"><h3>🌧 Раздал дождей — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(r2)}</tbody></table></div>
-      <div class="card"><h3>💸 Отправил чаевых — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(t1)}</tbody></table></div>
-      <div class="card"><h3>💸 Отправил чаевых — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{render_rank_table(t2)}</tbody></table></div>
-    </div>"""
+      <div class="card"><h3>🌧 Раздал дождей — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r1)}</tbody></table></div>
+      <div class="card"><h3>🌧 Раздал дождей — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r2)}</tbody></table></div>
+      <div class="card"><h3>💸 Отправил чаевых — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t1)}</tbody></table></div>
+      <div class="card"><h3>💸 Отправил чаевых — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t2)}</tbody></table></div>
+    </div>
+    <div id="profileModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);align-items:center;justify-content:center;z-index:50;padding:20px">
+      <div style="background:#161b22;border:1px solid #26303a;border-radius:12px;max-width:700px;width:100%;padding:24px;max-height:80vh;overflow-y:auto">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+          <h2 id="profName" style="margin:0;color:#7cc4ff"></h2>
+          <button onclick="document.getElementById('profileModal').style.display='none'" style="background:#2a3340;color:#e6e6e6;border:1px solid #334055;padding:4px 12px;border-radius:5px;cursor:pointer">✕</button>
+        </div>
+        <div style="margin-bottom:12px"><label style="color:#8b949e;font-size:12px">Язык:</label>
+          <select id="profLang" style="background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:6px;border-radius:5px;margin-left:8px">
+            <option>ENGLISH</option><option>RUSSIAN</option><option>JAPANESE</option><option>TURKISH</option>
+            <option>SPANISH</option><option>PORTUGUESE</option><option>FRENCH</option><option>KOREAN</option>
+            <option>CHINESE</option><option>POLISH</option><option>VIETNAMESE</option><option>INDONESIAN</option>
+          </select>
+        </div>
+        <div style="margin-bottom:12px"><label style="color:#8b949e;font-size:12px">Описание:</label>
+          <textarea id="profDesc" style="width:100%;background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:8px;border-radius:5px;margin-top:6px;min-height:80px"></textarea>
+        </div>
+        <div style="margin-bottom:16px"><label style="color:#8b949e;font-size:12px"><input type="checkbox" id="profTop"> Добавить в watch-list</label></div>
+        <div id="profContent"></div>
+        <button onclick="saveProfile()" style="background:#2563eb;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-weight:600">💾 Сохранить</button>
+      </div>
+    </div>
+    <script>
+      let currentNick = null;
+      async function openProfile(nick) {{
+        currentNick = nick;
+        document.getElementById('profileModal').style.display = 'flex';
+        document.getElementById('profName').textContent = nick;
+        const [prof, bets, msgs] = await Promise.all([
+          fetch('/api/profile/' + encodeURIComponent(nick)).then(r=>r.json()),
+          fetch('/api/bets?sender=' + encodeURIComponent(nick) + '&limit=20').then(r=>r.json()),
+          fetch('/api/player?username=' + encodeURIComponent(nick) + '&limit=15').then(r=>r.json()),
+        ]);
+        document.getElementById('profLang').value = prof.profile.lang || 'ENGLISH';
+        document.getElementById('profDesc').value = prof.profile.description || '';
+        document.getElementById('profTop').checked = !!prof.profile.is_top;
+        const betsHtml = (bets.bets||[]).map(b => `<div style="padding:6px 10px;border-left:3px solid #71d68a;margin:4px 0;font-size:12px">🎰 ${{b.game}} · ${{b.multiplier}} · ${{b.amount_text}} ${{b.crypto||''}} (~$${{(b.amount_usd||0).toFixed(2)}})</div>`).join('') || '<div class="muted">Нет ставок</div>';
+        const msgsHtml = (msgs.rows||[]).map(m => `<div style="padding:4px 8px;border-left:3px solid #2a2f3a;margin:4px 0;font-size:12px"><b>${{m.chat}}</b>: ${{m.text}}</div>`).join('') || '<div class="muted">Нет сообщений</div>';
+        document.getElementById('profContent').innerHTML = `
+          <h4 style="color:#8b949e;font-size:12px;margin:16px 0 8px">Последние ставки</h4>${{betsHtml}}
+          <h4 style="color:#8b949e;font-size:12px;margin:16px 0 8px">Последние сообщения</h4>${{msgsHtml}}`;
+      }}
+      async function saveProfile() {{
+        if(!currentNick) return;
+        const body = {{
+          lang: document.getElementById('profLang').value,
+          description: document.getElementById('profDesc').value,
+          is_top: document.getElementById('profTop').checked
+        }};
+        await fetch('/api/profile/' + encodeURIComponent(currentNick), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body)}});
+        if(body.is_top) {{
+          await fetch('/api/watchlist/add', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{name: currentNick}})}});
+        }}
+        alert('Сохранено');
+      }}
+    </script>"""
     return BASE_HTML.format(title="Shuffle — Раздающие", active_home="", active_hosts="active", active_receivers="", content=content)
 
 
@@ -2512,52 +2686,35 @@ async def page_receivers():
 
 
 # ==================== ADMIN ====================
-ADMIN_HTML = """
-<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Admin</title>
+ADMIN_HTML = """<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Admin</title>
 <style>
-body{margin:0;background:#0e1116;color:#e6e9ef;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}
+body{margin:0;background:#0e1116;color:#e6e9ef;font-family:sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}
 .box{background:#161b22;border:1px solid #26303a;border-radius:12px;padding:32px 40px;max-width:520px;width:100%}
-h1{margin:0 0 8px;font-size:22px}.sub{color:#8b949e;margin-bottom:24px;font-size:14px}
-input{width:100%;background:#0d1117;border:1px solid #30363d;color:#e6e9ef;padding:10px 12px;border-radius:8px;font-size:14px;margin-bottom:16px;font-family:monospace}
+h1{margin:0 0 8px}.sub{color:#8b949e;margin-bottom:24px;font-size:14px}
+input{width:100%;background:#0d1117;border:1px solid #30363d;color:#e6e9ef;padding:10px 12px;border-radius:8px;font-size:14px;margin-bottom:16px;font-family:monospace;box-sizing:border-box}
 button{width:100%;padding:12px;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;background:#dc2626;color:#fff}
-button:disabled{background:#4b5563;cursor:not-allowed}
 .result{margin-top:16px;padding:12px;border-radius:8px;font-size:13px;display:none}
-.result.ok{background:#052e16;color:#4ade80;border:1px solid #14532d;display:block}
-.result.err{background:#2d0f0f;color:#f87171;border:1px solid #7f1d1d;display:block}
-.warn{background:#2d2410;border:1px solid #78350f;color:#fbbf24;padding:12px;border-radius:8px;margin-bottom:20px;font-size:13px}
-a{color:#7cc4ff;text-decoration:none;font-size:13px}
-</style></head><body>
-<div class="box">
-  <h1>⚙️ Админ-панель</h1>
-  <div class="sub">Shuffle Rain Stats</div>
-  <div class="warn">⚠️ Удалит ВСЕ события. Необратимо.</div>
-  <input id="apiKey" type="password" placeholder="X-API-Key">
-  <input id="confirm" type="text" placeholder="DELETE_ALL" autocomplete="off">
-  <button id="clearBtn" onclick="clearDb()">🗑 Очистить базу данных</button>
-  <div id="result" class="result"></div>
-  <div style="margin-top:20px;text-align:center"><a href="/">← На главную</a></div>
-</div>
-<script>
-async function clearDb() {
-  const apiKey = document.getElementById('apiKey').value.trim();
-  const confirm = document.getElementById('confirm').value.trim();
-  const result = document.getElementById('result');
-  const btn = document.getElementById('clearBtn');
-  result.className='result'; result.textContent='';
-  if(!apiKey){ result.className='result err'; result.textContent='Введите API-ключ'; return; }
-  if(confirm !== 'DELETE_ALL'){ result.className='result err'; result.textContent='Введите DELETE_ALL'; return; }
-  if(!window.confirm('Точно удалить ВСЕ данные?')) return;
-  btn.disabled=true; btn.textContent='⏳';
-  try {
-    const r = await fetch('/api/clear', { method:'POST', headers:{'Content-Type':'application/json','X-API-Key':apiKey}, body: JSON.stringify({confirm:'DELETE_ALL'}) });
-    const data = await r.json();
-    if(r.ok){ result.className='result ok'; result.textContent='✅ '+(data.message||'Готово'); }
-    else { result.className='result err'; result.textContent='❌ '+(data.detail||'Ошибка'); }
-  } catch(e){ result.className='result err'; result.textContent='❌ '+e.message; }
-  finally { btn.disabled=false; btn.textContent='🗑 Очистить базу данных'; }
-}
-</script></body></html>
-"""
+.result.ok{background:#052e16;color:#4ade80;display:block}
+.result.err{background:#2d0f0f;color:#f87171;display:block}
+</style></head><body><div class="box">
+<h1>⚙️ Админ</h1><div class="sub">Shuffle Rain Stats</div>
+<input id="apiKey" type="password" placeholder="X-API-Key">
+<input id="confirm" type="text" placeholder="DELETE_ALL">
+<button onclick="clearDb()">🗑 Очистить БД</button>
+<div id="result" class="result"></div>
+</div><script>
+async function clearDb(){{
+  const k=document.getElementById('apiKey').value.trim();
+  const c=document.getElementById('confirm').value.trim();
+  const r=document.getElementById('result');
+  if(!k||c!=='DELETE_ALL'){{r.className='result err';r.textContent='Заполни оба поля';return;}}
+  if(!confirm('Точно удалить?')) return;
+  const res=await fetch('/api/clear',{{method:'POST',headers:{{'Content-Type':'application/json','X-API-Key':k}},body:JSON.stringify({{confirm:'DELETE_ALL'}})}});
+  const d=await res.json();
+  r.className='result '+(res.ok?'ok':'err');
+  r.textContent=res.ok?'✅ Готово':'❌ '+(d.detail||'Ошибка');
+}}
+</script></body></html>"""
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -2566,31 +2723,23 @@ async def admin_page():
 
 
 # ==================== STARTUP ====================
-@app.on_event("startup")
-async def startup_event():
-    # 1) Курсы валют
-    _load_server_rates()
-    threading.Thread(target=rates_refresh_thread, daemon=True).start()
-    print("[RATES] Поток обновления курсов запущен")
-
-    # 2) Один проход дедупликации + пересчёта нулевых сумм
-    threading.Thread(target=dedup_events, daemon=True).start()
-    # 3) Регулярный дедуп каждые 10 минут
-    threading.Thread(target=dedup_thread, daemon=True).start()
-
-    # 4) Промокоды
-    threading.Thread(target=promo_parser_thread, daemon=True).start()
-    print(f"[PROMO] Поток мониторинга @{PROMO_CHANNEL} запущен")
-
-    if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
-        print(f"[AI] ✅ GROQ_API_KEY задан, модель: {GROQ_MODEL}")
-    else:
-        print("[AI] ⚠️ GROQ_API_KEY не задан")
-
-
 init_db()
 print(f"[DB] Using {'PostgreSQL' if USE_POSTGRES else 'SQLite'}")
 migrate_ts_once()
+
+
+@app.on_event("startup")
+async def startup_event():
+    _load_server_rates()
+    threading.Thread(target=rates_refresh_thread, daemon=True).start()
+    threading.Thread(target=dedup_events, daemon=True).start()
+    threading.Thread(target=dedup_thread, daemon=True).start()
+    threading.Thread(target=promo_parser_thread, daemon=True).start()
+    print(f"[PROMO] Поток @{PROMO_CHANNEL} запущен")
+    if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
+        print(f"[AI] ✅ GROQ")
+    else:
+        print("[AI] ⚠️ GROQ_API_KEY не задан")
 
 
 if __name__ == "__main__":
