@@ -1,5 +1,5 @@
 import os, json, sqlite3, time, threading, re, hashlib
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from collections import defaultdict
 from typing import List, Optional
 
@@ -291,7 +291,6 @@ def init_db():
             lang TEXT DEFAULT 'ENGLISH', description TEXT DEFAULT '',
             is_top INTEGER DEFAULT 0, updated_at REAL)""")
 
-    # VAULT
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS vault_balances (
             currency TEXT PRIMARY KEY, amount DOUBLE PRECISION DEFAULT 0,
@@ -686,7 +685,7 @@ async def api_player_activity(username: str, windows: str = "15,25,60,1440"):
             "minutes_ago_total": int((now - gl) / 60) if gl else None, "chats": chats, "now": now, "known_chats": len(chats)}
 
 @app.get("/api/user/{nickname}/rains_received")
-async def user_rains_received(nickname: str, days: int = 30, limit: int = 200):
+async def user_rains_received(nickname: str, days: int = 30, limit: int = 500):
     since = time.time() - days * 86400
     rows = query_all("""SELECT id, ts, chat, sender, receivers, amount_text, amount_rub, amount_usd, crypto_symbol
                         FROM events WHERE type='rain' AND ts >= ? ORDER BY ts DESC LIMIT 5000""", (since,))
@@ -1133,7 +1132,7 @@ async def api_events(since: Optional[float] = None, until: Optional[float] = Non
     return {"events": rows}
 
 @app.get("/api/receivers_top")
-async def api_receivers_top(limit: int = 20, metric: str = "total", days: int = 30, window_min: int = 25):
+async def api_receivers_top(limit: int = 100, metric: str = "total", days: int = 30, window_min: int = 25):
     since = time.time() - days * 86400
     rows = query_all("SELECT chat,ts,amount_rub,receivers,receivers_info FROM events WHERE type='rain' AND ts>=? ORDER BY ts DESC", (since,))
     stats = defaultdict(lambda: {"total_rub": 0.0, "wins": 0, "active_wins": 0, "unknown_activity_wins": 0, "chats": defaultdict(int), "last_seen": 0.0})
@@ -1439,6 +1438,14 @@ tr:hover td{{background:#1c222b}}
 .tag{{display:inline-block;background:#21262d;padding:2px 8px;border-radius:6px;font-size:11px;color:#8b949e;margin-left:6px}}
 .muted{{color:#8b949e}}
 .chat-pill{{display:inline-block;background:#21262d;padding:2px 8px;border-radius:6px;font-size:11px;color:#7cc4ff}}
+.hint-btn{{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;
+  background:#232a37;color:#8ab4f8;font-size:12px;cursor:help;font-weight:bold;margin-left:6px;
+  position:relative;vertical-align:middle}}
+.hint-btn:hover{{background:#2f3d55}}
+.hint-btn:hover::after{{content:attr(data-hint);position:absolute;top:26px;left:-180px;width:380px;
+  background:#1a1f28;color:#e6e6e6;border:1px solid #2f3d55;border-radius:8px;padding:12px;
+  font-size:12px;font-weight:normal;line-height:1.5;z-index:100;white-space:pre-wrap;
+  box-shadow:0 4px 20px rgba(0,0,0,.6);text-align:left}}
 </style></head><body>
 <header>
   <div class="brand">🌧 SHUFFLE RAIN <small>статистика</small></div>
@@ -1507,14 +1514,18 @@ async def page_home():
 async def page_receivers():
     content = """
     <div class="card">
-      <h3>🎯 Топ активных получателей</h3>
+      <h3 style="display:flex;align-items:center;gap:6px">🎯 Топ активных получателей<span class="hint-btn" data-hint="Кто чаще всего получает дожди.&#10;&#10;Сортировка:&#10;• По сумме — сколько всего ₽ получил&#10;• По кол-ву — сколько раз попал под дождь&#10;• По % активных — какой процент выигрышей пришёл, когда он писал в чате за 25 мин до дождя.&#10;&#10;Чаты — где именно его дождило.">?</span></h3>
       <p style="color:#8b949e;font-size:12px">«Активный» = писал в том же чате за 25 минут до дождя.</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
         <select id="rtMetric" onchange="loadReceiversTop()" style="background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:6px;border-radius:5px">
           <option value="total">По сумме ₽</option><option value="count">По кол-ву</option><option value="active_percent">По % активных</option>
         </select>
         <select id="rtLimit" onchange="loadReceiversTop()" style="background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:6px;border-radius:5px">
-          <option value="20">Топ-20</option><option value="40">Топ-40</option><option value="100">Топ-100</option>
+          <option value="20">Топ-20</option>
+          <option value="50">Топ-50</option>
+          <option value="100" selected>Топ-100</option>
+          <option value="200">Топ-200</option>
+          <option value="500">Все (до 500)</option>
         </select>
         <select id="rtDays" onchange="loadReceiversTop()" style="background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:6px;border-radius:5px">
           <option value="7">7 дней</option><option value="30" selected>30 дней</option><option value="90">90 дней</option>
@@ -1537,7 +1548,7 @@ async def page_receivers():
         const body = document.getElementById('rtBody');
         if (!r.players.length) { body.innerHTML = '<tr><td colspan="7" class="muted">Нет данных</td></tr>'; document.getElementById('rtStatus').textContent=''; return; }
         body.innerHTML = r.players.map((p,i) => {
-          const chats = Object.entries(p.chats||{}).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([c,n])=>'<span class="tag">'+esc(c)+':'+n+'</span>').join(' ');
+          const chats = Object.entries(p.chats||{}).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([c,n])=>'<span class="tag">'+esc(c)+':'+n+'</span>').join(' ');
           let pct = '<span class="muted">—</span>';
           if (p.active_percent !== null && p.active_percent !== undefined) {
             const col = p.active_percent >= 60 ? '#4ade80' : (p.active_percent >= 30 ? '#fbbf24' : '#f87171');
@@ -1572,10 +1583,10 @@ async def page_hosts():
 
     content = f"""
     <div class="grid" style="grid-template-columns: 1fr 1fr">
-      <div class="card"><h3>🌧 Раздал дождей — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r1)}</tbody></table></div>
-      <div class="card"><h3>🌧 Раздал дождей — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r2)}</tbody></table></div>
-      <div class="card"><h3>💸 Отправил чаевых — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t1)}</tbody></table></div>
-      <div class="card"><h3>💸 Отправил чаевых — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t2)}</tbody></table></div>
+      <div class="card"><h3 style="display:flex;align-items:center;gap:6px">🌧 Раздал дождей — по сумме<span class="hint-btn" data-hint="Кто раздал больше всего ₽ за дожди.&#10;&#10;Клик по нику → профиль с активностью 15/25/60/1440м, ставками и последними сообщениями.">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r1)}</tbody></table></div>
+      <div class="card"><h3 style="display:flex;align-items:center;gap:6px">🌧 Раздал дождей — по кол-ву<span class="hint-btn" data-hint="Кто чаще всего делал дожди.&#10;Даже если суммы маленькие — этот игрок заливает регулярно.">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r2)}</tbody></table></div>
+      <div class="card"><h3 style="display:flex;align-items:center;gap:6px">💸 Отправил чаевых — по сумме<span class="hint-btn" data-hint="Кто раздал больше всего ₽ за чаевые (tips).">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t1)}</tbody></table></div>
+      <div class="card"><h3 style="display:flex;align-items:center;gap:6px">💸 Отправил чаевых — по кол-ву<span class="hint-btn" data-hint="Кто чаще всего отправлял чаевые.">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t2)}</tbody></table></div>
     </div>
     <div id="profileModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);align-items:center;justify-content:center;z-index:50;padding:20px">
       <div style="background:#161b22;border:1px solid #26303a;border-radius:12px;max-width:700px;width:100%;padding:24px;max-height:80vh;overflow-y:auto">
@@ -1618,7 +1629,7 @@ async def page_hosts():
         const actRow = wins.map(w => '<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:8px 14px;min-width:100px">'
           + '<span style="color:#8b949e;font-size:11px">За ' + lbl(w) + '</span>'
           + '<b style="display:block;font-size:18px;color:' + (((activity.total||{{}})[w]>0)?'#4ade80':'#666') + '">' + ((activity.total||{{}})[w]||0) + '</b></div>').join('');
-        const chatsAct = (activity.chats||[]).slice(0,10).map(c => {{
+        const chatsAct = (activity.chats||[]).slice(0,12).map(c => {{
           const cells = wins.map(w => '<td style="text-align:center;color:' + ((c.counts[w]>0)?'#4ade80':'#555') + '">' + (c.counts[w]||0) + '</td>').join('');
           return '<tr><td><b>' + c.chat + '</b></td>' + cells + '</tr>';
         }}).join('');
@@ -1654,7 +1665,7 @@ header{display:flex;align-items:center;gap:16px;padding:12px 20px;background:#17
 header h1{font-size:16px;margin:0;font-weight:600}
 header a{color:#7cc4ff;text-decoration:none;font-size:13px}
 .tabs{display:flex;gap:4px;padding:10px 20px;border-bottom:1px solid #2a2f3a;background:#12151b;flex-wrap:wrap}
-.tabs button{background:transparent;color:#aab;border:1px solid transparent;padding:7px 14px;border-radius:6px;cursor:pointer;font-size:13px}
+.tabs button{background:transparent;color:#aab;border:1px solid transparent;padding:7px 12px;border-radius:6px;cursor:pointer;font-size:13px;display:inline-flex;align-items:center}
 .tabs button.active{background:#202633;color:#fff;border-color:#2f3d55}
 main{padding:20px}
 table{width:100%;border-collapse:collapse;font-size:13px}
@@ -1716,10 +1727,14 @@ tr.rubric-row td{background:#2a2410 !important}
 .vault-amount{color:#71d68a;font-weight:600}
 .vault-warn{color:#fbbf24}
 .vault-danger{color:#f87171}
-.me-kpi{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
-.me-kpi div{background:#151821;border:1px solid #232a37;border-radius:8px;padding:10px 16px;min-width:110px}
-.me-kpi b{display:block;font-size:22px;color:#4ade80;margin-top:2px}
-.me-kpi .off{color:#666}
+.hint-btn{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
+  background:#232a37;color:#8ab4f8;font-size:11px;cursor:help;margin-left:6px;font-weight:bold;
+  position:relative;vertical-align:middle}
+.hint-btn:hover{background:#2f3d55}
+.hint-btn:hover::after{content:attr(data-hint);position:absolute;top:24px;left:-180px;width:380px;
+  background:#1a1f28;color:#e6e6e6;border:1px solid #2f3d55;border-radius:8px;padding:12px;
+  font-size:12px;font-weight:normal;line-height:1.5;z-index:100;white-space:pre-wrap;
+  box-shadow:0 4px 20px rgba(0,0,0,.6);text-align:left}
 </style></head><body>
 <header>
   <h1>🎰 Shuffle Monitor</h1>
@@ -1728,18 +1743,18 @@ tr.rubric-row td{background:#2a2410 !important}
   <span style="margin-left:auto" class="pill" id="kpiTotal">—</span>
 </header>
 <div class="tabs">
-  <button data-tab="status" class="active">Вкладки</button>
-  <button data-tab="events">События</button>
-  <button data-tab="bulk">Bulk-раздачи</button>
-  <button data-tab="bets">Ставки</button>
-  <button data-tab="betsrains">Ставки→Дожди</button>
-  <button data-tab="contexts">Контексты</button>
-  <button data-tab="intents">Интенты</button>
-  <button data-tab="promos">Промокоды</button>
-  <button data-tab="me">👤 Мой профиль</button>
-  <button data-tab="ai">🤖 AI</button>
-  <button data-tab="players">👥 Игроки</button>
-  <button data-tab="langs">🌍 Языки</button>
+  <button data-tab="status" class="active">Вкладки<span class="hint-btn" data-hint="Состояние всех Chrome-инстансов.&#10;&#10;📸 — сделать скриншот вкладки.">?</span></button>
+  <button data-tab="events">События<span class="hint-btn" data-hint="Все дожди и типсы.&#10;&#10;Колонки:&#10;• ₽ — сумма в рублях&#10;• ₽/чел — сколько каждому получателю&#10;• $ — сумма в долларах&#10;&#10;«+N ещё» — раскрыть всех получателей.">?</span></button>
+  <button data-tab="bulk">Bulk-раздачи<span class="hint-btn" data-hint="Одинаковая сумма 3+ людям за 20 мин.&#10;&#10;📌 Рубрика — отметить как «это рубрика, не спам».&#10;Строка станет жёлтой.">?</span></button>
+  <button data-tab="bets">Ставки<span class="hint-btn" data-hint="Выигрышные ставки:&#10;• 📊 — из таблицы ставок&#10;• 💬 — из чата (фиолетовый)&#10;&#10;Фильтр по $ и множителю.">?</span></button>
+  <button data-tab="betsrains">Ставки→Дожди<span class="hint-btn" data-hint="Кто после СВОЕЙ ставки САМ залил дождь.&#10;Окно: 15 мин по умолчанию.&#10;&#10;Минимум 3 ставки ≥$20 за период.">?</span></button>
+  <button data-tab="contexts">Контексты<span class="hint-btn" data-hint="Дожди с контекстом:&#10;последние 15 сообщений + 5 ставок до дождя.">?</span></button>
+  <button data-tab="intents">Интенты<span class="hint-btn" data-hint="Обещания сделать дождь (Groq AI).&#10;&#10;AI% — уверенность модели (≥70% — сохраняется).&#10;Δ — через сколько секунд реально залил.">?</span></button>
+  <button data-tab="promos">Промокоды<span class="hint-btn" data-hint="Парсится из Telegram-канала.&#10;✅ — использован.&#10;💰 В хранилище — добавить в учёт хранилища.">?</span></button>
+  <button data-tab="me">👤 Мой профиль<span class="hint-btn" data-hint="Введи свой ник и запомни.&#10;&#10;Показывает:&#10;• Активность по чатам (15м / 25м / 1ч / 24ч)&#10;• Мои выигранные дожди&#10;• Мои ставки&#10;• Хранилище (балансы, вейджер, цель, транзакции)">?</span></button>
+  <button data-tab="ai">🤖 AI<span class="hint-btn" data-hint="AI читает 50 последних сообщений чата и предлагает:&#10;• 5 ответов по теме&#10;• 5 нейтральных фраз">?</span></button>
+  <button data-tab="players">👥 Игроки<span class="hint-btn" data-hint="Все игроки по чатам.&#10;Сообщений / последний раз / онлайн.&#10;↗ Язык — переместить в другой чат.">?</span></button>
+  <button data-tab="langs">🌍 Языки<span class="hint-btn" data-hint="Кто в каких чатах активен.&#10;Сколько сообщений в каждом.">?</span></button>
 </div>
 <main>
   <div id="tab-status"><div class="kpi" id="kpiRow"></div>
