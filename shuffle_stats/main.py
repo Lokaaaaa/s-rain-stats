@@ -10,12 +10,20 @@ from pydantic import BaseModel
 import requests
 from bs4 import BeautifulSoup
 
+try:
+    from docx import Document
+    from docx.shared import Pt
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+
 DB_PATH = os.environ.get("DB_PATH", "shuffle.db")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 USE_POSTGRES = bool(DATABASE_URL)
 API_KEY = os.environ.get("API_KEY", "CHANGE_ME_SECRET_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = "openai/gpt-oss-20b"
+MY_NICK = os.environ.get("MY_NICK", "Merami")
 
 _default_screenshots = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", _default_screenshots)
@@ -384,7 +392,6 @@ def init_db():
     execute("CREATE TABLE IF NOT EXISTS vault_meta (k TEXT PRIMARY KEY, v TEXT)")
     execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
 
-    # --- Stage 1: модераторы, control, ngrok ---
     if USE_POSTGRES:
         execute("""CREATE TABLE IF NOT EXISTS moderators (
             username TEXT PRIMARY KEY, first_seen DOUBLE PRECISION,
@@ -635,7 +642,6 @@ class TransferIn(BaseModel):
     amount: float
 
 
-# === Stage 1: новые модели ===
 class ControlSet(BaseModel):
     action: str
 
@@ -1168,7 +1174,7 @@ async def get_moderator_messages(username: Optional[str] = None,
 
 
 # ==================== WATCHLIST / PROFILES ====================
-DEFAULT_WATCHLIST = ["Fab", "Fab434", "fab434"]
+DEFAULT_WATCHLIST = ["Fab", "Fab434", "fab434", MY_NICK]
 
 
 @app.get("/api/watchlist")
@@ -1697,6 +1703,190 @@ async def chat_latest(chat: Optional[str] = None):
             pass
     return {"task": {"id": task["id"], "chat": task["chat"],
                      "result": result, "completed_at": task["completed_at"]}}
+
+
+# ==================== ACTIVITY / RAIN / DOCX ====================
+@app.get("/api/activity/dashboard")
+async def api_activity_dashboard(minutes: int = 60):
+    now = time.time()
+    wl_raw = meta_get("watchlist")
+    try:
+        watchlist = json.loads(wl_raw) if wl_raw else DEFAULT_WATCHLIST
+    except Exception:
+        watchlist = DEFAULT_WATCHLIST
+    if MY_NICK not in watchlist:
+        watchlist = list(watchlist) + [MY_NICK]
+
+    rows = []
+    if watchlist:
+        phs = ",".join(["?"] * len(watchlist))
+        rows = query_all(f"SELECT chat, username, msg_count, last_seen FROM chat_players WHERE username IN ({phs})",
+                         tuple(watchlist))
+
+    players = {name: {"total_msgs": 0, "last_seen": 0.0, "chats": {}} for name in watchlist}
+    for r in rows:
+        un = r.get("username")
+        if un not in players:
+            continue
+        chat = r.get("chat")
+        last_seen = float(r.get("last_seen") or 0)
+        cnt = int(r.get("msg_count") or 0)
+        minutes_ago = int((now - last_seen) / 60) if last_seen > 0 else None
+        players[un]["chats"][chat] = {
+            "last_seen": last_seen,
+            "minutes_ago": minutes_ago,
+            "active_60m": (last_seen > 0 and (now - last_seen) <= 3600),
+            "active_N": (last_seen > 0 and (now - last_seen) <= minutes * 60),
+            "msg_count": cnt,
+        }
+        players[un]["total_msgs"] += cnt
+        if last_seen > players[un]["last_seen"]:
+            players[un]["last_seen"] = last_seen
+    return {"watchlist": watchlist, "players": players, "now": now, "window_min": minutes}
+
+
+@app.get("/api/rain_activity")
+async def api_rain_activity(hours: int = 24, limit: int = 100, chat: Optional[str] = None):
+    since = time.time() - hours * 3600
+    q = """SELECT id, ts, chat, sender, receivers, receivers_info,
+                  amount_text, amount_rub, amount_usd, crypto_symbol
+           FROM events WHERE type='rain' AND ts >= ?"""
+    p = [since]
+    if chat:
+        q += " AND chat=?"
+        p.append(chat)
+    q += " ORDER BY ts DESC LIMIT ?"
+    p.append(limit)
+    rows = query_all(q, tuple(p))
+
+    out = []
+    for r in rows:
+        try:
+            recs = json.loads(r.get("receivers") or "[]")
+        except Exception:
+            recs = []
+        try:
+            rinfo = json.loads(r.get("receivers_info") or "[]")
+        except Exception:
+            rinfo = []
+        rinfo_sorted = sorted(rinfo, key=lambda x: (-(x.get("total_msgs") or 0)))
+        top20 = rinfo_sorted[:20]
+        won = MY_NICK in recs
+        my_rec = next((x for x in rinfo if x.get("name") == MY_NICK), None)
+        merami = {
+            "won": won,
+            "pos": (recs.index(MY_NICK) + 1) if won else None,
+            "minutes_ago": my_rec.get("minutes_ago") if my_rec else None,
+            "was_active": bool(my_rec and my_rec.get("wrote_in_25min")),
+        }
+        out.append({
+            "id": r["id"], "ts": r["ts"], "chat": r["chat"], "sender": r["sender"],
+            "amount_text": r["amount_text"], "amount_rub": r.get("amount_rub") or 0,
+            "amount_usd": r.get("amount_usd") or 0,
+            "crypto_symbol": r.get("crypto_symbol") or "",
+            "receivers_count": len(recs),
+            "receivers": recs,
+            "receivers_info": rinfo_sorted,
+            "top20": top20,
+            "merami": merami,
+        })
+    return {"hours": hours, "count": len(out), "rains": out}
+
+
+@app.get("/api/daily_report")
+async def api_daily_report(date: str):
+    if not HAS_DOCX:
+        raise HTTPException(503, "python-docx не установлен. Добавь python-docx в requirements.txt")
+    try:
+        dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        start = dt.timestamp()
+        end = start + 86400
+    except Exception:
+        raise HTTPException(400, "invalid date (YYYY-MM-DD)")
+
+    events = query_all("""SELECT * FROM events WHERE ts>=? AND ts<=? ORDER BY ts ASC""",
+                       (start, end))
+    for r in events:
+        try:
+            r["receivers"] = json.loads(r.get("receivers") or "[]")
+        except Exception:
+            r["receivers"] = []
+
+    rains = [e for e in events if e["type"] == "rain"]
+    tips = [e for e in events if e["type"] == "tip"]
+    total_rain_rub = sum((e.get("amount_rub") or 0) for e in rains)
+    total_tip_rub = sum((e.get("amount_rub") or 0) for e in tips)
+
+    send_rub = defaultdict(float)
+    send_cnt = defaultdict(int)
+    recv_rub = defaultdict(float)
+    recv_cnt = defaultdict(int)
+    my_share_rub = 0.0
+    my_wins = 0
+    for e in rains:
+        s = e["sender"]
+        send_rub[s] += (e.get("amount_rub") or 0)
+        send_cnt[s] += 1
+        recs = e.get("receivers") or []
+        n = len(recs) or 1
+        per = (e.get("amount_rub") or 0) / n
+        for nick in recs:
+            recv_rub[nick] += per
+            recv_cnt[nick] += 1
+        if MY_NICK in recs:
+            my_share_rub += per
+            my_wins += 1
+
+    top_senders = sorted(send_rub.items(), key=lambda x: -x[1])[:15]
+    top_receivers = sorted(recv_rub.items(), key=lambda x: -x[1])[:15]
+
+    doc = Document()
+    doc.add_heading(f"Shuffle — отчёт за {date}", level=0)
+    doc.add_paragraph(f"Сгенерировано: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    doc.add_heading("Сводка", level=1)
+    doc.add_paragraph(f"Дождей: {len(rains)}")
+    doc.add_paragraph(f"Раздали всего: {total_rain_rub:,.2f} ₽".replace(",", " "))
+    doc.add_paragraph(f"Чаевых: {len(tips)}, сумма: {total_tip_rub:,.2f} ₽".replace(",", " "))
+    doc.add_heading("Мой профиль", level=1)
+    doc.add_paragraph(f"Ник: {MY_NICK}")
+    doc.add_paragraph(f"Побед: {my_wins}")
+    doc.add_paragraph(f"Получено: {my_share_rub:,.2f} ₽".replace(",", " "))
+
+    doc.add_heading("Топ-15 раздающих", level=1)
+    t = doc.add_table(rows=1, cols=3)
+    t.style = "Light Grid Accent 1"
+    hdr = t.rows[0].cells
+    hdr[0].text = "Ник"; hdr[1].text = "Дождей"; hdr[2].text = "Сумма ₽"
+    for nick, rub in top_senders:
+        row = t.add_row().cells
+        row[0].text = str(nick)
+        row[1].text = str(send_cnt[nick])
+        row[2].text = f"{rub:,.2f}".replace(",", " ")
+
+    doc.add_heading("Топ-15 получателей", level=1)
+    t2 = doc.add_table(rows=1, cols=3)
+    t2.style = "Light Grid Accent 1"
+    hdr2 = t2.rows[0].cells
+    hdr2[0].text = "Ник"; hdr2[1].text = "Дождей"; hdr2[2].text = "Получено ₽"
+    for nick, rub in top_receivers:
+        row = t2.add_row().cells
+        row[0].text = str(nick)
+        row[1].text = str(recv_cnt[nick])
+        row[2].text = f"{rub:,.2f}".replace(",", " ")
+
+    doc.add_heading("Все дожди", level=1)
+    for e in rains:
+        tstr = datetime.fromtimestamp(e["ts"], tz=timezone.utc).strftime("%H:%M:%S")
+        line = (f"{tstr} [{e['chat']}] {e['sender']} раздал "
+                f"{e['amount_text']} {e.get('crypto_symbol') or ''} "
+                f"на {len(e.get('receivers') or [])} чел")
+        doc.add_paragraph(line)
+
+    path = os.path.join(SCREENSHOT_DIR, f"report_{date}.docx")
+    doc.save(path)
+    return FileResponse(path,
+                        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        filename=f"shuffle_report_{date}.docx")
 
 
 # ==================== API UI ====================
@@ -2663,8 +2853,9 @@ tr.rubric-row td{background:#2a2410 !important}
   <button data-tab="contexts">Контексты<span class="hint-btn" data-hint="Дожди с контекстом: 15 сообщений + 5 ставок до дождя.">?</span></button>
   <button data-tab="intents">Интенты<span class="hint-btn" data-hint="Обещания сделать дождь (Groq AI).">?</span></button>
   <button data-tab="promos">Промокоды<span class="hint-btn" data-hint="Парсится из TG-канала.">?</span></button>
-  <button data-tab="calendar">📅 Календарь<span class="hint-btn" data-hint="Просмотр по дням.">?</span></button>
+  <button data-tab="calendar">📅 Календарь<span class="hint-btn" data-hint="Просмотр по дням + docx отчёт.">?</span></button>
   <button data-tab="chart">📈 Графики<span class="hint-btn" data-hint="Распределение событий по часам суток.">?</span></button>
+  <button data-tab="activity">📊 Активность<span class="hint-btn" data-hint="Watchlist игроки по чатам + Merami + Rain Activity.">?</span></button>
   <button data-tab="mods">🛡 Модераторы<span class="hint-btn" data-hint="Все сообщения с иконкой модератора.">?</span></button>
   <button data-tab="me">👤 Мой профиль<span class="hint-btn" data-hint="Мой профиль + хранилище + балансы.">?</span></button>
   <button data-tab="ai">🤖 AI<span class="hint-btn" data-hint="AI читает чат и предлагает фразы.">?</span></button>
@@ -2797,7 +2988,11 @@ tr.rubric-row td{background:#2a2410 !important}
 
   <div id="tab-calendar" style="display:none">
     <div class="vault-card">
-      <h3>📅 Календарь <span class="hint-btn" data-hint="Клик по дню → топ раздающих и получателей.">?</span></h3>
+      <h3>📅 Календарь <span class="hint-btn" data-hint="Клик по дню → топ раздающих и получателей.&#10;📄 Скачать docx — отчёт за день.">?</span></h3>
+      <div class="row-flex">
+        <input type="date" id="docxDate">
+        <button class="btn green" onclick="downloadDocx()">📄 Скачать docx</button>
+      </div>
       <div class="calendar-grid" id="calGrid"></div>
     </div>
     <div id="calDetail"></div>
@@ -2812,6 +3007,22 @@ tr.rubric-row td{background:#2a2410 !important}
     </div>
     <div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:16px;margin-bottom:16px"><canvas id="hourCount" height="90"></canvas></div>
     <div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:16px"><canvas id="hourSum" height="90"></canvas></div>
+  </div>
+
+  <div id="tab-activity" style="display:none">
+    <div class="row-flex">
+      <label class="hint">Окно: </label>
+      <select id="actWindow" onchange="loadActivityDashboard()">
+        <option value="60" selected>60 мин</option>
+        <option value="120">2 часа</option>
+        <option value="1440">24 часа</option>
+      </select>
+      <button class="btn" onclick="loadActivityDashboard()">Обновить</button>
+      <button class="btn blue" onclick="loadRainActivity()">🌧 Rain Activity</button>
+      <span class="hint" id="actStatus"></span>
+    </div>
+    <div id="actGrid"></div>
+    <div id="rainActivityBox"></div>
   </div>
 
   <div id="tab-mods" style="display:none">
@@ -3035,7 +3246,7 @@ function renderReceivers(recs, collapseAfter) {
 
 function switchTab(name){
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
-  ['status','events','bulk','bets','betsrains','contexts','intents','promos','calendar','chart','ai','players','langs','me','mods'].forEach(t=>{
+  ['status','events','bulk','bets','betsrains','contexts','intents','promos','calendar','chart','ai','players','langs','me','mods','activity'].forEach(t=>{
     const el = $('tab-'+t); if(el) el.style.display = (t===name) ? '' : 'none';
   });
   if(name==='events') { loadChats(); loadEvents(); }
@@ -3052,6 +3263,7 @@ function switchTab(name){
   if(name==='players') { loadChats(); loadPlayersTab(); }
   if(name==='langs') loadLanguages();
   if(name==='mods') loadModerators();
+  if(name==='activity') loadActivityDashboard();
 }
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 
@@ -3264,6 +3476,8 @@ async function loadCalendar(){
     }
     grid.appendChild(cell);
   }
+  const docxInp = $('docxDate');
+  if (docxInp && !docxInp.value) docxInp.value = new Date().toISOString().slice(0,10);
 }
 async function loadDayDetail(date){
   const el = $('calDetail');
@@ -3276,6 +3490,12 @@ async function loadDayDetail(date){
     + '<div class="vault-card"><h3>🏆 Топ получателей</h3><table><thead><tr><th>#</th><th>Ник</th><th>Раз</th><th>₽</th></tr></thead><tbody>'+recvHtml+'</tbody></table></div>'
     + '<div class="vault-card"><h3>🌧 Топ раздающих</h3><table><thead><tr><th>#</th><th>Ник</th><th>Дождей</th><th>₽</th></tr></thead><tbody>'+sendHtml+'</tbody></table></div>'
     + '</div>';
+}
+
+function downloadDocx(){
+  const d = $('docxDate').value;
+  if (!d) { alert('Выбери дату'); return; }
+  window.location.href = '/api/daily_report?date=' + encodeURIComponent(d);
 }
 
 let chart1=null, chart2=null;
@@ -3323,6 +3543,80 @@ async function testPromo(){
   const btn = event.target; btn.disabled=true; btn.textContent='⏳';
   try { const r = await fetch('/api/promo/test',{method:'POST'}).then(r=>r.json()); alert('Найдено: '+r.found+', новых: '+r.new); loadPromos(); }
   catch(e){ alert('Ошибка'); } finally { btn.disabled=false; btn.textContent='🔍 Проверить'; }
+}
+
+// === ACTIVITY ===
+async function loadActivityDashboard(){
+  const win = $('actWindow').value || 60;
+  $('actStatus').textContent = '⏳';
+  try {
+    const r = await fetch('/api/activity/dashboard?minutes=' + win).then(r=>r.json());
+    const grid = $('actGrid');
+    const wl = r.watchlist || [];
+    if (!wl.length) { grid.innerHTML = '<p class="hint">Пусто. Добавь игроков в watchlist.</p>'; return; }
+    const chats = ['ENGLISH','RUSSIAN','JAPANESE','POLISH','TURKISH','PORTUGUESE','SPANISH','FRENCH','CHINESE','KOREAN','VIETNAMESE','INDONESIAN'];
+    let html = '<table><thead><tr><th>Игрок</th>';
+    chats.forEach(c => html += '<th style="text-align:center;font-size:10px">' + c.substring(0,4) + '</th>');
+    html += '<th>Всего msgs</th></tr></thead><tbody>';
+    wl.forEach(name => {
+      const p = r.players[name] || { chats: {}, total_msgs: 0 };
+      html += '<tr><td><b>' + esc(name) + '</b>' + (name === 'Merami' ? ' ⭐' : '') + '</td>';
+      chats.forEach(c => {
+        const info = p.chats[c];
+        if (!info) { html += '<td style="text-align:center;color:#333">·</td>'; return; }
+        const mins = info.minutes_ago;
+        let color = '#666', symbol = '·';
+        if (mins !== null && mins !== undefined) {
+          if (mins <= 25) { color = '#4ade80'; symbol = mins + 'м'; }
+          else if (mins <= 59) { color = '#fbbf24'; symbol = mins + 'м'; }
+          else { color = '#f87171'; symbol = mins + 'м'; }
+        }
+        const title = `last: ${mins}м, msgs: ${info.msg_count}`;
+        html += `<td style="text-align:center;color:${color}" title="${title}">${symbol}</td>`;
+      });
+      html += '<td>' + (p.total_msgs || 0) + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    grid.innerHTML = html;
+    $('actStatus').textContent = 'обновлено: ' + new Date().toLocaleTimeString('ru-RU');
+  } catch(e) { $('actStatus').textContent = '❌ ' + e.message; }
+}
+
+async function loadRainActivity(){
+  const box = $('rainActivityBox');
+  box.innerHTML = '<div class="vault-card">⏳ Загрузка...</div>';
+  try {
+    const r = await fetch('/api/rain_activity?hours=24&limit=50').then(r=>r.json());
+    if (!r.rains.length) { box.innerHTML = '<p class="hint">Нет дождей за 24 часа</p>'; return; }
+    box.innerHTML = '<h3 style="color:#8ab4f8">🌧 Расширенный отчёт (24ч, ' + r.count + ')</h3>'
+      + r.rains.map(e => {
+        const tstr = fmtTime(e.ts);
+        const m = e.merami;
+        let myStat = '';
+        if (m.won) myStat = '<span class="pill ok">✅ ты выиграл #' + m.pos + '</span>';
+        else if (m.minutes_ago !== null && m.minutes_ago !== undefined)
+          myStat = m.was_active
+            ? '<span class="pill warn">❌ не выиграл · активен ' + m.minutes_ago + 'м</span>'
+            : '<span class="pill err">❌ не выиграл · ' + m.minutes_ago + 'м назад</span>';
+        else myStat = '<span class="pill err">❌ не писал</span>';
+        const top = (e.top20 || []).slice(0, 10).map(r => {
+          const icon = r.wrote_in_25min ? '✅' : (r.in_chat_only ? '🟢' : '⏸');
+          const ago = r.minutes_ago !== null ? r.minutes_ago + 'м' : '—';
+          return '<span class="tag">' + icon + ' ' + esc(r.name) + ' ' + ago + '</span>';
+        }).join(' ');
+        return '<div class="vault-card" style="padding:10px">'
+          + '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
+          + '<span class="pill">' + esc(e.chat) + '</span>'
+          + '<b>' + esc(e.sender) + '</b>'
+          + '<span class="hint">' + tstr + '</span>'
+          + '<span style="color:#71d68a">' + esc(e.amount_text) + ' ' + esc(e.crypto_symbol) + '</span>'
+          + '<span class="hint">на ' + e.receivers_count + ' чел</span>'
+          + myStat
+          + '</div>'
+          + '<div style="margin-top:6px;font-size:12px"><b>Топ активных:</b> ' + top + '</div>'
+          + '</div>';
+      }).join('');
+  } catch(e) { box.innerHTML = '<p class="hint">❌ ' + e.message + '</p>'; }
 }
 
 // === MODERATORS ===
