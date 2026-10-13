@@ -2503,6 +2503,14 @@ async def clear_database(body: dict, x_api_key: str = Header(default="")):
     return {"ok": True, "message": "Все данные удалены"}
 
 
+@app.get("/api/chats_with_rains")
+async def api_chats_with_rains(days: int = 90):
+    """Список чатов, где был хотя бы один дождь за N дней."""
+    since = time.time() - days * 86400
+    rows = query_all("SELECT DISTINCT chat FROM events WHERE type='rain' AND ts >= ?", (since,))
+    return {"chats": [r["chat"] for r in rows if r.get("chat")]}
+
+
 # ==================== HTML ====================
 BASE_HTML = """<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
