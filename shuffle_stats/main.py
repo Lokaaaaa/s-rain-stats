@@ -43,22 +43,13 @@ LANG_MAP = {
     'PORTUGUESE': 'португальский', 'KOREAN': 'корейский', 'VIETNAMESE': 'вьетнамский',
     'POLISH': 'польский', 'INDONESIAN': 'индонезийский', 'CHINESE': 'китайский',
 }
-
 ALL_CHATS = list(LANG_MAP.keys())
-
-CURRENCIES = [
-    "USDT", "USDC", "BTC", "ETH", "SOL", "LTC", "DOGE", "XRP", "TRX", "BNB", "SHIB",
-    "SHFL", "POL", "MATIC", "AVAX", "TON", "GRAM", "BONK", "WIF", "PUMP", "TRUMP",
-    "DAI", "CASH", "USD",
-]
-
+CURRENCIES = ["USDT","USDC","BTC","ETH","SOL","LTC","DOGE","XRP","TRX","BNB","SHIB","SHFL","POL","MATIC",
+              "AVAX","TON","GRAM","BONK","WIF","PUMP","TRUMP","DAI","CASH","USD"]
 
 # ==================== RATES ====================
 RATES_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_rates.json")
-RATE_ALIASES = {
-    "TON": "GRAM", "MATIC": "POL", "POLYGON": "POL", "USD": "USDT",
-    "USDC": "USDT", "DAI": "USDT", "BUSD": "USDT", "TUSD": "USDT",
-}
+RATE_ALIASES = {"TON":"GRAM","MATIC":"POL","POLYGON":"POL","USD":"USDT","USDC":"USDT","DAI":"USDT","BUSD":"USDT","TUSD":"USDT"}
 _server_rates = {}
 _server_rates_lock = threading.Lock()
 _server_rates_updated = [0.0]
@@ -90,23 +81,16 @@ def _save_server_rates():
 def _fetch_server_rates():
     try:
         url = "https://api.coingecko.com/api/v3/simple/price"
-        ids = (
-            "bitcoin,ethereum,solana,litecoin,dogecoin,ripple,tron,binancecoin,tether,"
-            "usd-coin,shiba-inu,shuffle-2,polygon-ecosystem-token,avalanche-2,"
-            "the-open-network,bonk,dogwifcoin,pump-fun,official-trump,dai"
-        )
+        ids = ("bitcoin,ethereum,solana,litecoin,dogecoin,ripple,tron,binancecoin,tether,usd-coin,shiba-inu,"
+               "shuffle-2,polygon-ecosystem-token,avalanche-2,the-open-network,bonk,dogwifcoin,pump-fun,official-trump,dai")
         r = requests.get(url, params={"ids": ids, "vs_currencies": "rub,usd"}, timeout=15)
         if r.status_code != 200:
             return
         data = r.json()
-        mapping = {
-            "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "LTC": "litecoin",
-            "DOGE": "dogecoin", "XRP": "ripple", "TRX": "tron", "BNB": "binancecoin",
-            "USDT": "tether", "USDC": "usd-coin", "SHIB": "shiba-inu", "SHFL": "shuffle-2",
-            "POL": "polygon-ecosystem-token", "AVAX": "avalanche-2", "GRAM": "the-open-network",
-            "BONK": "bonk", "WIF": "dogwifcoin", "PUMP": "pump-fun", "TRUMP": "official-trump",
-            "DAI": "dai",
-        }
+        mapping = {"BTC":"bitcoin","ETH":"ethereum","SOL":"solana","LTC":"litecoin","DOGE":"dogecoin","XRP":"ripple",
+                   "TRX":"tron","BNB":"binancecoin","USDT":"tether","USDC":"usd-coin","SHIB":"shiba-inu",
+                   "SHFL":"shuffle-2","POL":"polygon-ecosystem-token","AVAX":"avalanche-2","GRAM":"the-open-network",
+                   "BONK":"bonk","WIF":"dogwifcoin","PUMP":"pump-fun","TRUMP":"official-trump","DAI":"dai"}
         new = {}
         for sym, cg in mapping.items():
             if cg in data:
@@ -167,8 +151,6 @@ def get_db():
         url = DATABASE_URL
         if url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql://", 1)
-        # SSL: если не указан явно — добавляем require (для внешних URL).
-        # Для внутренних URL Render можно убрать.
         if "sslmode" not in url:
             sep = "&" if "?" in url else "?"
             url += f"{sep}sslmode=require"
@@ -248,10 +230,8 @@ def init_db():
         ("receivers_info", "TEXT"),
     ]:
         _try(f"ALTER TABLE events ADD COLUMN {col} {typ}")
-    for idx in [
-        "idx_type ON events(type)", "idx_sender ON events(sender)",
-        "idx_events_ts ON events(ts)", "idx_events_chat ON events(chat)",
-    ]:
+    for idx in ["idx_type ON events(type)", "idx_sender ON events(sender)",
+                "idx_events_ts ON events(ts)", "idx_events_chat ON events(chat)"]:
         execute(f"CREATE INDEX IF NOT EXISTS {idx}")
 
     if USE_POSTGRES:
@@ -403,6 +383,24 @@ def init_db():
     execute("CREATE INDEX IF NOT EXISTS idx_vt_type ON vault_transactions(type)")
     execute("CREATE TABLE IF NOT EXISTS vault_meta (k TEXT PRIMARY KEY, v TEXT)")
     execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+
+    # --- Stage 1: модераторы, control, ngrok ---
+    if USE_POSTGRES:
+        execute("""CREATE TABLE IF NOT EXISTS moderators (
+            username TEXT PRIMARY KEY, first_seen DOUBLE PRECISION,
+            last_seen DOUBLE PRECISION, chats TEXT)""")
+        execute("""CREATE TABLE IF NOT EXISTS moderator_messages (
+            id SERIAL PRIMARY KEY, ts DOUBLE PRECISION NOT NULL,
+            username TEXT NOT NULL, chat TEXT NOT NULL, text TEXT)""")
+    else:
+        execute("""CREATE TABLE IF NOT EXISTS moderators (
+            username TEXT PRIMARY KEY, first_seen REAL,
+            last_seen REAL, chats TEXT)""")
+        execute("""CREATE TABLE IF NOT EXISTS moderator_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+            username TEXT NOT NULL, chat TEXT NOT NULL, text TEXT)""")
+    execute("CREATE INDEX IF NOT EXISTS idx_mm_ts ON moderator_messages(ts)")
+    execute("CREATE INDEX IF NOT EXISTS idx_mm_user ON moderator_messages(username)")
 
 
 def meta_get(k, default=None):
@@ -635,6 +633,37 @@ class TransferIn(BaseModel):
     direction: str
     currency: str
     amount: float
+
+
+# === Stage 1: новые модели ===
+class ControlSet(BaseModel):
+    action: str
+
+
+class NgrokUrlIn(BaseModel):
+    url: str
+    ts: Optional[float] = None
+
+
+class ModeratorMessageIn(BaseModel):
+    ts: Optional[float] = None
+    username: str
+    chat: str
+    text: str = ""
+
+
+class LogFilterIn(BaseModel):
+    categories: dict
+
+
+DEFAULT_LOG_FILTER = {
+    "rain": True, "tip": True, "bet": False, "bulk": True,
+    "intent": True, "player": True, "moderator": True,
+    "observer": True, "server": True, "batch": True,
+    "rates": False, "shot": False, "proc": True,
+    "ngrok": True, "telegram": True, "debug": False,
+    "error": True, "info": True,
+}
 
 
 # ==================== РАСЧЁТ ====================
@@ -1033,6 +1062,109 @@ async def upload_screenshot(iid: int = Form(...), file: UploadFile = File(...),
                                      "done": True, "path": path,
                                      "uploaded_at": time.time()}
     return {"ok": True}
+
+
+# ==================== CONTROL / NGROK / MODERATORS / LOG FILTER ====================
+@app.get("/api/control/get")
+async def control_get():
+    v = meta_get("control_action") or ""
+    ts = float(meta_get("control_ts") or 0)
+    return {"action": v, "ts": ts}
+
+
+@app.post("/api/control/set")
+async def control_set(body: ControlSet):
+    if body.action not in ("start", "stop", "restart"):
+        raise HTTPException(400, "invalid action")
+    meta_set("control_action", body.action)
+    meta_set("control_ts", str(time.time()))
+    return {"ok": True, "action": body.action}
+
+
+@app.post("/api/ngrok_url")
+async def post_ngrok_url(body: NgrokUrlIn, x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
+    meta_set("ngrok_url", body.url)
+    meta_set("ngrok_url_ts", str(body.ts or time.time()))
+    return {"ok": True}
+
+
+@app.get("/api/ngrok_url")
+async def get_ngrok_url():
+    return {"url": meta_get("ngrok_url") or "",
+            "ts": float(meta_get("ngrok_url_ts") or 0)}
+
+
+@app.get("/api/log_filter")
+async def get_log_filter():
+    v = meta_get("log_filter")
+    if not v:
+        return {"categories": DEFAULT_LOG_FILTER}
+    try:
+        return {"categories": json.loads(v)}
+    except Exception:
+        return {"categories": DEFAULT_LOG_FILTER}
+
+
+@app.post("/api/log_filter")
+async def set_log_filter(body: LogFilterIn):
+    meta_set("log_filter", json.dumps(body.categories, ensure_ascii=False))
+    return {"ok": True, "categories": body.categories}
+
+
+@app.post("/api/moderator_message")
+async def post_moderator_message(body: ModeratorMessageIn, x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
+    ts_val = body.ts or time.time()
+    p = ph()
+    execute(f"""INSERT INTO moderator_messages (ts,username,chat,text)
+                VALUES ({p},{p},{p},{p})""",
+            (ts_val, body.username, body.chat, body.text))
+    row = query_one("SELECT * FROM moderators WHERE username=?", (body.username,))
+    if row:
+        try:
+            chats = json.loads(row.get("chats") or "{}")
+        except Exception:
+            chats = {}
+        chats[body.chat] = chats.get(body.chat, 0) + 1
+        execute(f"UPDATE moderators SET last_seen={p}, chats={p} WHERE username={p}",
+                (ts_val, json.dumps(chats), body.username))
+    else:
+        chats = {body.chat: 1}
+        execute(f"""INSERT INTO moderators (username,first_seen,last_seen,chats)
+                    VALUES ({p},{p},{p},{p})""",
+                (body.username, ts_val, ts_val, json.dumps(chats)))
+    return {"ok": True}
+
+
+@app.get("/api/moderators")
+async def get_moderators():
+    rows = query_all("SELECT * FROM moderators ORDER BY last_seen DESC LIMIT 500")
+    for r in rows:
+        try:
+            r["chats"] = json.loads(r.get("chats") or "{}")
+        except Exception:
+            r["chats"] = {}
+    return {"moderators": rows}
+
+
+@app.get("/api/moderator_messages")
+async def get_moderator_messages(username: Optional[str] = None,
+                                  chat: Optional[str] = None,
+                                  limit: int = 200):
+    q = "SELECT * FROM moderator_messages WHERE 1=1"
+    p = []
+    if username:
+        q += " AND username=?"
+        p.append(username)
+    if chat:
+        q += " AND chat=?"
+        p.append(chat)
+    q += " ORDER BY ts DESC LIMIT ?"
+    p.append(limit)
+    return {"messages": query_all(q, tuple(p))}
 
 
 # ==================== WATCHLIST / PROFILES ====================
@@ -1968,7 +2100,6 @@ async def api_players_relocate(body: dict):
 
 @app.post("/api/players/set_chats")
 async def api_players_set_chats(body: dict):
-    """Заменить полный набор чатов игрока."""
     username = (body.get("username") or "").strip()
     chats = body.get("chats") or []
     if not username:
@@ -2435,6 +2566,7 @@ tr:hover td{background:#161a22}
 .pill.err{background:#3a1f1f;color:#e07a7a}
 .pill.chat{background:#2a1f3a;color:#c58af9}
 .pill.rubric{background:#3a2f1f;color:#e0c66a}
+.pill.mod{background:#3a1f2f;color:#f472b6}
 .btn{background:#2a3340;color:#e6e6e6;border:1px solid #334055;padding:5px 10px;border-radius:5px;cursor:pointer;font-size:12px}
 .btn:hover{background:#334055}
 .btn.danger{background:#3a1f1f;border-color:#7f1d1d}
@@ -2515,6 +2647,12 @@ tr.rubric-row td{background:#2a2410 !important}
   <span id="uptime" class="hint">—</span>
   <a href="/" style="margin-left:16px">← На сайт</a>
   <span style="margin-left:auto" class="pill" id="kpiTotal">—</span>
+  <div class="row-flex" style="margin:0">
+    <button class="btn green" onclick="controlAction('start')" title="Запуск">▶️</button>
+    <button class="btn danger" onclick="controlAction('restart')" title="Перезапуск">🔄</button>
+    <button class="btn danger" onclick="controlAction('stop')" title="Стоп">⛔</button>
+  </div>
+  <span class="pill" id="ngrokUrl" style="cursor:pointer" onclick="copyNgrok()">🌐 ngrok: —</span>
 </header>
 <div class="tabs">
   <button data-tab="status" class="active">Вкладки<span class="hint-btn" data-hint="Состояние всех Chrome-инстансов.&#10;📸 — сделать скриншот.">?</span></button>
@@ -2523,14 +2661,15 @@ tr.rubric-row td{background:#2a2410 !important}
   <button data-tab="bets">Ставки<span class="hint-btn" data-hint="Выигрышные ставки:&#10;📊 — из таблицы ставок&#10;💬 — из чата.">?</span></button>
   <button data-tab="betsrains">Ставки→Дожди<span class="hint-btn" data-hint="Сколько % ставок (≥$20) были за 15 мин ДО дождя (любого).">?</span></button>
   <button data-tab="contexts">Контексты<span class="hint-btn" data-hint="Дожди с контекстом: 15 сообщений + 5 ставок до дождя.">?</span></button>
-  <button data-tab="intents">Интенты<span class="hint-btn" data-hint="Обещания сделать дождь (Groq AI).&#10;AI% = уверенность модели.&#10;Δ = через сколько секунд реально залил.">?</span></button>
+  <button data-tab="intents">Интенты<span class="hint-btn" data-hint="Обещания сделать дождь (Groq AI).">?</span></button>
   <button data-tab="promos">Промокоды<span class="hint-btn" data-hint="Парсится из TG-канала.">?</span></button>
-  <button data-tab="calendar">📅 Календарь<span class="hint-btn" data-hint="Просмотр по дням: сколько дождей/чаевых, топ раздающих и получателей за день.">?</span></button>
+  <button data-tab="calendar">📅 Календарь<span class="hint-btn" data-hint="Просмотр по дням.">?</span></button>
   <button data-tab="chart">📈 Графики<span class="hint-btn" data-hint="Распределение событий по часам суток.">?</span></button>
+  <button data-tab="mods">🛡 Модераторы<span class="hint-btn" data-hint="Все сообщения с иконкой модератора.">?</span></button>
   <button data-tab="me">👤 Мой профиль<span class="hint-btn" data-hint="Мой профиль + хранилище + балансы.">?</span></button>
   <button data-tab="ai">🤖 AI<span class="hint-btn" data-hint="AI читает чат и предлагает фразы.">?</span></button>
-  <button data-tab="players">👥 Игроки<span class="hint-btn" data-hint="Все игроки по чатам.↗ Язык — переместить.">?</span></button>
-  <button data-tab="langs">🌍 Языки<span class="hint-btn" data-hint="Редактор языков игрока (выбрать чаты чекбоксами).">?</span></button>
+  <button data-tab="players">👥 Игроки<span class="hint-btn" data-hint="Все игроки по чатам.">?</span></button>
+  <button data-tab="langs">🌍 Языки<span class="hint-btn" data-hint="Редактор языков игрока.">?</span></button>
 </div>
 <main>
   <div id="tab-status"><div class="kpi" id="kpiRow"></div>
@@ -2658,7 +2797,7 @@ tr.rubric-row td{background:#2a2410 !important}
 
   <div id="tab-calendar" style="display:none">
     <div class="vault-card">
-      <h3>📅 Календарь <span class="hint-btn" data-hint="Просмотр по дням.&#10;Клик по дню → топ раздающих и получателей за этот день.">?</span></h3>
+      <h3>📅 Календарь <span class="hint-btn" data-hint="Клик по дню → топ раздающих и получателей.">?</span></h3>
       <div class="calendar-grid" id="calGrid"></div>
     </div>
     <div id="calDetail"></div>
@@ -2673,6 +2812,19 @@ tr.rubric-row td{background:#2a2410 !important}
     </div>
     <div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:16px;margin-bottom:16px"><canvas id="hourCount" height="90"></canvas></div>
     <div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:16px"><canvas id="hourSum" height="90"></canvas></div>
+  </div>
+
+  <div id="tab-mods" style="display:none">
+    <div class="row-flex">
+      <input type="text" id="modSearch" placeholder="Поиск по нику">
+      <button class="btn" onclick="loadModerators()">Обновить</button>
+      <span class="hint" id="modStats"></span>
+    </div>
+    <table id="tbl-mods"><thead><tr>
+      <th>Ник</th><th>Первый раз</th><th>Последний раз</th><th>Чаты</th><th>Действие</th>
+    </tr></thead>
+    <tbody id="modBody"></tbody></table>
+    <div id="modMessages"></div>
   </div>
 
   <div id="tab-me" style="display:none">
@@ -2706,7 +2858,7 @@ tr.rubric-row td{background:#2a2410 !important}
     <div id="vaultWagerCard" class="vault-card"></div>
 
     <div class="vault-card">
-      <h3>💼 Балансы <span class="hint-btn" data-hint="Слева — сколько на аккаунте.&#10;Справа — сколько в хранилище.&#10;Стрелки посередине — перевод между ними.">?</span></h3>
+      <h3>💼 Балансы <span class="hint-btn" data-hint="Аккаунт слева, хранилище справа, стрелки — перевод.">?</span></h3>
       <div class="balance-grid">
         <div class="balance-col">
           <h4>💰 Аккаунт <span class="balance-total" id="accTotal">$0</span></h4>
@@ -2795,16 +2947,14 @@ tr.rubric-row td{background:#2a2410 !important}
       <input type="text" id="langFilter" placeholder="Поиск по нику">
       <button class="btn" onclick="loadLanguages()">Обновить</button>
     </div>
-    <div class="hint" style="margin-bottom:12px">
-      Клик по игроку → откроется редактор. Можно выбрать ЛЮБЫЕ чаты чекбоксами.
-    </div>
+    <div class="hint" style="margin-bottom:12px">Клик по игроку → откроется редактор чатов.</div>
     <div id="langGrid" class="lang-grid"></div></div>
 </main>
 <div class="modal" id="imgModal" onclick="this.classList.remove('on')"><img id="imgModalImg" src=""></div>
 <div class="modal" id="langEditModal">
   <div style="background:#161b22;border:1px solid #26303a;border-radius:12px;max-width:600px;width:100%;padding:24px" onclick="event.stopPropagation()">
     <h3 style="margin:0 0 16px;color:#7cc4ff" id="langEditName"></h3>
-    <div class="hint" style="margin-bottom:12px">Отметь чаты, где этот игрок активен:</div>
+    <div class="hint" style="margin-bottom:12px">Отметь чаты:</div>
     <div id="langCheckboxes" style="display:grid;grid-template-columns:1fr 1fr;gap:8px"></div>
     <div class="row-flex" style="margin-top:16px">
       <button class="btn green" onclick="saveLangEdit()">💾 Сохранить</button>
@@ -2885,7 +3035,7 @@ function renderReceivers(recs, collapseAfter) {
 
 function switchTab(name){
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
-  ['status','events','bulk','bets','betsrains','contexts','intents','promos','calendar','chart','ai','players','langs','me'].forEach(t=>{
+  ['status','events','bulk','bets','betsrains','contexts','intents','promos','calendar','chart','ai','players','langs','me','mods'].forEach(t=>{
     const el = $('tab-'+t); if(el) el.style.display = (t===name) ? '' : 'none';
   });
   if(name==='events') { loadChats(); loadEvents(); }
@@ -2901,6 +3051,7 @@ function switchTab(name){
   if(name==='ai') { loadChats(); loadAILatest(); }
   if(name==='players') { loadChats(); loadPlayersTab(); }
   if(name==='langs') loadLanguages();
+  if(name==='mods') loadModerators();
 }
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 
@@ -3031,7 +3182,7 @@ async function loadBetsToRains(){
   const r = await fetch('/api/bets_to_rains?window_sec='+w).then(r=>r.json());
   const body = $('b2rBody'); body.innerHTML='';
   $('b2rStats').innerHTML = '<div class="kpi"><div>Окно<b>'+r.window_sec+'с</b></div><div>Найдено игроков<b>'+r.stats.length+'</b></div></div>';
-  if(!r.stats.length){ body.innerHTML = '<tr><td colspan="5" class="hint">Нет данных (нужно 3+ ставки ≥$20)</td></tr>'; return; }
+  if(!r.stats.length){ body.innerHTML = '<tr><td colspan="5" class="hint">Нет данных</td></tr>'; return; }
   r.stats.forEach((s,i)=>{ const cls = s.percent>=50?'ok':(s.percent>=25?'warn':'err');
     const tr = document.createElement('tr');
     tr.innerHTML = '<td>'+(i+1)+'</td><td data-v="'+esc(s.nickname)+'"><b>'+esc(s.nickname)+'</b></td><td data-v="'+s.bets+'">'+s.bets+'</td><td data-v="'+s.triggered+'">'+s.triggered+'</td><td data-v="'+s.percent+'"><span class="pill '+cls+'">'+s.percent+'%</span></td>';
@@ -3049,7 +3200,7 @@ async function loadContexts(){
     const rub = c.amount_rub ? fmtMoney(c.amount_rub) + ' ₽' : '';
     const msgs = (c.context_messages||[]).slice(-15); const bets = (c.context_bets||[]).slice(-5);
     const mH = msgs.length ? msgs.map((m,i)=>'<div style="padding:4px 8px;border-left:3px solid #2a2f3a;margin:4px 0;color:#aab;font-size:12px">'+(i+1)+'. '+esc(m)+'</div>').join('') : '<div class="hint">—</div>';
-    const bH = bets.length ? bets.map(b=>'<div style="padding:4px 8px;border-left:3px solid #71d68a;margin:4px 0;color:#71d68a;font-size:12px">🎰 <b>'+esc(b.sender||'?')+'</b> · '+esc(b.game||'')+' · '+esc(b.multiplier||'')+'</div>').join('') : '<div class="hint">—</div>';
+    const bH = bets.length ? bets.map(b=>'<div style="padding:4px 8px;border-left:3px solid #71d68a;margin:4px 0;color:#71d68a;font-size:12px">🎰 <b>'+esc(b.sender||'?')+'</b> · '+esc(b.game||'')+' · '+esc(b.multiplier||'')+' · '+esc(b.amount_text||'')+' '+esc(b.crypto_symbol||'')+'</div>').join('') : '<div class="hint">—</div>';
     return '<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px;margin-bottom:12px">'
       + '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px">'
       + '<span class="pill">🌧 RAIN</span><b>'+esc(c.chat)+'</b>'
@@ -3084,13 +3235,12 @@ async function loadIntents(){
 async function loadIntentsStats(){
   const r = await fetch('/api/intents_stats').then(r=>r.json());
   const el = $('intStats');
-  if(!r.stats.length){ el.innerHTML = '<p class="hint">Нет данных. Нужно чтобы AI обработал интенты.</p>'; return; }
+  if(!r.stats.length){ el.innerHTML = '<p class="hint">Нет данных.</p>'; return; }
   el.innerHTML = '<div class="kpi">' + r.stats.map(s=>{const cls = s.percent>=50?'ok':(s.percent>=25?'warn':'err');
     return '<div>'+esc(s.nickname)+'<b>'+s.percent+'%</b><span class="hint"><span class="pill '+cls+'">'+s.matched+'/'+s.total+'</span></span></div>';
   }).join('') + '</div>';
 }
 
-// ==== КАЛЕНДАРЬ ====
 async function loadCalendar(){
   const r = await fetch('/api/days?days=60').then(r=>r.json());
   const grid = $('calGrid'); grid.innerHTML = '';
@@ -3123,12 +3273,11 @@ async function loadDayDetail(date){
   const sendHtml = r.top_senders.map((p,i)=>'<tr><td>'+(i+1)+'</td><td><b>'+esc(p.nickname)+'</b></td><td>'+p.count+'</td><td style="color:#71d68a">'+fmtMoney(p.rub)+' ₽</td></tr>').join('') || '<tr><td colspan="4" class="hint">—</td></tr>';
   el.innerHTML = '<div class="vault-card"><h3>📅 '+date+' — '+r.events_count+' событий</h3></div>'
     + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'
-    + '<div class="vault-card"><h3>🏆 Топ получателей дня</h3><table><thead><tr><th>#</th><th>Ник</th><th>Раз</th><th>₽</th></tr></thead><tbody>'+recvHtml+'</tbody></table></div>'
-    + '<div class="vault-card"><h3>🌧 Топ раздающих дня</h3><table><thead><tr><th>#</th><th>Ник</th><th>Дождей</th><th>₽</th></tr></thead><tbody>'+sendHtml+'</tbody></table></div>'
+    + '<div class="vault-card"><h3>🏆 Топ получателей</h3><table><thead><tr><th>#</th><th>Ник</th><th>Раз</th><th>₽</th></tr></thead><tbody>'+recvHtml+'</tbody></table></div>'
+    + '<div class="vault-card"><h3>🌧 Топ раздающих</h3><table><thead><tr><th>#</th><th>Ник</th><th>Дождей</th><th>₽</th></tr></thead><tbody>'+sendHtml+'</tbody></table></div>'
     + '</div>';
 }
 
-// ==== ГРАФИКИ ====
 let chart1=null, chart2=null;
 async function loadChart(){
   const p = new URLSearchParams();
@@ -3144,7 +3293,6 @@ async function loadChart(){
   chart2 = new Chart($('hourSum'), {type:'bar', data:{labels, datasets:[{label:'Сумма ₽', data:sums, backgroundColor:'#71d68a'}]}, options:{plugins:{legend:{labels:{color:'#e6e6e6'}}}, scales:{x:{ticks:{color:'#8b93a7'}}, y:{ticks:{color:'#8b93a7'}}}}});
 }
 
-// ==== ПРОМОКОДЫ ====
 async function loadPromos(){
   const filter = $('promoFilter').value;
   const p = new URLSearchParams(); if(filter === '0') p.set('only_unused','1');
@@ -3177,7 +3325,61 @@ async function testPromo(){
   catch(e){ alert('Ошибка'); } finally { btn.disabled=false; btn.textContent='🔍 Проверить'; }
 }
 
-// ==== МОЙ ПРОФИЛЬ ====
+// === MODERATORS ===
+async function loadModerators(){
+  const r = await fetch('/api/moderators').then(r=>r.json());
+  const body = document.getElementById('modBody'); body.innerHTML = '';
+  if(!r.moderators || !r.moderators.length){
+    body.innerHTML = '<tr><td colspan="5" class="hint">Пусто</td></tr>';
+    document.getElementById('modStats').textContent = '';
+    return;
+  }
+  const search = (document.getElementById('modSearch').value || '').toLowerCase();
+  const filtered = r.moderators.filter(m => !search || (m.username||'').toLowerCase().includes(search));
+  document.getElementById('modStats').textContent = 'Всего: ' + r.moderators.length;
+  filtered.forEach(m => {
+    const chats = Object.entries(m.chats||{}).map(([c,n]) => '<span class="tag">'+esc(c)+':'+n+'</span>').join(' ');
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td><b>'+esc(m.username)+'</b></td>'
+      + '<td>'+(m.first_seen?fmtTime(m.first_seen):'—')+'</td>'
+      + '<td>'+(m.last_seen?fmtTime(m.last_seen):'—')+'</td>'
+      + '<td>'+chats+'</td>'
+      + '<td><button class="btn" onclick="loadModMsgs(\''+esc(m.username)+'\')">📜 Сообщения</button></td>';
+    body.appendChild(tr);
+  });
+}
+async function loadModMsgs(username){
+  const r = await fetch('/api/moderator_messages?username='+encodeURIComponent(username)+'&limit=100').then(r=>r.json());
+  const el = document.getElementById('modMessages');
+  if(!r.messages.length){ el.innerHTML = '<p class="hint">Нет сообщений</p>'; return; }
+  el.innerHTML = '<h3 style="color:#8ab4f8">Последние сообщения '+esc(username)+'</h3>'
+    + r.messages.map(m => '<div style="padding:6px 10px;border-left:3px solid #c58af9;margin:4px 0;font-size:12px">'
+      + '<span class="hint">'+fmtTime(m.ts)+' · '+esc(m.chat)+'</span> · '+esc(m.text||'') + '</div>').join('');
+}
+
+// === CONTROL / NGROK ===
+async function controlAction(action) {
+  if (!confirm('Команда: ' + action + '?')) return;
+  await fetch('/api/control/set', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action})}).then(r=>r.json());
+  alert('✅ Отправлено: ' + action);
+}
+let _lastNgrok = '';
+async function pollNgrok() {
+  try {
+    const r = await fetch('/api/ngrok_url').then(r=>r.json());
+    if (r.url && r.url !== _lastNgrok) {
+      _lastNgrok = r.url;
+      document.getElementById('ngrokUrl').textContent = '🌐 ngrok: ' + r.url;
+    }
+  } catch(e){}
+}
+function copyNgrok() {
+  if (!_lastNgrok) return;
+  if (navigator.clipboard) navigator.clipboard.writeText(_lastNgrok);
+  alert('Скопировано: ' + _lastNgrok);
+}
+
+// === ME ===
 function saveMeNick(){ const v = $('meNick').value.trim(); if(!v) return; localStorage.setItem('myNick', v); alert('✅ Сохранён: ' + v); }
 async function loadMe(){
   const un = $('meNick').value.trim(); if(!un) return;
@@ -3231,7 +3433,7 @@ async function loadMeBets(){
 }
 (function initMe(){ const saved = localStorage.getItem('myNick'); if(saved && $('meNick')) $('meNick').value = saved; })();
 
-// ==== ХРАНИЛИЩЕ ====
+// === VAULT ===
 async function loadVault(){
   const r = await fetch('/api/vault').then(r=>r.json());
   const w = r.wager; const daysLeft = w.days_left; const hasWager = w.amount_required > 0;
@@ -3270,7 +3472,7 @@ async function saveWager(){ const a = parseFloat($('wgAmount').value)||0; const 
 async function saveGoal(){ const g = parseFloat($('goalUsd').value)||0; const t = $('goalText').value.trim(); await fetch('/api/vault/goal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal_usd:g,goal_text:t})}); alert('✅ Сохранена'); loadVault(); }
 async function addTransaction(){ const t = $('txType').value; const c = $('txCurrency').value.trim().toUpperCase() || 'USDT'; const a = parseFloat($('txAmount').value)||0; const au = $('txAmountUsd').value ? parseFloat($('txAmountUsd').value) : 0; const d = $('txDesc').value.trim(); if(!a) return alert('Сумма'); await fetch('/api/vault/transaction',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:t,currency:c,amount:a,amount_usd:au,description:d})}); $('txAmount').value=''; $('txAmountUsd').value=''; $('txDesc').value=''; loadVault(); }
 
-// ==== AI ====
+// === AI ===
 async function runAI(){
   const chat = $('aiChat').value; if(!chat){ alert('Выбери чат'); return; }
   const btn = event.target; btn.disabled=true; btn.textContent='⏳'; $('aiStatus').textContent = 'Отправляю...';
@@ -3301,7 +3503,7 @@ function copyMsg(el, text){
 }
 async function loadAILatest(){ const chat = $('aiChat').value || null; const p = new URLSearchParams(); if(chat) p.set('chat',chat); const r = await fetch('/api/chat/latest?'+p).then(r=>r.json()); if(!r.task){ $('aiResult').innerHTML='<p class="hint">Нет</p>'; return; } renderAIResult(r.task.result, r.task.chat); $('aiStatus').textContent = 'Последний: '+fmtTime(r.task.completed_at); }
 
-// ==== PLAYERS ====
+// === PLAYERS ===
 async function loadPlayersTab(){
   const sum = await fetch('/api/players_by_chat').then(r=>r.json());
   const sEl = $('plChatsSummary');
@@ -3330,7 +3532,6 @@ async function loadPlayersTab(){
 }
 async function relocatePlayer(username){ const nc = prompt('Куда переместить "'+username+'"?'); if(!nc) return; await fetch('/api/players/relocate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username, chat:nc.toUpperCase()})}); loadPlayersTab(); }
 
-// ==== ЯЗЫКИ (с чекбоксами) ====
 let currentLangPlayer = null;
 async function loadLanguages(){
   const r = await fetch('/api/players_by_language').then(r=>r.json());
@@ -3362,14 +3563,15 @@ async function saveLangEdit(){
   else { st.textContent = '❌ Ошибка'; }
 }
 
-// Init
 attachAutocomplete(document.getElementById('accCur'));
 attachAutocomplete(document.getElementById('txCurrency'));
 
 renderBulkChips();
 loadChats();
 refreshStatus();
+pollNgrok();
 setInterval(refreshStatus, 3000);
+setInterval(pollNgrok, 5000);
 </script></body></html>
 """
 
@@ -3381,23 +3583,17 @@ async def monitor_page():
 
 @app.on_event("startup")
 async def startup_event():
-    # 1. Загружаем курсы (не зависит от БД)
     _load_server_rates()
-
-    # 2. Создаём / мигрируем таблицы — ОБЯЗАТЕЛЬНО ДО запуска фоновых потоков
     try:
         init_db()
         print("[STARTUP] ✅ Таблицы БД готовы")
     except Exception as e:
         print(f"[STARTUP] ❌ Ошибка init_db: {e}")
-
     try:
         migrate_ts_once()
         print("[STARTUP] ✅ Миграция ts выполнена")
     except Exception as e:
         print(f"[STARTUP] ⚠️ migrate_ts_once: {e}")
-
-    # 3. Теперь безопасно запускаем фоновые потоки, работающие с БД
     threading.Thread(target=rates_refresh_thread, daemon=True).start()
     threading.Thread(target=dedup_thread, daemon=True).start()
     threading.Thread(target=ticks_cleanup_thread, daemon=True).start()
