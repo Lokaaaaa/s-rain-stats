@@ -673,6 +673,32 @@ DEFAULT_LOG_FILTER = {
 
 
 # ==================== РАСЧЁТ ====================
+def _enrich_context_bets(ctx_bets):
+    """Добавляет amount_rub / amount_usd в context_bets для отображения."""
+    out = []
+    for b in (ctx_bets or []):
+        if not isinstance(b, dict):
+            continue
+        b = dict(b)
+        if (b.get("amount_rub") or 0) and (b.get("amount_usd") or 0):
+            out.append(b)
+            continue
+        txt = b.get("amount_text", "") or ""
+        sym = b.get("crypto_symbol", "") or ""
+        has_fiat = any(m in txt for m in ("₽", "$", "€", "£", "₴", "₸", "₺"))
+        atype = "fiat" if has_fiat else ("crypto" if sym else "fiat")
+        try:
+            cr, cu = _recalc_amounts(txt, atype, sym)
+        except Exception:
+            cr, cu = 0.0, 0.0
+        if not b.get("amount_rub"):
+            b["amount_rub"] = cr
+        if not b.get("amount_usd"):
+            b["amount_usd"] = cu
+        out.append(b)
+    return out
+
+
 def _recalc_amounts(amount_text, amount_type, crypto_symbol):
     txt = amount_text or ""
     crypto = (crypto_symbol or "").upper().strip()
@@ -738,6 +764,7 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
         if not usd:
             usd = cu
     p = ph()
+    ctx_bets_enriched = _enrich_context_bets(event.context_bets)
     execute(f"""INSERT INTO events
                 (type,chat,sender,receivers,receivers_info,amount_text,amount_type,
                  crypto_symbol,amount_rub,amount_usd,created_at,ts,
@@ -749,7 +776,7 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
              event.amount_text, event.amount_type, event.crypto_symbol,
              rub, usd, created, ts_val,
              json.dumps(event.context_messages or [], ensure_ascii=False),
-             json.dumps(event.context_bets or [], ensure_ascii=False)))
+             json.dumps(ctx_bets_enriched, ensure_ascii=False)))
     return {"ok": True}
 
 
@@ -772,6 +799,7 @@ async def events_batch(payload: dict, x_api_key: str = Header(default="")):
                 if not usd:
                     usd = cu
             p = ph()
+            ctx_bets_enriched = _enrich_context_bets(e.get("context_bets", []))
             execute(f"""INSERT INTO events
                         (type,chat,sender,receivers,receivers_info,amount_text,amount_type,
                          crypto_symbol,amount_rub,amount_usd,created_at,ts,
@@ -786,7 +814,7 @@ async def events_batch(payload: dict, x_api_key: str = Header(default="")):
                                             tz=timezone.utc).isoformat(),
                      e.get("ts", time.time()),
                      json.dumps(e.get("context_messages", []), ensure_ascii=False),
-                     json.dumps(e.get("context_bets", []), ensure_ascii=False)))
+                     json.dumps(ctx_bets_enriched, ensure_ascii=False)))
             inserted += 1
         except Exception:
             pass
@@ -3412,8 +3440,14 @@ async function loadContexts(){
     const rub = c.amount_rub ? fmtMoney(c.amount_rub) + ' ₽' : '';
     const msgs = (c.context_messages||[]).slice(-15); const bets = (c.context_bets||[]).slice(-5);
     const mH = msgs.length ? msgs.map((m,i)=>'<div style="padding:4px 8px;border-left:3px solid #2a2f3a;margin:4px 0;color:#aab;font-size:12px">'+(i+1)+'. '+esc(m)+'</div>').join('') : '<div class="hint">—</div>';
-    const bH = bets.length ? bets.map(b=>'<div style="padding:4px 8px;border-left:3px solid #71d68a;margin:4px 0;color:#71d68a;font-size:12px">🎰 <b>'+esc(b.sender||'?')+'</b> · '+esc(b.game||'')+' · '+esc(b.multiplier||'')+' · '+esc(b.amount_text||'')+' '+esc(b.crypto_symbol||'')+'</div>').join('') : '<div class="hint">—</div>';
-    return '<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px;margin-bottom:12px">'
+    const bH = bets.length ? bets.map(b=>{
+      const amt = esc(b.amount_text||'');
+      const sym = esc(b.crypto_symbol||'');
+      const rub = (b.amount_rub||0) > 0 ? ' <span style="color:#4ade80">~'+Math.round(b.amount_rub)+'₽</span>' : '';
+      const usd = (b.amount_usd||0) > 0 ? ' <span style="color:#8ab4f8">$'+b.amount_usd.toFixed(2)+'</span>' : '';
+      const win = b.outcome === 'win' ? '' : (b.outcome === 'loss' ? ' <span style="color:#f87171">(loss)</span>' : '');
+      return '<div style="padding:4px 8px;border-left:3px solid #71d68a;margin:4px 0;color:#71d68a;font-size:12px">🎰 <b>'+esc(b.sender||'?')+'</b> · '+esc(b.game||'')+' · '+esc(b.multiplier||'')+' · '+amt+' '+sym+rub+usd+win+'</div>';
+    }).join('') : '<div class="hint">—</div>';    return '<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px;margin-bottom:12px">'
       + '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px">'
       + '<span class="pill">🌧 RAIN</span><b>'+esc(c.chat)+'</b>'
       + '<span class="hint">'+(c.ts?fmtTime(c.ts):esc(c.created_at))+'</span>'
