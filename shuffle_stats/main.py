@@ -3312,7 +3312,21 @@ async function refreshStatus(){
       else if(['error','timeout','verify_error','chat_not_loaded'].includes(i.status)) cls+=' err';
       const upd = i.updated_at ? Math.round(now - i.updated_at)+'с' : '—';
       const tr = document.createElement('tr');
-      tr.innerHTML = '<td>'+i.iid+'</td><td>'+esc(i.mode||'')+'</td><td><b>'+esc(i.current_chat||'—')+'</b></td><td><span class="'+cls+'">'+esc(txt)+'</span></td><td>'+upd+'</td><td><button class="btn" onclick="reqShot('+i.iid+')">📸</button></td>';
+      const chats = i.chats || [];
+const cur = i.current_chat || '—';
+let chatsCell;
+if (i.mode === 'rotation' && chats.length > 0) {
+  // Показываем все чаты, текущий — жирным
+  chatsCell = chats.map(c => c === cur
+    ? '<b style="color:#71d68a">' + esc(c) + '</b>'
+    : '<span class="hint">' + esc(c) + '</span>'
+  ).join(' → ');
+} else if (i.mode === 'rotation') {
+  chatsCell = '<b>' + esc(cur) + '</b>';
+} else {
+  chatsCell = '<b>' + esc(cur) + '</b>';
+}
+tr.innerHTML = '<td>'+i.iid+'</td><td>'+esc(i.mode||'')+'</td><td>'+chatsCell+'</td><td><span class="'+cls+'">'+esc(txt)+'</span></td><td>'+upd+'</td><td><button class="btn" onclick="reqShot('+i.iid+')">📸</button></td>';
       body.appendChild(tr);
     });
   } catch(e){}
