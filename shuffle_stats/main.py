@@ -738,6 +738,30 @@ def _recalc_amounts(amount_text, amount_type, crypto_symbol):
     return value, value / ur * uu
 
 
+def _enrich_receivers_info_from_db(chat_name, receivers_info):
+    """Заменяет last_seen в receivers_info на актуальный из БД."""
+    if not receivers_info:
+        return
+    now_ts = time.time()
+    for r in receivers_info:
+        name = (r or {}).get("name")
+        if not name:
+            continue
+        try:
+            row = query_one("SELECT last_seen FROM chat_players WHERE username=? AND chat=?",
+                            (name, chat_name))
+        except Exception:
+            continue
+        if row and row.get("last_seen"):
+            ls = float(row["last_seen"])
+            js_ls = float(r.get("last_msg_ts") or 0)
+            if ls > js_ls:
+                r["last_msg_ts"] = ls
+                r["minutes_ago"] = int((now_ts - ls) / 60)
+                r["wrote_in_25min"] = (now_ts - ls) <= 25 * 60
+                r["in_chat_only"] = False
+
+
 # ==================== API SCRIPT ====================
 @app.post("/api/event")
 async def add_event(event: EventIn, x_api_key: str = Header(default="")):
@@ -755,6 +779,8 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
                      event.amount_text, ts_val))
     if dup:
         return {"ok": True, "dup": True}
+    if event.type == "rain" and event.receivers_info:
+        _enrich_receivers_info_from_db(event.chat, event.receivers_info)
     rub = event.amount_rub or 0.0
     usd = event.amount_usd or 0.0
     if rub == 0 or usd == 0:
@@ -788,6 +814,8 @@ async def events_batch(payload: dict, x_api_key: str = Header(default="")):
     inserted = 0
     for e in events:
         try:
+            if e.get("type") == "rain" and e.get("receivers_info"):
+                _enrich_receivers_info_from_db(e.get("chat"), e.get("receivers_info"))
             rub = float(e.get("amount_rub") or 0)
             usd = float(e.get("amount_usd") or 0)
             if rub == 0 or usd == 0:
@@ -2501,6 +2529,14 @@ async def clear_database(body: dict, x_api_key: str = Header(default="")):
     else:
         execute("DELETE FROM events;")
     return {"ok": True, "message": "Все данные удалены"}
+
+
+@app.get("/api/chats_with_rains")
+async def api_chats_with_rains(days: int = 90):
+    """Список чатов, где был хотя бы один дождь за N дней."""
+    since = time.time() - days * 86400
+    rows = query_all("SELECT DISTINCT chat FROM events WHERE type='rain' AND ts >= ?", (since,))
+    return {"chats": [r["chat"] for r in rows if r.get("chat")]}
 
 
 @app.get("/api/chats_with_rains")
