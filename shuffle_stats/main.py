@@ -918,11 +918,9 @@ async def clear_bets_top(hard: int = 0, x_api_key: str = Header(default="")):
 
 
 @app.post("/api/bets_to_rains/clear")
-async def clear_bets_to_rains(x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY:
-        raise HTTPException(401, "Invalid API key")
+async def clear_bets_to_rains():
     meta_set("bets_to_rains_cleared_at", time.time())
-    return {"ok": True}
+    return {"ok": True, "cleared_at": time.time()}
 
 
 @app.post("/api/intent")
@@ -1362,11 +1360,15 @@ def promo_parser_thread():
 
 
 @app.get("/api/promocodes")
-async def api_promocodes(only_unused: Optional[int] = None, limit: int = 200):
+async def api_promocodes(only_unused: Optional[int] = None,
+                         only_used: Optional[int] = None,
+                         limit: int = 200):
     q = "SELECT * FROM promocodes WHERE 1=1"
     p = []
     if only_unused == 1:
         q += " AND used = 0"
+    if only_used == 1:
+        q += " AND used = 1"
     q += " ORDER BY discovered_at DESC LIMIT ?"
     p.append(limit)
     return {"promos": query_all(q, tuple(p))}
@@ -2858,6 +2860,38 @@ tr.rubric-row td{background:#2a2410 !important}
 .cal-day .num{font-size:14px;font-weight:600;color:#e6e6e6}
 .cal-day .cnt{color:#8ab4f8;font-size:11px;margin-top:2px}
 .cal-day .rain{color:#71d68a;font-size:11px}
+/* === Промокоды === */
+.promo-card{background:#151821;border:1px solid #232a37;border-radius:8px;padding:12px 16px;margin-bottom:10px}
+.promo-card.used{opacity:.55;border-color:#2a2f3a}
+.promo-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap}
+.promo-date{color:#8b93a7;font-size:12px}
+.promo-text{white-space:pre-wrap;font-size:13px;line-height:1.5;color:#e6e6e6;margin-bottom:10px;font-family:inherit}
+.promo-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.promo-actions a{color:#7cc4ff;font-size:12px;text-decoration:none}
+.promo-actions a:hover{text-decoration:underline}
+
+/* === Языки / Игроки === */
+.lang-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+.lang-card{background:#151821;border:1px solid #232a37;border-radius:8px;padding:12px 16px}
+.lang-card h4{margin:0 0 6px;color:#fff;font-size:14px}
+.player-row{padding:3px 0;color:#aab;font-size:12px;border-top:1px solid #1e2430}
+.player-row:first-of-type{border-top:none;margin-top:6px;padding-top:6px}
+
+/* === AI === */
+.ai-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.ai-col h3{margin:0 0 8px;font-size:13px;color:#8ab4f8;text-transform:uppercase}
+.ai-msg,.ai-phrase{padding:8px 12px;background:#151821;border:1px solid #232a37;border-radius:6px;margin-bottom:6px;cursor:pointer;font-size:13px;user-select:none}
+.ai-msg:hover,.ai-phrase:hover{border-color:#4a7ce0;background:#1a1f2b}
+.ai-msg.copied,.ai-phrase.copied{border-color:#71d68a;background:#162a1e}
+
+/* === Ставки (чатовые) === */
+tr.bet-row.chat td{background:rgba(197,138,249,.06)}
+tr.bet-row.chat:hover td{background:rgba(197,138,249,.12)}
+
+/* === Модалка скриншота === */
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center;z-index:99;cursor:zoom-out}
+.modal.on{display:flex}
+.modal img{max-width:92vw;max-height:92vh;border-radius:8px;box-shadow:0 8px 40px rgba(0,0,0,.6)}
 </style></head><body>
 <header>
   <h1>🎰 Shuffle Monitor</h1>
@@ -3002,15 +3036,20 @@ tr.rubric-row td{background:#2a2410 !important}
     </tr></thead>
     <tbody id="intBody"></tbody></table></div>
 
-  <div id="tab-promos" style="display:none">
-    <div class="row-flex">
-      <select id="promoFilter"><option value="">Все</option><option value="0">Неиспользованные</option><option value="1">Использованные</option></select>
-      <button class="btn" onclick="loadPromos()">Обновить</button>
-      <button class="btn" onclick="testPromo()">🔍 Проверить</button>
-      <span class="hint" id="promoStats"></span>
-    </div>
-    <div id="promoList"></div></div>
-
+<div id="tab-promos" style="display:none">
+  <div class="row-flex">
+    <select id="promoFilter" onchange="loadPromos()">
+      <option value="">Все</option>
+      <option value="0">Неиспользованные</option>
+      <option value="1">Использованные</option>
+    </select>
+    <button class="btn" onclick="loadPromos()">Обновить</button>
+    <button class="btn" onclick="testPromo(event)">🔍 Проверить канал</button>
+    <span class="hint" id="promoStats"></span>
+  </div>
+  <div id="promoList"></div>
+  
+</div>
   <div id="tab-calendar" style="display:none">
     <div class="vault-card">
       <h3>📅 Календарь</h3>
@@ -3468,18 +3507,87 @@ async function loadChart(){
 
 async function loadPromos(){
   const filter = $('promoFilter').value;
-  const p = new URLSearchParams(); if(filter === '0') p.set('only_unused','1');
-  const r = await fetch('/api/promocodes?'+p).then(r=>r.json());
-  const stats = await fetch('/api/promocodes/stats').then(r=>r.json());
-  $('promoStats').textContent = 'Всего: '+stats.total+' | Исп: '+stats.used+' | Осталось: '+stats.unused;
+  const p = new URLSearchParams();
+  if (filter === '0') p.set('only_unused','1');
+  if (filter === '1') p.set('only_used','1');
+
+  let r, stats;
+  try {
+    const [rr, ss] = await Promise.all([
+      fetch('/api/promocodes?'+p).then(x=>x.json()),
+      fetch('/api/promocodes/stats').then(x=>x.json()),
+    ]);
+    r = rr; stats = ss;
+  } catch(e){
+    $('promoList').innerHTML = '<p class="hint">❌ Ошибка: '+esc(e.message)+'</p>';
+    return;
+  }
+  $('promoStats').textContent = `Всего: ${stats.total||0} | Исп: ${stats.used||0} | Осталось: ${stats.unused||0}`;
+
   const el = $('promoList');
-  if(!r.promos.length){ el.innerHTML = '<p class="hint">Пусто</p>'; return; }
-  el.innerHTML = r.promos.map(x=>'<div class="promo-card '+(x.used?'used':'')+'"><div class="promo-body"><div class="promo-text">'+esc(x.text)+'</div></div></div>').join('');
+  if (!r.promos || !r.promos.length){
+    el.innerHTML = '<p class="hint">Пусто</p>';
+    return;
+  }
+  el.innerHTML = r.promos.map(x => {
+    const usedClass = x.used ? 'used' : '';
+    const dateStr = x.discovered_at
+      ? new Date(x.discovered_at*1000).toLocaleString('ru-RU')
+      : (x.message_date || '—');
+    const linkHtml = x.link
+      ? `<a href="${esc(x.link)}" target="_blank" rel="noopener">🔗 Открыть в TG</a>`
+      : '';
+    const toggleLabel = x.used ? '↩️ Вернуть' : '✅ Использован';
+    const vaultBtn = x.used_for_vault
+      ? `<span class="pill ok">💎 В хранилище $${(x.vault_amount_usd||0).toFixed(2)}</span>`
+      : `<button class="btn blue" onclick="promoToVault(${x.id})">💎 В хранилище</button>`;
+    const statusPill = x.used
+      ? '<span class="pill warn">Использован</span>'
+      : '<span class="pill ok">Активен</span>';
+    return `<div class="promo-card ${usedClass}">
+      <div class="promo-head">
+        <span class="promo-date">📅 ${esc(dateStr)}</span>
+        ${statusPill}
+      </div>
+      <div class="promo-text">${esc(x.text)}</div>
+      <div class="promo-actions">
+        ${linkHtml}
+        <button class="btn" onclick="promoToggle(${x.id})">${toggleLabel}</button>
+        ${vaultBtn}
+      </div>
+    </div>`;
+  }).join('');
 }
-async function testPromo(){
-  const btn = event.target; btn.disabled=true; btn.textContent='⏳';
-  try { const r = await fetch('/api/promo/test',{method:'POST'}).then(r=>r.json()); alert('Найдено: '+r.found+', новых: '+r.new); loadPromos(); }
-  catch(e){ alert('Ошибка'); } finally { btn.disabled=false; btn.textContent='🔍 Проверить'; }
+
+async function promoToggle(id){
+  try {
+    const r = await fetch('/api/promo/toggle/'+id, {method:'POST'}).then(x=>x.json());
+    if (r.ok) loadPromos();
+  } catch(e){ alert('Ошибка: '+e.message); }
+}
+
+async function promoToVault(id){
+  const amt = prompt('Сумма в USD:', '0');
+  if (amt === null) return;
+  const currency = (prompt('Валюта (USD/USDT):', 'USD') || 'USD').toUpperCase();
+  try {
+    const r = await fetch('/api/promo/to_vault/'+id, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({amount_usd: parseFloat(amt)||0, currency})
+    }).then(x=>x.json());
+    if (r.ok) loadPromos();
+  } catch(e){ alert('Ошибка: '+e.message); }
+}
+async function testPromo(ev){
+  const btn = (ev && ev.target) || document.querySelector('button[onclick*="testPromo"]');
+  if (btn){ btn.disabled=true; btn.textContent='⏳'; }
+  try {
+    const r = await fetch('/api/promo/test',{method:'POST'}).then(x=>x.json());
+    alert('Найдено: '+r.found+', новых: '+r.new);
+    loadPromos();
+  } catch(e){ alert('Ошибка: '+e.message); }
+  finally { if (btn){ btn.disabled=false; btn.textContent='🔍 Проверить канал'; } }
 }
 
 async function loadActivityDashboard(){
@@ -3761,7 +3869,11 @@ pollDeployInfo();
 setInterval(refreshStatus, 5000);
 setInterval(pollNgrok, 10000);
 setInterval(pollDeployInfo, 30000);
-</script></body></html>
+</script>
+<div class="modal" id="imgModal" onclick="this.classList.remove('on')">
+  <img id="imgModalImg" src="" alt="screenshot">
+</div>
+</body></html>
 """
 
 
