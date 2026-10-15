@@ -718,11 +718,7 @@ def _recalc_amounts(amount_text, amount_type, crypto_symbol):
     return value, value / ur * uu
 
 
-def _enrich_receivers_info_from_db(chat_name, receivers_info):
-    if not receivers_info:
-        return
-    now_ts = time.time()
-    for r in redef _enrich_receivers_info_from_db(chat_name, receivers_info, event_ts=None):
+def _enrich_receivers_info_from_db(chat_name, receivers_info, event_ts=None):
     """Обогащает receivers_info данными из player_message_ticks.
     Считает 'minutes_ago' ОТНОСИТЕЛЬНО event_ts (времени дождя), а не сейчас.
     Берём последнее сообщение игрока ДО момента дождя (ts <= event_ts).
@@ -749,8 +745,7 @@ def _enrich_receivers_info_from_db(chat_name, receivers_info):
         except Exception:
             pass
 
-        # 2. Если в тиках нет — фолбэк на chat_players.last_seen,
-        #    но только если оно МЕНЬШЕ event_ts (т.е. сообщение было до дождя)
+        # 2. Фолбэк на chat_players.last_seen, если оно МЕНЬШЕ event_ts
         if tick_ts is None:
             try:
                 crow = query_one("SELECT last_seen, msg_count FROM chat_players WHERE username=? AND chat=?",
@@ -770,7 +765,6 @@ def _enrich_receivers_info_from_db(chat_name, receivers_info):
             r["wrote_in_25min"] = min_ago <= 25
             r["in_chat_only"] = False
         else:
-            # Игрок вообще не писал до этого дождя — оставляем как есть
             if r.get("minutes_ago") is None:
                 r["wrote_in_25min"] = False
 
