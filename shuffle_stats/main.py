@@ -913,6 +913,15 @@ async def clear_bets_to_rains(x_api_key: str = Header(default="")):
     return {"ok": True}
 
 
+
+@app.post("/api/bets_to_rains/clear")
+async def clear_bets_to_rains(x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
+    meta_set("bets_to_rains_cleared_at", time.time())
+    return {"ok": True}
+
+
 @app.post("/api/intent")
 async def add_intent(body: IntentIn, x_api_key: str = Header(default="")):
     if x_api_key != API_KEY:
@@ -2658,6 +2667,7 @@ async def page_home():
       <div class="card"><h3>Раздали всего</h3><div class="big">{fmt_rub(tr or 0)}</div></div>
       <div class="card"><h3>Чаевых</h3><div class="big">{tips}</div></div>
       <div class="card"><h3>Чаевых сумма</h3><div class="big">{fmt_rub(ttr or 0)}</div></div>
+      
     </div>
     <div class="grid" style="margin-top:16px">
       <div class="card"><h3>Последний деплой сервера</h3><div id="deployBlock" class="big" style="font-size:16px">—</div></div>
@@ -2666,7 +2676,6 @@ async def page_home():
     <script>
       function esc(s){{return (s==null?'':String(s)).replace(/[<>&"]/g,c=>({{'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}}[c]));}}
       function fmtR(v){{return (v||0).toFixed(0);}}
-      async function loadOnce() {{ const r = await fetch('/api/stats'); const d = await r.json(); renderRecent(d.recent); }}
       async function loadDeployInfo() {{
         try {{
           const r = await fetch('/api/server_info').then(r=>r.json());
@@ -2678,6 +2687,8 @@ async def page_home():
             + '<div class="muted" style="font-size:12px;margin-top:4px">commit: <b>' + (r.git_commit||'?') + '</b> · branch: ' + (r.git_branch||'-') + '</div>';
         }} catch(e) {{}}
       }}
+      async function loadOnce() {{ const r = await fetch('/api/stats'); const d = await r.json(); renderRecent(d.recent); }}
+
       function renderRecent(rows) {{
         const el = document.getElementById('recent'); if (!rows) return;
         el.innerHTML = rows.map(r => {{
