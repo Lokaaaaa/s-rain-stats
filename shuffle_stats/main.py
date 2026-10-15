@@ -25,6 +25,12 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = "openai/gpt-oss-20b"
 MY_NICK = os.environ.get("MY_NICK", "Merami")
 
+# --- Инфо о деплое ---
+SERVER_START_TS = time.time()
+SERVER_GIT_COMMIT = (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "?"
+SERVER_GIT_BRANCH = os.environ.get("RENDER_GIT_BRANCH") or "-"
+SERVER_SERVICE_NAME = os.environ.get("RENDER_SERVICE_NAME") or "?"
+
 _default_screenshots = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", _default_screenshots)
 try:
@@ -673,32 +679,6 @@ DEFAULT_LOG_FILTER = {
 
 
 # ==================== РАСЧЁТ ====================
-def _enrich_context_bets(ctx_bets):
-    """Добавляет amount_rub / amount_usd в context_bets для отображения."""
-    out = []
-    for b in (ctx_bets or []):
-        if not isinstance(b, dict):
-            continue
-        b = dict(b)
-        if (b.get("amount_rub") or 0) and (b.get("amount_usd") or 0):
-            out.append(b)
-            continue
-        txt = b.get("amount_text", "") or ""
-        sym = b.get("crypto_symbol", "") or ""
-        has_fiat = any(m in txt for m in ("₽", "$", "€", "£", "₴", "₸", "₺"))
-        atype = "fiat" if has_fiat else ("crypto" if sym else "fiat")
-        try:
-            cr, cu = _recalc_amounts(txt, atype, sym)
-        except Exception:
-            cr, cu = 0.0, 0.0
-        if not b.get("amount_rub"):
-            b["amount_rub"] = cr
-        if not b.get("amount_usd"):
-            b["amount_usd"] = cu
-        out.append(b)
-    return out
-
-
 def _recalc_amounts(amount_text, amount_type, crypto_symbol):
     txt = amount_text or ""
     crypto = (crypto_symbol or "").upper().strip()
@@ -739,7 +719,8 @@ def _recalc_amounts(amount_text, amount_type, crypto_symbol):
 
 
 def _enrich_receivers_info_from_db(chat_name, receivers_info):
-    """Заменяет last_seen в receivers_info на актуальный из БД."""
+    """Обогащает receivers_info актуальным last_seen из chat_players.
+    Берём самое СВЕЖЕЕ (меньшее minutes_ago) из JS и БД."""
     if not receivers_info:
         return
     now_ts = time.time()
@@ -748,18 +729,23 @@ def _enrich_receivers_info_from_db(chat_name, receivers_info):
         if not name:
             continue
         try:
-            row = query_one("SELECT last_seen FROM chat_players WHERE username=? AND chat=?",
+            row = query_one("SELECT last_seen, msg_count FROM chat_players WHERE username=? AND chat=?",
                             (name, chat_name))
         except Exception:
             continue
         if row and row.get("last_seen"):
             ls = float(row["last_seen"])
-            js_ls = float(r.get("last_msg_ts") or 0)
-            if ls > js_ls:
+            js_min = r.get("minutes_ago")
+            srv_min = int((now_ts - ls) / 60)
+            # Берём самое свежее
+            if js_min is None or srv_min < js_min:
                 r["last_msg_ts"] = ls
-                r["minutes_ago"] = int((now_ts - ls) / 60)
-                r["wrote_in_25min"] = (now_ts - ls) <= 25 * 60
+                r["minutes_ago"] = srv_min
+                r["wrote_in_25min"] = srv_min <= 25
                 r["in_chat_only"] = False
+            # Обновляем total_msgs если сервер знает больше
+            if (row.get("msg_count") or 0) > (r.get("total_msgs") or 0):
+                r["total_msgs"] = row["msg_count"]
 
 
 # ==================== API SCRIPT ====================
@@ -790,7 +776,6 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
         if not usd:
             usd = cu
     p = ph()
-    ctx_bets_enriched = _enrich_context_bets(event.context_bets)
     execute(f"""INSERT INTO events
                 (type,chat,sender,receivers,receivers_info,amount_text,amount_type,
                  crypto_symbol,amount_rub,amount_usd,created_at,ts,
@@ -802,7 +787,7 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
              event.amount_text, event.amount_type, event.crypto_symbol,
              rub, usd, created, ts_val,
              json.dumps(event.context_messages or [], ensure_ascii=False),
-             json.dumps(ctx_bets_enriched, ensure_ascii=False)))
+             json.dumps(event.context_bets or [], ensure_ascii=False)))
     return {"ok": True}
 
 
@@ -827,7 +812,6 @@ async def events_batch(payload: dict, x_api_key: str = Header(default="")):
                 if not usd:
                     usd = cu
             p = ph()
-            ctx_bets_enriched = _enrich_context_bets(e.get("context_bets", []))
             execute(f"""INSERT INTO events
                         (type,chat,sender,receivers,receivers_info,amount_text,amount_type,
                          crypto_symbol,amount_rub,amount_usd,created_at,ts,
@@ -842,7 +826,7 @@ async def events_batch(payload: dict, x_api_key: str = Header(default="")):
                                             tz=timezone.utc).isoformat(),
                      e.get("ts", time.time()),
                      json.dumps(e.get("context_messages", []), ensure_ascii=False),
-                     json.dumps(ctx_bets_enriched, ensure_ascii=False)))
+                     json.dumps(e.get("context_bets", []), ensure_ascii=False)))
             inserted += 1
         except Exception:
             pass
@@ -918,6 +902,14 @@ async def add_bet(body: BetIn, x_api_key: str = Header(default="")):
 @app.post("/api/bets/clear_top")
 async def clear_bets_top():
     meta_set("bets_top_cleared_at", time.time())
+    return {"ok": True}
+
+
+@app.post("/api/bets_to_rains/clear")
+async def clear_bets_to_rains(x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
+    meta_set("bets_to_rains_cleared_at", time.time())
     return {"ok": True}
 
 
@@ -1180,6 +1172,16 @@ async def post_moderator_message(body: ModeratorMessageIn, x_api_key: str = Head
     if x_api_key != API_KEY:
         raise HTTPException(401, "Invalid API key")
     ts_val = body.ts or time.time()
+
+    # Дедупликация: не пишем то же самое сообщение от того же юзера в том же чате
+    # в течение 5 минут
+    dup = query_one("""SELECT id FROM moderator_messages
+                       WHERE username=? AND chat=? AND text=?
+                       AND ABS(ts-?) < 300 LIMIT 1""",
+                    (body.username, body.chat, body.text, ts_val))
+    if dup:
+        return {"ok": True, "dup": True}
+
     p = ph()
     execute(f"""INSERT INTO moderator_messages (ts,username,chat,text)
                 VALUES ({p},{p},{p},{p})""",
@@ -1828,12 +1830,27 @@ async def api_rain_activity(hours: int = 24, limit: int = 100, chat: Optional[st
         rinfo_sorted = sorted(rinfo, key=lambda x: (-(x.get("total_msgs") or 0)))
         top20 = rinfo_sorted[:20]
         won = MY_NICK in recs
+
+        # Merami статус: ищем в receivers_info, если нет — в chat_players
         my_rec = next((x for x in rinfo if x.get("name") == MY_NICK), None)
+        my_minutes = my_rec.get("minutes_ago") if my_rec else None
+        my_was_active = bool(my_rec and my_rec.get("wrote_in_25min"))
+        if my_minutes is None:
+            try:
+                crow = query_one("SELECT last_seen FROM chat_players WHERE username=? AND chat=?",
+                                 (MY_NICK, r["chat"]))
+                if crow and crow.get("last_seen"):
+                    my_minutes = int((time.time() - float(crow["last_seen"])) / 60)
+                    my_was_active = my_minutes <= 60
+            except Exception:
+                pass
+
         merami = {
             "won": won,
             "pos": (recs.index(MY_NICK) + 1) if won else None,
-            "minutes_ago": my_rec.get("minutes_ago") if my_rec else None,
-            "was_active": bool(my_rec and my_rec.get("wrote_in_25min")),
+            "minutes_ago": my_minutes,
+            "was_active": my_was_active,
+            "in_receivers": bool(my_rec),
         }
         out.append({
             "id": r["id"], "ts": r["ts"], "chat": r["chat"], "sender": r["sender"],
@@ -1849,10 +1866,52 @@ async def api_rain_activity(hours: int = 24, limit: int = 100, chat: Optional[st
     return {"hours": hours, "count": len(out), "rains": out}
 
 
+@app.get("/api/chats_with_rains")
+async def api_chats_with_rains(days: int = 90):
+    since = time.time() - days * 86400
+    rows = query_all("SELECT DISTINCT chat FROM events WHERE type='rain' AND ts >= ?", (since,))
+    return {"chats": [r["chat"] for r in rows if r.get("chat")]}
+
+
+@app.get("/api/server_info")
+async def api_server_info():
+    started = datetime.fromtimestamp(SERVER_START_TS, tz=timezone.utc)
+    return {
+        "started_at": SERVER_START_TS,
+        "started_at_str": started.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "uptime_sec": int(time.time() - SERVER_START_TS),
+        "git_commit": SERVER_GIT_COMMIT,
+        "git_branch": SERVER_GIT_BRANCH,
+        "service_name": SERVER_SERVICE_NAME,
+        "now_ts": time.time(),
+    }
+
+
+@app.get("/api/db_stats")
+async def api_db_stats():
+    tables = ["events", "bets", "intents", "bulk_alerts", "player_activity",
+              "chat_players", "player_message_ticks", "moderator_messages",
+              "moderators", "promocodes", "chat_tasks"]
+    out = {}
+    for t in tables:
+        try:
+            r = query_one(f"SELECT COUNT(*) AS c FROM {t}")
+            out[t] = r["c"] if r else 0
+        except Exception:
+            out[t] = None
+    # События по типам
+    try:
+        rains = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='rain'") or {}).get("c", 0)
+        tips = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='tip'") or {}).get("c", 0)
+    except Exception:
+        rains = tips = 0
+    return {"tables": out, "rains": rains, "tips": tips, "now": time.time()}
+
+
 @app.get("/api/daily_report")
 async def api_daily_report(date: str):
     if not HAS_DOCX:
-        raise HTTPException(503, "python-docx не установлен. Добавь python-docx в requirements.txt")
+        raise HTTPException(503, "python-docx не установлен")
     try:
         dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         start = dt.timestamp()
@@ -2405,6 +2464,9 @@ async def api_players_by_language():
 async def api_bets_to_rains(window_sec: int = BET_TO_RAIN_WINDOW_SEC,
                              last_hours: Optional[int] = None):
     since = time.time() - (last_hours * 3600 if last_hours else 7 * 86400)
+    cleared = float(meta_get("bets_to_rains_cleared_at") or 0)
+    since = max(since, cleared)
+
     bets = query_all("""SELECT id,ts,sender FROM bets
                         WHERE ts>=? AND COALESCE(amount_usd,0)>=20
                         ORDER BY ts ASC""", (since,))
@@ -2431,7 +2493,7 @@ async def api_bets_to_rains(window_sec: int = BET_TO_RAIN_WINDOW_SEC,
         arr.append({"nickname": nick, "bets": d["bets"],
                     "triggered": d["triggered"], "percent": round(pct, 1)})
     arr.sort(key=lambda x: (-x["percent"], -x["bets"]))
-    return {"stats": arr[:200], "window_sec": window_sec}
+    return {"stats": arr[:200], "window_sec": window_sec, "cleared_at": cleared}
 
 
 @app.get("/api/bets")
@@ -2531,22 +2593,6 @@ async def clear_database(body: dict, x_api_key: str = Header(default="")):
     return {"ok": True, "message": "Все данные удалены"}
 
 
-@app.get("/api/chats_with_rains")
-async def api_chats_with_rains(days: int = 90):
-    """Список чатов, где был хотя бы один дождь за N дней."""
-    since = time.time() - days * 86400
-    rows = query_all("SELECT DISTINCT chat FROM events WHERE type='rain' AND ts >= ?", (since,))
-    return {"chats": [r["chat"] for r in rows if r.get("chat")]}
-
-
-@app.get("/api/chats_with_rains")
-async def api_chats_with_rains(days: int = 90):
-    """Список чатов, где был хотя бы один дождь за N дней."""
-    since = time.time() - days * 86400
-    rows = query_all("SELECT DISTINCT chat FROM events WHERE type='rain' AND ts >= ?", (since,))
-    return {"chats": [r["chat"] for r in rows if r.get("chat")]}
-
-
 # ==================== HTML ====================
 BASE_HTML = """<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2613,11 +2659,25 @@ async def page_home():
       <div class="card"><h3>Чаевых</h3><div class="big">{tips}</div></div>
       <div class="card"><h3>Чаевых сумма</h3><div class="big">{fmt_rub(ttr or 0)}</div></div>
     </div>
+    <div class="grid" style="margin-top:16px">
+      <div class="card"><h3>Последний деплой сервера</h3><div id="deployBlock" class="big" style="font-size:16px">—</div></div>
+    </div>
     <div class="card" style="margin-top:16px"><h3>Последние события</h3><div id="recent"></div></div>
     <script>
       function esc(s){{return (s==null?'':String(s)).replace(/[<>&"]/g,c=>({{'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}}[c]));}}
       function fmtR(v){{return (v||0).toFixed(0);}}
       async function loadOnce() {{ const r = await fetch('/api/stats'); const d = await r.json(); renderRecent(d.recent); }}
+      async function loadDeployInfo() {{
+        try {{
+          const r = await fetch('/api/server_info').then(r=>r.json());
+          const started = new Date(r.started_at * 1000);
+          const upMin = Math.round(r.uptime_sec / 60);
+          const ago = upMin < 60 ? upMin + 'м' : Math.floor(upMin/60) + 'ч ' + (upMin % 60) + 'м';
+          document.getElementById('deployBlock').innerHTML =
+            started.toLocaleString('ru-RU') + ' <span class="muted">(' + ago + ' назад)</span>'
+            + '<div class="muted" style="font-size:12px;margin-top:4px">commit: <b>' + (r.git_commit||'?') + '</b> · branch: ' + (r.git_branch||'-') + '</div>';
+        }} catch(e) {{}}
+      }}
       function renderRecent(rows) {{
         const el = document.getElementById('recent'); if (!rows) return;
         el.innerHTML = rows.map(r => {{
@@ -2631,6 +2691,7 @@ async def page_home():
         }}).join('');
       }}
       loadOnce(); setInterval(loadOnce, 15000);
+      loadDeployInfo(); setInterval(loadDeployInfo, 30000);
     </script>"""
     return BASE_HTML.format(title="Shuffle Rain Stats", active_home="active",
                             active_hosts="", active_receivers="", content=content)
@@ -2641,7 +2702,7 @@ async def page_receivers():
     content = """
     <div class="card">
       <h3 style="display:flex;align-items:center;gap:6px">🎯 Топ активных получателей
-        <span class="hint-btn" data-hint="Кто чаще всего получает дожди.&#10;Активный = писал в том же чате за 25 мин до дождя.&#10;&#10;% = active_wins / known_wins (только свежие события с receivers_info).&#10;&#10;Клик по столбцу → сортировка.">?</span></h3>
+        <span class="hint-btn" data-hint="Кто чаще всего получает дожди.&#10;Активный = писал в том же чате за 25 мин до дождя.">?</span></h3>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
         <select id="rtMetric" onchange="loadReceiversTop()"><option value="total">По сумме ₽</option><option value="count">По кол-ву</option><option value="active_percent">По % активных</option></select>
         <select id="rtLimit" onchange="loadReceiversTop()"><option value="20">Топ-20</option><option value="50">Топ-50</option><option value="100" selected>Топ-100</option><option value="200">Топ-200</option><option value="500">Все</option></select>
@@ -2723,80 +2784,16 @@ async def page_hosts():
             return "<tr><td colspan='4' class='muted'>Пусто</td></tr>"
         html = ""
         for i, r in enumerate(rows, 1):
-            nick = r['nickname'].replace("'", "\\'")
-            html += f"""<tr><td>{i}</td><td><a href="#" onclick="openProfile('{nick}');return false"><b>{r['nickname']}</b></a></td><td>{r['cnt']}</td><td class="amount">{fmt_rub(r['total'])}</td></tr>"""
+            html += f"""<tr><td>{i}</td><td><b>{r['nickname']}</b></td><td>{r['cnt']}</td><td class="amount">{fmt_rub(r['total'])}</td></tr>"""
         return html
 
     content = f"""
     <div class="grid" style="grid-template-columns: 1fr 1fr">
-      <div class="card"><h3>🌧 Раздал дождей — по сумме<span class="hint-btn" data-hint="Кто раздал больше всего ₽ за дожди.">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r1)}</tbody></table></div>
-      <div class="card"><h3>🌧 Раздал дождей — по кол-ву<span class="hint-btn" data-hint="Кто чаще всего делал дожди.">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r2)}</tbody></table></div>
-      <div class="card"><h3>💸 Отправил чаевых — по сумме<span class="hint-btn" data-hint="Кто отправил больше всего ₽ в чаевых.">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t1)}</tbody></table></div>
-      <div class="card"><h3>💸 Отправил чаевых — по кол-ву<span class="hint-btn" data-hint="Кто чаще всего отправлял чаевые.">?</span></h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t2)}</tbody></table></div>
-    </div>
-    <div id="profileModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);align-items:center;justify-content:center;z-index:50;padding:20px">
-      <div style="background:#161b22;border:1px solid #26303a;border-radius:12px;max-width:700px;width:100%;padding:24px;max-height:80vh;overflow-y:auto">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-          <h2 id="profName" style="margin:0;color:#7cc4ff"></h2>
-          <button onclick="document.getElementById('profileModal').style.display='none'">✕</button>
-        </div>
-        <div style="margin-bottom:12px"><label class="muted" style="font-size:12px">Язык:</label>
-          <select id="profLang" style="margin-left:8px">
-            <option>ENGLISH</option><option>RUSSIAN</option><option>JAPANESE</option><option>TURKISH</option>
-            <option>SPANISH</option><option>PORTUGUESE</option><option>FRENCH</option><option>KOREAN</option>
-            <option>CHINESE</option><option>POLISH</option><option>VIETNAMESE</option><option>INDONESIAN</option>
-          </select>
-        </div>
-        <div style="margin-bottom:12px"><label class="muted" style="font-size:12px">Описание:</label>
-          <textarea id="profDesc" style="width:100%;background:#0d1117;color:#e6e6e6;border:1px solid #30363d;padding:8px;border-radius:5px;margin-top:6px;min-height:80px"></textarea>
-        </div>
-        <div style="margin-bottom:16px"><label class="muted" style="font-size:12px"><input type="checkbox" id="profTop"> Добавить в watch-list</label></div>
-        <div id="profContent"></div>
-        <button onclick="saveProfile()" style="background:#2563eb;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-weight:600">💾 Сохранить</button>
-      </div>
-    </div>
-    <script>
-      let currentNick = null;
-      async function openProfile(nick) {{
-        currentNick = nick;
-        document.getElementById('profileModal').style.display = 'flex';
-        document.getElementById('profName').textContent = nick;
-        const [prof, bets, msgs, activity] = await Promise.all([
-          fetch('/api/profile/' + encodeURIComponent(nick)).then(r=>r.json()),
-          fetch('/api/bets?sender=' + encodeURIComponent(nick) + '&limit=20').then(r=>r.json()),
-          fetch('/api/player?username=' + encodeURIComponent(nick) + '&limit=15').then(r=>r.json()),
-          fetch('/api/player/activity?username=' + encodeURIComponent(nick) + '&windows=15,25,60,1440').then(r=>r.json()).catch(()=>({{}}))
-        ]);
-        document.getElementById('profLang').value = prof.profile.lang || 'ENGLISH';
-        document.getElementById('profDesc').value = prof.profile.description || '';
-        document.getElementById('profTop').checked = !!prof.profile.is_top;
-        const wins = (activity.windows || [15,25,60,1440]);
-        const lbl = w => w === 1440 ? '24ч' : (w === 60 ? '1ч' : (w + 'м'));
-        const actRow = wins.map(w => '<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:8px 14px;min-width:100px">'
-          + '<span class="muted" style="font-size:11px">За ' + lbl(w) + '</span>'
-          + '<b style="display:block;font-size:18px;color:' + (((activity.total||{{}})[w]>0)?'#4ade80':'#666') + '">' + ((activity.total||{{}})[w]||0) + '</b></div>').join('');
-        const chatsAct = (activity.chats||[]).slice(0,12).map(c => {{
-          const cells = wins.map(w => '<td style="text-align:center;color:' + ((c.counts[w]>0)?'#4ade80':'#555') + '">' + (c.counts[w]||0) + '</td>').join('');
-          return '<tr><td><b>' + c.chat + '</b></td>' + cells + '</tr>';
-        }}).join('');
-        const actHtml = (activity.chats && activity.chats.length) ? '<table><thead><tr><th>Чат</th>' + wins.map(w=>'<th style="text-align:center">'+lbl(w)+'</th>').join('') + '</tr></thead><tbody>' + chatsAct + '</tbody></table>' : '<div class="muted">Нет данных</div>';
-        const betsHtml = (bets.bets||[]).map(b => '<div style="padding:6px 10px;border-left:3px solid #71d68a;margin:4px 0;font-size:12px">🎰 ' + b.game + ' · ' + b.multiplier + ' · ' + b.amount_text + ' ' + (b.crypto||'') + ' (~$' + (b.amount_usd||0).toFixed(2) + ')</div>').join('') || '<div class="muted">Нет ставок</div>';
-        const msgsHtml = (msgs.rows||[]).map(m => '<div style="padding:4px 8px;border-left:3px solid #2a2f3a;margin:4px 0;font-size:12px"><b>' + m.chat + '</b>: ' + m.text + '</div>').join('') || '<div class="muted">Нет сообщений</div>';
-        document.getElementById('profContent').innerHTML =
-          '<h4 class="muted" style="font-size:12px;margin:16px 0 8px">📊 Активность</h4>'
-          + '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px">' + actRow + '</div>'
-          + actHtml
-          + '<h4 class="muted" style="font-size:12px;margin:16px 0 8px">Последние ставки</h4>' + betsHtml
-          + '<h4 class="muted" style="font-size:12px;margin:16px 0 8px">Последние сообщения</h4>' + msgsHtml;
-      }}
-      async function saveProfile() {{
-        if(!currentNick) return;
-        const body = {{ lang: document.getElementById('profLang').value, description: document.getElementById('profDesc').value, is_top: document.getElementById('profTop').checked }};
-        await fetch('/api/profile/' + encodeURIComponent(currentNick), {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body)}});
-        if(body.is_top) {{ await fetch('/api/watchlist/add', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{name: currentNick}})}}); }}
-        alert('Сохранено');
-      }}
-    </script>"""
+      <div class="card"><h3>🌧 Раздал дождей — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r1)}</tbody></table></div>
+      <div class="card"><h3>🌧 Раздал дождей — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(r2)}</tbody></table></div>
+      <div class="card"><h3>💸 Отправил чаевых — по сумме</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t1)}</tbody></table></div>
+      <div class="card"><h3>💸 Отправил чаевых — по кол-ву</h3><table><thead><tr><th>#</th><th>Ник</th><th>Кол-во</th><th>Сумма</th></tr></thead><tbody>{table(t2)}</tbody></table></div>
+    </div>"""
     return BASE_HTML.format(title="Shuffle — Раздающие", active_home="",
                             active_hosts="active", active_receivers="", content=content)
 
@@ -2828,7 +2825,6 @@ tr:hover td{background:#161a22}
 .pill.err{background:#3a1f1f;color:#e07a7a}
 .pill.chat{background:#2a1f3a;color:#c58af9}
 .pill.rubric{background:#3a2f1f;color:#e0c66a}
-.pill.mod{background:#3a1f2f;color:#f472b6}
 .btn{background:#2a3340;color:#e6e6e6;border:1px solid #334055;padding:5px 10px;border-radius:5px;cursor:pointer;font-size:12px}
 .btn:hover{background:#334055}
 .btn.danger{background:#3a1f1f;border-color:#7f1d1d}
@@ -2843,28 +2839,6 @@ input,select,textarea{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;
 .kpi{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
 .kpi div{background:#151821;border:1px solid #232a37;border-radius:8px;padding:10px 16px;min-width:140px}
 .kpi b{display:block;font-size:20px;color:#8ab4f8;margin-top:2px}
-.chips{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
-.chip{background:#2a3340;color:#e6e6e6;padding:4px 8px;border-radius:14px;font-size:12px;display:inline-flex;align-items:center;gap:6px}
-.chip .x{color:#f87171;cursor:pointer;font-weight:bold}
-.bet-row{color:#71d68a}
-.bet-row.chat{color:#c58af9}
-.promo-card{background:#151821;border:1px solid #232a37;border-radius:8px;padding:12px 16px;margin-bottom:10px;display:flex;gap:12px;align-items:flex-start}
-.promo-card.used{opacity:0.5}
-.promo-card.vaulted{border-color:#2d5a3a}
-.promo-cb{width:22px;height:22px;cursor:pointer;accent-color:#71d68a}
-.promo-body{flex:1}
-.promo-text{white-space:pre-wrap;font-size:13px;line-height:1.5}
-.promo-meta{font-size:11px;color:#8b93a7;margin-top:6px}
-.ai-grid{display:grid;grid-template-columns:2fr 1fr;gap:16px}
-.ai-col{background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px}
-.ai-msg{padding:10px 12px;background:#1a1f28;border-left:3px solid #7cc4ff;border-radius:4px;margin-bottom:8px;font-size:13px;cursor:pointer}
-.ai-msg.copied{border-left-color:#71d68a;background:#1e3a26}
-.ai-phrase{padding:8px 12px;background:#1a1f28;border-left:3px solid #c58af9;border-radius:4px;margin-bottom:6px;font-size:13px;cursor:pointer}
-.ai-phrase.copied{border-left-color:#71d68a;background:#1e3a26}
-.lang-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:14px}
-.lang-card{background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px}
-.lang-card h4{margin:0 0 8px;font-size:13px;color:#8ab4f8}
-.lang-card .player-row{display:flex;padding:4px 0;font-size:12px;border-bottom:1px solid #1e232e}
 .recv-wrap{max-width:420px;font-size:12px}
 .recv-visible{color:#aab}
 .recv-hidden{display:none;color:#aab}
@@ -2872,9 +2846,6 @@ input,select,textarea{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;
 tr.rubric-row td{background:#2a2410 !important}
 .vault-card{background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px 18px;margin-bottom:12px}
 .vault-card h3{margin:0 0 10px;font-size:13px;color:#8ab4f8;text-transform:uppercase}
-.vault-amount{color:#71d68a;font-weight:600}
-.vault-warn{color:#fbbf24}
-.vault-danger{color:#f87171}
 .hint-btn{display:inline-block;width:18px;height:18px;line-height:18px;text-align:center;border-radius:50%;
   background:#1e88e5;color:#fff;font-size:12px;cursor:help;margin-left:8px;font-weight:bold;
   position:relative;vertical-align:middle;flex-shrink:0;user-select:none;border:none;padding:0}
@@ -2883,26 +2854,12 @@ tr.rubric-row td{background:#2a2410 !important}
   background:#1a1f28;color:#e6e6e6;border:1px solid #2f3d55;border-radius:8px;padding:14px;
   font-size:12px;font-weight:normal;line-height:1.6;z-index:1000;white-space:pre-wrap;
   box-shadow:0 8px 30px rgba(0,0,0,.8);text-align:left;pointer-events:none}
-.balance-grid{display:grid;grid-template-columns:1fr 60px 1fr;gap:12px;align-items:start}
-.balance-col{background:#10131a;border:1px solid #232a37;border-radius:8px;padding:12px}
-.balance-col h4{margin:0 0 10px;font-size:12px;color:#8ab4f8;text-transform:uppercase;display:flex;justify-content:space-between;align-items:center}
-.balance-total{font-size:16px;color:#71d68a;font-weight:600}
-.balance-row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #1a1f28;font-size:13px}
-.balance-cur{font-weight:600}
-.transfer-arrow{display:flex;flex-direction:column;justify-content:center;align-items:center;padding-top:40px}
-.autocomplete-wrap{position:relative;display:inline-block}
-.autocomplete-list{position:absolute;top:100%;left:0;right:0;background:#1a1f28;border:1px solid #2f3d55;
-  border-radius:0 0 6px 6px;max-height:200px;overflow-y:auto;z-index:100;display:none}
-.autocomplete-list.on{display:block}
-.autocomplete-list div{padding:6px 10px;cursor:pointer;font-size:13px}
-.autocomplete-list div:hover,.autocomplete-list div.sel{background:#2f3d55;color:#fff}
 .calendar-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;max-width:560px}
 .cal-day{background:#10131a;border:1px solid #232a37;border-radius:6px;padding:6px;text-align:center;cursor:pointer;min-height:56px;font-size:11px}
 .cal-day:hover{border-color:#4a7ce0}
 .cal-day .num{font-size:14px;font-weight:600;color:#e6e6e6}
 .cal-day .cnt{color:#8ab4f8;font-size:11px;margin-top:2px}
 .cal-day .rain{color:#71d68a;font-size:11px}
-.cal-day.empty{opacity:.3;cursor:default}
 </style></head><body>
 <header>
   <h1>🎰 Shuffle Monitor</h1>
@@ -2915,24 +2872,26 @@ tr.rubric-row td{background:#2a2410 !important}
     <button class="btn danger" onclick="controlAction('stop')" title="Стоп">⛔</button>
   </div>
   <span class="pill" id="ngrokUrl" style="cursor:pointer" onclick="copyNgrok()">🌐 ngrok: —</span>
+  <span class="pill" id="deployInfo" title="Деплой">🚀 —</span>
 </header>
 <div class="tabs">
-  <button data-tab="status" class="active">Вкладки<span class="hint-btn" data-hint="Состояние всех Chrome-инстансов.&#10;📸 — сделать скриншот.">?</span></button>
-  <button data-tab="events">События<span class="hint-btn" data-hint="Дожди и типсы.&#10;&#10;Клик по столбцу → сортировка.&#10;₽/чел = сколько каждому получателю.">?</span></button>
-  <button data-tab="bulk">Bulk-раздачи<span class="hint-btn" data-hint="Одинаковая сумма 3+ людям за 20 мин.&#10;📌 Рубрика — отметить.">?</span></button>
-  <button data-tab="bets">Ставки<span class="hint-btn" data-hint="Выигрышные ставки:&#10;📊 — из таблицы ставок&#10;💬 — из чата.">?</span></button>
-  <button data-tab="betsrains">Ставки→Дожди<span class="hint-btn" data-hint="Сколько % ставок (≥$20) были за 15 мин ДО дождя (любого).">?</span></button>
-  <button data-tab="contexts">Контексты<span class="hint-btn" data-hint="Дожди с контекстом: 15 сообщений + 5 ставок до дождя.">?</span></button>
-  <button data-tab="intents">Интенты<span class="hint-btn" data-hint="Обещания сделать дождь (Groq AI).">?</span></button>
-  <button data-tab="promos">Промокоды<span class="hint-btn" data-hint="Парсится из TG-канала.">?</span></button>
-  <button data-tab="calendar">📅 Календарь<span class="hint-btn" data-hint="Просмотр по дням + docx отчёт.">?</span></button>
-  <button data-tab="chart">📈 Графики<span class="hint-btn" data-hint="Распределение событий по часам суток.">?</span></button>
-  <button data-tab="activity">📊 Активность<span class="hint-btn" data-hint="Watchlist игроки по чатам + Merami + Rain Activity.">?</span></button>
-  <button data-tab="mods">🛡 Модераторы<span class="hint-btn" data-hint="Все сообщения с иконкой модератора.">?</span></button>
-  <button data-tab="me">👤 Мой профиль<span class="hint-btn" data-hint="Мой профиль + хранилище + балансы.">?</span></button>
-  <button data-tab="ai">🤖 AI<span class="hint-btn" data-hint="AI читает чат и предлагает фразы.">?</span></button>
-  <button data-tab="players">👥 Игроки<span class="hint-btn" data-hint="Все игроки по чатам.">?</span></button>
-  <button data-tab="langs">🌍 Языки<span class="hint-btn" data-hint="Редактор языков игрока.">?</span></button>
+  <button data-tab="status" class="active">Вкладки</button>
+  <button data-tab="events">События</button>
+  <button data-tab="bulk">Bulk</button>
+  <button data-tab="bets">Ставки</button>
+  <button data-tab="betsrains">Ставки→Дожди</button>
+  <button data-tab="contexts">Контексты</button>
+  <button data-tab="intents">Интенты</button>
+  <button data-tab="promos">Промокоды</button>
+  <button data-tab="calendar">📅 Календарь</button>
+  <button data-tab="chart">📈 Графики</button>
+  <button data-tab="activity">📊 Активность</button>
+  <button data-tab="mods">🛡 Модераторы</button>
+  <button data-tab="me">👤 Профиль</button>
+  <button data-tab="ai">🤖 AI</button>
+  <button data-tab="players">👥 Игроки</button>
+  <button data-tab="langs">🌍 Языки</button>
+  <button data-tab="db">🗄 БД</button>
 </div>
 <main>
   <div id="tab-status"><div class="kpi" id="kpiRow"></div>
@@ -2944,41 +2903,21 @@ tr.rubric-row td{background:#2a2410 !important}
       <input type="text" id="fSender" placeholder="Отправитель">
       <select id="fChat"><option value="">Все чаты</option></select>
       <select id="fType"><option value="">Все</option><option value="tip">Tip</option><option value="rain">Rain</option></select>
-      <select id="fRange"><option value="">Всё</option><option value="1">1 час</option><option value="24">24 часа</option><option value="168">7 дней</option></select>
+      <select id="fRange"><option value="">Всё</option><option value="1">1 час</option><option value="24" selected>24 часа</option><option value="168">7 дней</option><option value="720">Месяц</option></select>
       <button class="btn" onclick="loadEvents()">Фильтр</button>
     </div>
     <table id="tbl-events"><thead><tr>
-      <th class="sortable" onclick="sortTable('tbl-events',0)">Время ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-events',1)">Тип ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-events',2)">Чат ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-events',3)">От ⇅</th>
+      <th class="sortable" onclick="sortTable('tbl-events',0)">Время</th>
+      <th class="sortable" onclick="sortTable('tbl-events',1)">Тип</th>
+      <th class="sortable" onclick="sortTable('tbl-events',2)">Чат</th>
+      <th class="sortable" onclick="sortTable('tbl-events',3)">От</th>
       <th>Кому</th>
-      <th class="sortable" onclick="sortTable('tbl-events',5)">Сумма ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-events',6)">₽ ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-events',7)">₽/чел ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-events',8)">$ ⇅</th>
+      <th class="sortable" onclick="sortTable('tbl-events',5)">Сумма</th>
+      <th class="sortable" onclick="sortTable('tbl-events',6)">₽</th>
+      <th class="sortable" onclick="sortTable('tbl-events',7)">₽/чел</th>
+      <th class="sortable" onclick="sortTable('tbl-events',8)">$</th>
     </tr></thead>
     <tbody id="evBody"></tbody></table></div>
-
-  <div id="tab-bulk" style="display:none">
-    <div class="row-flex">
-      <input type="text" id="bSenderInput" placeholder="Ник + Enter" style="width:180px">
-      <button class="btn" onclick="addBulkChip()">+ Добавить</button>
-      <button class="btn" onclick="clearBulkChips()">Очистить</button>
-    </div>
-    <div class="chips" id="bulkChips"></div>
-    <table id="tbl-bulk"><thead><tr>
-      <th class="sortable" onclick="sortTable('tbl-bulk',0)">Время ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-bulk',1)">Чат ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-bulk',2)">От ⇅</th>
-      <th>Сумма</th>
-      <th class="sortable" onclick="sortTable('tbl-bulk',4)">₽/чел ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-bulk',5)">₽ всего ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-bulk',6)">Получателей ⇅</th>
-      <th>Кому</th>
-      <th>Действие</th>
-    </tr></thead>
-    <tbody id="bulkBody"></tbody></table></div>
 
   <div id="tab-bets" style="display:none">
     <div class="row-flex">
@@ -2986,22 +2925,22 @@ tr.rubric-row td{background:#2a2410 !important}
       <select id="betChat"><option value="">Все чаты</option></select>
       <select id="betSource"><option value="">Все</option><option value="bets_page">Таблица</option><option value="chat">Чат</option></select>
       <input type="number" id="betMinUsd" placeholder="Мин. $" value="50">
-      <select id="betRange"><option value="">Всё</option><option value="24" selected>24 часа</option><option value="168">7 дней</option></select>
+      <select id="betRange"><option value="">Всё</option><option value="1">1 час</option><option value="24" selected>24 часа</option><option value="168">7 дней</option><option value="720">Месяц</option></select>
       <button class="btn" onclick="loadBets()">Фильтр</button>
       <button class="btn" onclick="loadBetsTop()">🏆 Топ</button>
-      <button class="btn danger" onclick="clearBetsTop()">🗑 Очистить</button>
+      <button class="btn danger" onclick="clearBetsTop()">🗑 Очистить топ</button>
     </div>
     <div id="betStats" style="margin-bottom:16px"></div>
     <table id="tbl-bets"><thead><tr>
-      <th class="sortable" onclick="sortTable('tbl-bets',0)">Время ⇅</th>
+      <th class="sortable" onclick="sortTable('tbl-bets',0)">Время</th>
       <th>Источник</th>
-      <th class="sortable" onclick="sortTable('tbl-bets',2)">Чат ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-bets',3)">Игрок ⇅</th>
+      <th class="sortable" onclick="sortTable('tbl-bets',2)">Чат</th>
+      <th class="sortable" onclick="sortTable('tbl-bets',3)">Игрок</th>
       <th>Игра</th>
       <th>Множ.</th>
       <th>Сумма</th>
-      <th class="sortable" onclick="sortTable('tbl-bets',7)">$ ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-bets',8)">₽ ⇅</th>
+      <th class="sortable" onclick="sortTable('tbl-bets',7)">$</th>
+      <th class="sortable" onclick="sortTable('tbl-bets',8)">₽</th>
     </tr></thead>
     <tbody id="betsBody"></tbody></table></div>
 
@@ -3010,16 +2949,31 @@ tr.rubric-row td{background:#2a2410 !important}
       <input type="number" id="b2rWindow" value="900" style="width:100px">
       <span class="hint">сек — окно до дождя</span>
       <button class="btn" onclick="loadBetsToRains()">Обновить</button>
+      <button class="btn danger" onclick="clearBetsToRains()">🗑 Очистить</button>
     </div>
     <div id="b2rStats" style="margin-bottom:16px"></div>
     <table id="tbl-b2r"><thead><tr>
       <th>#</th>
-      <th class="sortable" onclick="sortTable('tbl-b2r',1)">Ник ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-b2r',2)">Ставок ≥$20 ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-b2r',3)">Привели к дождю ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-b2r',4)">% ⇅</th>
+      <th class="sortable" onclick="sortTable('tbl-b2r',1)">Ник</th>
+      <th class="sortable" onclick="sortTable('tbl-b2r',2)">Ставок ≥$20</th>
+      <th class="sortable" onclick="sortTable('tbl-b2r',3)">Привели к дождю</th>
+      <th class="sortable" onclick="sortTable('tbl-b2r',4)">%</th>
     </tr></thead>
     <tbody id="b2rBody"></tbody></table></div>
+
+  <div id="tab-bulk" style="display:none">
+    <table id="tbl-bulk"><thead><tr>
+      <th class="sortable" onclick="sortTable('tbl-bulk',0)">Время</th>
+      <th class="sortable" onclick="sortTable('tbl-bulk',1)">Чат</th>
+      <th class="sortable" onclick="sortTable('tbl-bulk',2)">От</th>
+      <th>Сумма</th>
+      <th class="sortable" onclick="sortTable('tbl-bulk',4)">₽/чел</th>
+      <th class="sortable" onclick="sortTable('tbl-bulk',5)">₽ всего</th>
+      <th class="sortable" onclick="sortTable('tbl-bulk',6)">Получателей</th>
+      <th>Кому</th>
+      <th>Действие</th>
+    </tr></thead>
+    <tbody id="bulkBody"></tbody></table></div>
 
   <div id="tab-contexts" style="display:none">
     <div class="row-flex">
@@ -3039,13 +2993,13 @@ tr.rubric-row td{background:#2a2410 !important}
     </div>
     <div id="intStats" style="margin-bottom:16px"></div>
     <table id="tbl-intents"><thead><tr>
-      <th class="sortable" onclick="sortTable('tbl-intents',0)">Время ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-intents',1)">Чат ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-intents',2)">Игрок ⇅</th>
+      <th class="sortable" onclick="sortTable('tbl-intents',0)">Время</th>
+      <th class="sortable" onclick="sortTable('tbl-intents',1)">Чат</th>
+      <th class="sortable" onclick="sortTable('tbl-intents',2)">Игрок</th>
       <th>Текст</th>
-      <th class="sortable" onclick="sortTable('tbl-intents',4)">AI% ⇅</th>
+      <th class="sortable" onclick="sortTable('tbl-intents',4)">AI%</th>
       <th>Статус</th>
-      <th class="sortable" onclick="sortTable('tbl-intents',6)">Δ сек ⇅</th>
+      <th class="sortable" onclick="sortTable('tbl-intents',6)">Δ сек</th>
     </tr></thead>
     <tbody id="intBody"></tbody></table></div>
 
@@ -3060,7 +3014,7 @@ tr.rubric-row td{background:#2a2410 !important}
 
   <div id="tab-calendar" style="display:none">
     <div class="vault-card">
-      <h3>📅 Календарь <span class="hint-btn" data-hint="Клик по дню → топ раздающих и получателей.&#10;📄 Скачать docx — отчёт за день.">?</span></h3>
+      <h3>📅 Календарь</h3>
       <div class="row-flex">
         <input type="date" id="docxDate">
         <button class="btn green" onclick="downloadDocx()">📄 Скачать docx</button>
@@ -3074,7 +3028,7 @@ tr.rubric-row td{background:#2a2410 !important}
     <div class="row-flex">
       <select id="cType"><option value="">Всё</option><option value="tip">Tip</option><option value="rain">Rain</option></select>
       <select id="cChat"><option value="">Все чаты</option></select>
-      <select id="cRange"><option value="">Всё время</option><option value="24" selected>24 часа</option><option value="168">7 дней</option></select>
+      <select id="cRange"><option value="">Всё время</option><option value="1">1 час</option><option value="24" selected>24 часа</option><option value="168">7 дней</option><option value="720">Месяц</option></select>
       <button class="btn" onclick="loadChart()">Обновить</button>
     </div>
     <div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:16px;margin-bottom:16px"><canvas id="hourCount" height="90"></canvas></div>
@@ -3115,7 +3069,7 @@ tr.rubric-row td{background:#2a2410 !important}
       <div class="row-flex" style="justify-content:space-between;margin-bottom:0">
         <h3 style="margin:0">👤 Мой профиль</h3>
         <div class="row-flex" style="margin:0">
-          <input type="text" id="meNick" placeholder="Твой ник (напр. Merami)" style="width:200px">
+          <input type="text" id="meNick" placeholder="Ник" style="width:200px">
           <button class="btn green" onclick="loadMe()">🔎 Проверить</button>
           <button class="btn" onclick="saveMeNick()">💾 Запомнить</button>
           <span class="hint" id="meStatus"></span>
@@ -3123,10 +3077,8 @@ tr.rubric-row td{background:#2a2410 !important}
       </div>
       <div id="meTop"></div>
     </div>
-
-    <div class="vault-card"><h3>📊 Активность по чатам</h3><div id="meActivity"></div></div>
-    <div class="vault-card">
-      <h3>🏆 Мои выигранные дожди</h3>
+    <div class="vault-card"><h3>📊 Активность</h3><div id="meActivity"></div></div>
+    <div class="vault-card"><h3>🏆 Мои дожди</h3>
       <div class="row-flex">
         <select id="meRainDays" onchange="loadMeRains()" style="max-width:160px">
           <option value="7">7 дней</option><option value="30" selected>30 дней</option><option value="90">90 дней</option>
@@ -3135,67 +3087,7 @@ tr.rubric-row td{background:#2a2410 !important}
       </div>
       <div id="meRains"></div>
     </div>
-    <div class="vault-card"><h3>🎰 Мои последние ставки</h3><div id="meBets"></div></div>
-
-    <div id="vaultKpi" class="kpi"></div>
-    <div id="vaultWagerCard" class="vault-card"></div>
-
-    <div class="vault-card">
-      <h3>💼 Балансы <span class="hint-btn" data-hint="Аккаунт слева, хранилище справа, стрелки — перевод.">?</span></h3>
-      <div class="balance-grid">
-        <div class="balance-col">
-          <h4>💰 Аккаунт <span class="balance-total" id="accTotal">$0</span></h4>
-          <div id="accBalances"></div>
-          <div class="row-flex" style="margin-top:10px">
-            <div class="autocomplete-wrap"><input type="text" id="accCur" placeholder="Валюта" style="width:130px" autocomplete="off"></div>
-            <input type="number" id="accAmt" placeholder="Сумма" step="any" style="width:100px">
-            <button class="btn green" onclick="setAccBalance()">💾</button>
-          </div>
-        </div>
-        <div class="transfer-arrow">
-          <button class="btn blue" title="В хранилище" onclick="doTransfer('to_vault')">→</button>
-          <button class="btn blue" title="Из хранилища" onclick="doTransfer('to_account')" style="margin-top:8px">←</button>
-          <div style="margin-top:8px;color:#666;font-size:10px">перевод</div>
-        </div>
-        <div class="balance-col">
-          <h4>🏦 Хранилище <span class="balance-total" id="vaultTotal">$0</span></h4>
-          <div id="vaultBalances"></div>
-        </div>
-      </div>
-    </div>
-
-    <div class="vault-card"><h3>⚙️ Вейджер</h3>
-      <div class="row-flex">
-        <input type="number" id="wgAmount" placeholder="$ сумма" step="any" style="width:140px">
-        <input type="datetime-local" id="wgDeadline">
-        <button class="btn green" onclick="saveWager()">💾 Сохранить</button>
-      </div></div>
-
-    <div class="vault-card"><h3>🎯 Цель накопления</h3>
-      <div class="row-flex">
-        <input type="number" id="goalUsd" placeholder="$ цель" step="any" style="width:140px">
-        <input type="text" id="goalText" placeholder="Описание" style="width:280px">
-        <button class="btn green" onclick="saveGoal()">💾 Сохранить</button>
-      </div></div>
-
-    <div class="vault-card"><h3>➕ Транзакция</h3>
-      <div class="row-flex">
-        <select id="txType">
-          <option value="income">💰 Получил $</option>
-          <option value="wager_spend">🎲 Потратил на вейджер</option>
-          <option value="vault_add">📥 Убрал в хранилище</option>
-          <option value="vault_take">📤 Взял из хранилища</option>
-        </select>
-        <div class="autocomplete-wrap"><input type="text" id="txCurrency" placeholder="Валюта" style="width:120px" autocomplete="off" value="USDT"></div>
-        <input type="number" id="txAmount" placeholder="Сумма" step="any" style="width:120px">
-        <input type="number" id="txAmountUsd" placeholder="$ (auto)" step="any" style="width:140px">
-        <input type="text" id="txDesc" placeholder="Описание" style="width:220px">
-        <button class="btn green" onclick="addTransaction()">➕</button>
-      </div></div>
-
-    <div class="vault-card"><h3>📜 Транзакции</h3>
-      <table><thead><tr><th>Время</th><th>Тип</th><th>Валюта</th><th>Сумма</th><th>$</th><th>Описание</th></tr></thead>
-      <tbody id="txList"></tbody></table></div>
+    <div class="vault-card"><h3>🎰 Мои ставки</h3><div id="meBets"></div></div>
   </div>
 
   <div id="tab-ai" style="display:none">
@@ -3212,15 +3104,15 @@ tr.rubric-row td{background:#2a2410 !important}
     <div class="row-flex">
       <select id="plChatFilter"><option value="">Все чаты</option></select>
       <input type="text" id="plUserFilter" placeholder="Ник">
-      <label style="font-size:12px;color:#aab"><input type="checkbox" id="plOnlineOnly"> Только онлайн</label>
+      <label style="font-size:12px;color:#aab"><input type="checkbox" id="plOnlineOnly"> Онлайн</label>
       <button class="btn" onclick="loadPlayersTab()">Обновить</button>
     </div>
     <div id="plChatsSummary" style="margin-bottom:16px"></div>
     <table id="tbl-players"><thead><tr>
-      <th class="sortable" onclick="sortTable('tbl-players',0)">Чат ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-players',1)">Игрок ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-players',2)">Сообщений ⇅</th>
-      <th class="sortable" onclick="sortTable('tbl-players',3)">Последний раз ⇅</th>
+      <th class="sortable" onclick="sortTable('tbl-players',0)">Чат</th>
+      <th class="sortable" onclick="sortTable('tbl-players',1)">Игрок</th>
+      <th class="sortable" onclick="sortTable('tbl-players',2)">Сообщений</th>
+      <th class="sortable" onclick="sortTable('tbl-players',3)">Последний раз</th>
       <th>Статус</th><th>Действие</th>
     </tr></thead>
     <tbody id="plPlayersBody"></tbody></table></div>
@@ -3230,31 +3122,25 @@ tr.rubric-row td{background:#2a2410 !important}
       <input type="text" id="langFilter" placeholder="Поиск по нику">
       <button class="btn" onclick="loadLanguages()">Обновить</button>
     </div>
-    <div class="hint" style="margin-bottom:12px">Клик по игроку → откроется редактор чатов.</div>
     <div id="langGrid" class="lang-grid"></div></div>
-</main>
-<div class="modal" id="imgModal" onclick="this.classList.remove('on')"><img id="imgModalImg" src=""></div>
-<div class="modal" id="langEditModal">
-  <div style="background:#161b22;border:1px solid #26303a;border-radius:12px;max-width:600px;width:100%;padding:24px" onclick="event.stopPropagation()">
-    <h3 style="margin:0 0 16px;color:#7cc4ff" id="langEditName"></h3>
-    <div class="hint" style="margin-bottom:12px">Отметь чаты:</div>
-    <div id="langCheckboxes" style="display:grid;grid-template-columns:1fr 1fr;gap:8px"></div>
-    <div class="row-flex" style="margin-top:16px">
-      <button class="btn green" onclick="saveLangEdit()">💾 Сохранить</button>
-      <button class="btn" onclick="document.getElementById('langEditModal').classList.remove('on')">Отмена</button>
-      <span class="hint" id="langEditStatus"></span>
+
+  <div id="tab-db" style="display:none">
+    <div class="vault-card">
+      <h3>🚀 Деплой</h3>
+      <div id="dbDeploy">—</div>
+    </div>
+    <div class="vault-card">
+      <h3>🗄 База данных</h3>
+      <div id="dbStats">—</div>
     </div>
   </div>
-</div>
+</main>
 
 <script>
 const $ = id => document.getElementById(id);
 const fmtTime = ts => new Date(ts*1000).toLocaleString('ru-RU');
 const fmtMoney = v => (v||0).toLocaleString('ru-RU',{maximumFractionDigits:2});
 const esc = s => (s==null?'':String(s)).replace(/[<>&"]/g, c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
-
-const CURRENCIES = ["USDT","USDC","BTC","ETH","SOL","LTC","DOGE","XRP","TRX","BNB","SHIB","SHFL","POL","MATIC","AVAX","TON","GRAM","BONK","WIF","PUMP","TRUMP","DAI","CASH","USD"];
-const ALL_CHATS = ["ENGLISH","RUSSIAN","JAPANESE","TURKISH","FRENCH","SPANISH","PORTUGUESE","KOREAN","VIETNAMESE","POLISH","INDONESIAN","CHINESE"];
 
 function sortTable(tableId, colIdx) {
   const table = document.getElementById(tableId);
@@ -3274,37 +3160,6 @@ function sortTable(tableId, colIdx) {
   rows.forEach(r => tb.appendChild(r));
 }
 
-function attachAutocomplete(inputEl) {
-  if (!inputEl) return;
-  inputEl.setAttribute('autocomplete','off');
-  const wrap = inputEl.parentElement;
-  if (!wrap.classList.contains('autocomplete-wrap')) return;
-  let list = wrap.querySelector('.autocomplete-list');
-  if (!list) { list = document.createElement('div'); list.className = 'autocomplete-list'; wrap.appendChild(list); }
-  let idx = -1;
-  function render(q) {
-    const qq = (q||'').toUpperCase();
-    const matches = qq ? CURRENCIES.filter(c => c.startsWith(qq)) : CURRENCIES;
-    if (!matches.length) { list.classList.remove('on'); return; }
-    list.innerHTML = matches.slice(0,8).map((c,i) => '<div data-c="'+c+'" class="'+(i===0?'sel':'')+'">'+c+'</div>').join('');
-    list.classList.add('on'); idx = 0;
-  }
-  inputEl.addEventListener('input', () => render(inputEl.value));
-  inputEl.addEventListener('focus', () => render(inputEl.value));
-  inputEl.addEventListener('blur', () => setTimeout(()=>{list.classList.remove('on');}, 150));
-  inputEl.addEventListener('keydown', (e) => {
-    const items = list.querySelectorAll('div');
-    if (!items.length || !list.classList.contains('on')) return;
-    if (e.key === 'ArrowDown') { idx = Math.min(idx+1, items.length-1); items.forEach((el,i)=>el.classList.toggle('sel', i===idx)); e.preventDefault(); }
-    else if (e.key === 'ArrowUp') { idx = Math.max(idx-1, 0); items.forEach((el,i)=>el.classList.toggle('sel', i===idx)); e.preventDefault(); }
-    else if (e.key === 'Enter' || e.key === 'Tab') { if (idx>=0 && items[idx]) { inputEl.value = items[idx].dataset.c; list.classList.remove('on'); e.preventDefault(); } }
-    else if (e.key === 'Escape') { list.classList.remove('on'); }
-  });
-  list.addEventListener('mousedown', (e) => { const t = e.target.closest('div[data-c]'); if (t) { inputEl.value = t.dataset.c; list.classList.remove('on'); } });
-}
-
-let bulkChips = [], aiPollTimer = null;
-
 function renderReceivers(recs, collapseAfter) {
   recs = recs || [];
   if (!recs.length) return '<span class="hint">—</span>';
@@ -3318,7 +3173,7 @@ function renderReceivers(recs, collapseAfter) {
 
 function switchTab(name){
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
-  ['status','events','bulk','bets','betsrains','contexts','intents','promos','calendar','chart','ai','players','langs','me','mods','activity'].forEach(t=>{
+  ['status','events','bulk','bets','betsrains','contexts','intents','promos','calendar','chart','ai','players','langs','me','mods','activity','db'].forEach(t=>{
     const el = $('tab-'+t); if(el) el.style.display = (t===name) ? '' : 'none';
   });
   if(name==='events') { loadChats(); loadEvents(); }
@@ -3330,12 +3185,13 @@ function switchTab(name){
   if(name==='promos') loadPromos();
   if(name==='calendar') loadCalendar();
   if(name==='chart') { loadChats(); loadChart(); }
-  if(name==='me') { loadVault(); loadMe(); }
+  if(name==='me') loadMe();
   if(name==='ai') { loadChats(); loadAILatest(); }
   if(name==='players') { loadChats(); loadPlayersTab(); }
   if(name==='langs') loadLanguages();
   if(name==='mods') loadModerators();
   if(name==='activity') loadActivityDashboard();
+  if(name==='db') loadDb();
 }
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 
@@ -3345,32 +3201,27 @@ async function refreshStatus(){
     $('uptime').textContent = r.first_ts ? 'с ' + new Date(r.first_ts*1000).toLocaleDateString('ru-RU') : '—';
     $('kpiTotal').textContent = `Всего: ${r.total||0} | Tips: ${r.tips||0} | Rains: ${r.rains||0} | Bets: ${r.bets||0} | Intents: ${r.intents||0}`;
     const now = Date.now()/1000;
-    $('kpiRow').innerHTML = '<div>Всего событий<b>'+(r.total||0)+'</b></div><div>Tips<b>'+(r.tips||0)+'</b></div><div>Rains<b>'+(r.rains||0)+'</b></div><div>Bets<b>'+(r.bets||0)+'</b></div><div>Intents<b>'+(r.intents||0)+'</b></div><div>Онлайн инстансов<b>'+(r.instances||[]).filter(i=>now-(i.updated_at||0)<40).length+'</b></div>';
+    $('kpiRow').innerHTML = '<div>Всего<b>'+(r.total||0)+'</b></div><div>Tips<b>'+(r.tips||0)+'</b></div><div>Rains<b>'+(r.rains||0)+'</b></div><div>Bets<b>'+(r.bets||0)+'</b></div><div>Intents<b>'+(r.intents||0)+'</b></div><div>Онлайн<b>'+(r.instances||[]).filter(i=>now-(i.updated_at||0)<90).length+'</b></div>';
     const body = $('instBody'); body.innerHTML = '';
     (r.instances||[]).forEach(i=>{
-      const online = now - (i.updated_at||0) < 40;
+      const online = now - (i.updated_at||0) < 90;
       let cls='pill', txt=i.status||'—';
       if(!online){ cls+=' err'; txt='offline'; }
       else if(i.status==='ok') cls+=' ok';
-      else if(i.status==='waiting'||i.status==='rotating') cls+=' warn';
+      else if(i.status==='waiting'||i.status==='rotating'||i.status==='busy') cls+=' warn';
       else if(['error','timeout','verify_error','chat_not_loaded'].includes(i.status)) cls+=' err';
       const upd = i.updated_at ? Math.round(now - i.updated_at)+'с' : '—';
-      const tr = document.createElement('tr');
+      // Список чатов для ротации
+      let chatsCell = '<b>' + esc(i.current_chat||'—') + '</b>';
       const chats = i.chats || [];
-const cur = i.current_chat || '—';
-let chatsCell;
-if (i.mode === 'rotation' && chats.length > 0) {
-  // Показываем все чаты, текущий — жирным
-  chatsCell = chats.map(c => c === cur
-    ? '<b style="color:#71d68a">' + esc(c) + '</b>'
-    : '<span class="hint">' + esc(c) + '</span>'
-  ).join(' → ');
-} else if (i.mode === 'rotation') {
-  chatsCell = '<b>' + esc(cur) + '</b>';
-} else {
-  chatsCell = '<b>' + esc(cur) + '</b>';
-}
-tr.innerHTML = '<td>'+i.iid+'</td><td>'+esc(i.mode||'')+'</td><td>'+chatsCell+'</td><td><span class="'+cls+'">'+esc(txt)+'</span></td><td>'+upd+'</td><td><button class="btn" onclick="reqShot('+i.iid+')">📸</button></td>';
+      if (i.mode === 'rotation' && chats.length > 0) {
+        chatsCell = chats.map(c => c === i.current_chat
+          ? '<b style="color:#71d68a">' + esc(c) + '</b>'
+          : '<span class="hint">' + esc(c) + '</span>'
+        ).join(' → ');
+      }
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td>'+i.iid+'</td><td>'+esc(i.mode||'')+'</td><td>'+chatsCell+'</td><td><span class="'+cls+'">'+esc(txt)+'</span></td><td>'+upd+'</td><td><button class="btn" onclick="reqShot('+i.iid+')">📸</button></td>';
       body.appendChild(tr);
     });
   } catch(e){}
@@ -3414,15 +3265,8 @@ async function loadEvents(){
     body.appendChild(tr);
   });
 }
-function renderBulkChips(){
-  $('bulkChips').innerHTML = bulkChips.length ? bulkChips.map(n=>'<span class="chip">'+esc(n)+'<span class="x" onclick="removeBulkChip(\''+esc(n)+'\')">×</span></span>').join('') : '<span class="hint">Фильтр не задан</span>';
-}
-function addBulkChip(){ const v = $('bSenderInput').value.trim(); if(!v) return; if(!bulkChips.includes(v)) bulkChips.push(v); $('bSenderInput').value=''; renderBulkChips(); loadBulk(); }
-function removeBulkChip(n){ bulkChips = bulkChips.filter(x=>x!==n); renderBulkChips(); loadBulk(); }
-function clearBulkChips(){ bulkChips = []; renderBulkChips(); loadBulk(); }
 async function loadBulk(){
-  const p = new URLSearchParams(); if(bulkChips.length) p.set('senders', bulkChips.join(','));
-  const r = await fetch('/api/bulk?'+p).then(r=>r.json());
+  const r = await fetch('/api/bulk').then(r=>r.json());
   const body = $('bulkBody'); body.innerHTML='';
   if(!r.alerts.length){ body.innerHTML = '<tr><td colspan="9" class="hint">Нет данных</td></tr>'; return; }
   r.alerts.forEach(a=>{
@@ -3452,11 +3296,11 @@ async function loadBets(){
   if($('betRange').value) p.set('last_hours',$('betRange').value);
   const r = await fetch('/api/bets?'+p).then(r=>r.json());
   const body = $('betsBody'); body.innerHTML='';
-  if(!r.bets.length){ body.innerHTML = '<tr><td colspan="9" class="hint">Нет ставок</td></tr>'; return; }
+  if(!r.bets.length){ body.innerHTML = '<tr><td colspan="9" class="hint">Нет ставок · query='+esc(p.toString())+'</td></tr>'; return; }
   r.bets.forEach(b=>{
     const fromChat = b.source === 'chat';
     const tr = document.createElement('tr'); tr.className = 'bet-row' + (fromChat?' chat':'');
-    const realInfo = b.real_sender ? ' <span class="pill ok" title="Настоящий ник">real: '+esc(b.real_sender)+'</span>' : '';
+    const realInfo = b.real_sender ? ' <span class="pill ok">real: '+esc(b.real_sender)+'</span>' : '';
     tr.innerHTML = '<td data-v="'+(b.ts||0)+'">'+fmtTime(b.ts)+'</td>'
       + '<td><span class="pill '+(fromChat?'chat':'')+'">'+(fromChat?'💬':'📊')+'</span></td>'
       + '<td data-v="'+esc(b.chat)+'">'+esc(b.chat)+'</td>'
@@ -3469,18 +3313,26 @@ async function loadBets(){
   });
 }
 async function loadBetsTop(){
-  const r = await fetch('/api/bets_top_senders').then(r=>r.json());
+  const p = new URLSearchParams();
+  if($('betRange').value) p.set('last_hours',$('betRange').value);
+  const r = await fetch('/api/bets_top_senders?'+p).then(r=>r.json());
   const el = $('betStats');
   if(!r.senders.length){ el.innerHTML = '<p class="hint">Пусто</p>'; return; }
   el.innerHTML = '<div class="kpi">' + r.senders.map(s=>'<div>'+esc(s.nickname)+'<b>'+s.cnt+' шт.</b><span class="hint">$'+fmtMoney(s.total_usd)+'</span></div>').join('') + '</div>';
 }
 async function clearBetsTop(){ if(!confirm('Очистить топ?')) return; await fetch('/api/bets/clear_top',{method:'POST'}); alert('OK'); loadBetsTop(); }
+async function clearBetsToRains(){
+  if(!confirm('Очистить историю Bets→Rains? Старые данные больше не будут учитываться.')) return;
+  await fetch('/api/bets_to_rains/clear',{method:'POST'}).then(r=>r.json());
+  alert('✅ Очищено');
+  loadBetsToRains();
+}
 async function loadBetsToRains(){
   const w = $('b2rWindow').value || 900;
   const r = await fetch('/api/bets_to_rains?window_sec='+w).then(r=>r.json());
   const body = $('b2rBody'); body.innerHTML='';
-  $('b2rStats').innerHTML = '<div class="kpi"><div>Окно<b>'+r.window_sec+'с</b></div><div>Найдено игроков<b>'+r.stats.length+'</b></div></div>';
-  if(!r.stats.length){ body.innerHTML = '<tr><td colspan="5" class="hint">Нет данных</td></tr>'; return; }
+  $('b2rStats').innerHTML = '<div class="kpi"><div>Окно<b>'+r.window_sec+'с</b></div><div>Игроков<b>'+r.stats.length+'</b></div></div>';
+  if(!r.stats.length){ body.innerHTML = '<tr><td colspan="5" class="hint">Нет данных (нужно 3+ ставки ≥$20)</td></tr>'; return; }
   r.stats.forEach((s,i)=>{ const cls = s.percent>=50?'ok':(s.percent>=25?'warn':'err');
     const tr = document.createElement('tr');
     tr.innerHTML = '<td>'+(i+1)+'</td><td data-v="'+esc(s.nickname)+'"><b>'+esc(s.nickname)+'</b></td><td data-v="'+s.bets+'">'+s.bets+'</td><td data-v="'+s.triggered+'">'+s.triggered+'</td><td data-v="'+s.percent+'"><span class="pill '+cls+'">'+s.percent+'%</span></td>';
@@ -3501,11 +3353,11 @@ async function loadContexts(){
     const bH = bets.length ? bets.map(b=>{
       const amt = esc(b.amount_text||'');
       const sym = esc(b.crypto_symbol||'');
-      const rub = (b.amount_rub||0) > 0 ? ' <span style="color:#4ade80">~'+Math.round(b.amount_rub)+'₽</span>' : '';
-      const usd = (b.amount_usd||0) > 0 ? ' <span style="color:#8ab4f8">$'+b.amount_usd.toFixed(2)+'</span>' : '';
-      const win = b.outcome === 'win' ? '' : (b.outcome === 'loss' ? ' <span style="color:#f87171">(loss)</span>' : '');
-      return '<div style="padding:4px 8px;border-left:3px solid #71d68a;margin:4px 0;color:#71d68a;font-size:12px">🎰 <b>'+esc(b.sender||'?')+'</b> · '+esc(b.game||'')+' · '+esc(b.multiplier||'')+' · '+amt+' '+sym+rub+usd+win+'</div>';
-    }).join('') : '<div class="hint">—</div>';    return '<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px;margin-bottom:12px">'
+      const rub2 = (b.amount_rub||0) > 0 ? ' <span style="color:#4ade80">~'+Math.round(b.amount_rub)+'₽</span>' : '';
+      const usd2 = (b.amount_usd||0) > 0 ? ' <span style="color:#8ab4f8">$'+b.amount_usd.toFixed(2)+'</span>' : '';
+      return '<div style="padding:4px 8px;border-left:3px solid #71d68a;margin:4px 0;color:#71d68a;font-size:12px">🎰 <b>'+esc(b.sender||'?')+'</b> · '+esc(b.game||'')+' · '+esc(b.multiplier||'')+' · '+amt+' '+sym+rub2+usd2+'</div>';
+    }).join('') : '<div class="hint">—</div>';
+    return '<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px;margin-bottom:12px">'
       + '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px">'
       + '<span class="pill">🌧 RAIN</span><b>'+esc(c.chat)+'</b>'
       + '<span class="hint">'+(c.ts?fmtTime(c.ts):esc(c.created_at))+'</span>'
@@ -3583,7 +3435,6 @@ async function loadDayDetail(date){
     + '<div class="vault-card"><h3>🌧 Топ раздающих</h3><table><thead><tr><th>#</th><th>Ник</th><th>Дождей</th><th>₽</th></tr></thead><tbody>'+sendHtml+'</tbody></table></div>'
     + '</div>';
 }
-
 function downloadDocx(){
   const d = $('docxDate').value;
   if (!d) { alert('Выбери дату'); return; }
@@ -3601,8 +3452,8 @@ async function loadChart(){
   const counts = labels.map((_,h)=>r.buckets[h]?.count||0);
   const sums   = labels.map((_,h)=>r.buckets[h]?.sum||0);
   if(chart1) chart1.destroy(); if(chart2) chart2.destroy();
-  chart1 = new Chart($('hourCount'), {type:'bar', data:{labels, datasets:[{label:'Кол-во', data:counts, backgroundColor:'#4a7ce0'}]}, options:{plugins:{legend:{labels:{color:'#e6e6e6'}}}, scales:{x:{ticks:{color:'#8b93a7'}}, y:{ticks:{color:'#8b93a7'}}}}});
-  chart2 = new Chart($('hourSum'), {type:'bar', data:{labels, datasets:[{label:'Сумма ₽', data:sums, backgroundColor:'#71d68a'}]}, options:{plugins:{legend:{labels:{color:'#e6e6e6'}}}, scales:{x:{ticks:{color:'#8b93a7'}}, y:{ticks:{color:'#8b93a7'}}}}});
+  chart1 = new Chart($('hourCount'), {type:'bar', data:{labels, datasets:[{label:'Кол-во', data:counts, backgroundColor:'#4a7ce0'}]}});
+  chart2 = new Chart($('hourSum'), {type:'bar', data:{labels, datasets:[{label:'Сумма ₽', data:sums, backgroundColor:'#71d68a'}]}});
 }
 
 async function loadPromos(){
@@ -3613,23 +3464,7 @@ async function loadPromos(){
   $('promoStats').textContent = 'Всего: '+stats.total+' | Исп: '+stats.used+' | Осталось: '+stats.unused;
   const el = $('promoList');
   if(!r.promos.length){ el.innerHTML = '<p class="hint">Пусто</p>'; return; }
-  const filtered = filter==='1' ? r.promos.filter(x=>x.used) : r.promos;
-  el.innerHTML = filtered.map(x=>{
-    const vaulted = !!x.used_for_vault;
-    const vaultBadge = vaulted ? ' <span class="pill ok">💰 в хранилище ($'+fmtMoney(x.vault_amount_usd)+')</span>' : '';
-    const vaultBtn = vaulted ? '' : '<button class="btn green" onclick="promoToVault('+x.id+')">💰 В хранилище</button>';
-    return '<div class="promo-card '+(x.used?'used':'')+' '+(vaulted?'vaulted':'')+'">'
-      + '<input type="checkbox" class="promo-cb" '+(x.used?'checked':'')+' onchange="togglePromo('+x.id+')">'
-      + '<div class="promo-body"><div class="promo-text">'+esc(x.text)+'</div>'
-      + '<div class="promo-meta">'+(x.message_date?'📅 '+esc(x.message_date):'')+(x.link?' · <a href="'+esc(x.link)+'" target="_blank">TG</a>':'')+vaultBadge+'</div></div>'
-      + '<div style="display:flex;flex-direction:column;gap:6px">'+vaultBtn+'</div></div>';
-  }).join('');
-}
-async function togglePromo(id){ await fetch('/api/promo/toggle/'+id,{method:'POST'}); loadPromos(); }
-async function promoToVault(id){
-  const amount = prompt('Сколько $ получил за промокод?', '0'); if(amount === null) return;
-  await fetch('/api/promo/to_vault/'+id, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({amount_usd: parseFloat(amount)||0, currency: 'USD'})});
-  alert('✅ Добавлено'); loadPromos(); loadVault();
+  el.innerHTML = r.promos.map(x=>'<div class="promo-card '+(x.used?'used':'')+'"><div class="promo-body"><div class="promo-text">'+esc(x.text)+'</div></div></div>').join('');
 }
 async function testPromo(){
   const btn = event.target; btn.disabled=true; btn.textContent='⏳';
@@ -3637,7 +3472,6 @@ async function testPromo(){
   catch(e){ alert('Ошибка'); } finally { btn.disabled=false; btn.textContent='🔍 Проверить'; }
 }
 
-// === ACTIVITY ===
 async function loadActivityDashboard(){
   const win = $('actWindow').value || 60;
   $('actStatus').textContent = '⏳';
@@ -3645,11 +3479,11 @@ async function loadActivityDashboard(){
     const r = await fetch('/api/activity/dashboard?minutes=' + win).then(r=>r.json());
     const grid = $('actGrid');
     const wl = r.watchlist || [];
-    if (!wl.length) { grid.innerHTML = '<p class="hint">Пусто. Добавь игроков в watchlist.</p>'; return; }
+    if (!wl.length) { grid.innerHTML = '<p class="hint">Пусто</p>'; return; }
     const chats = ['ENGLISH','RUSSIAN','JAPANESE','POLISH','TURKISH','PORTUGUESE','SPANISH','FRENCH','CHINESE','KOREAN','VIETNAMESE','INDONESIAN'];
     let html = '<table><thead><tr><th>Игрок</th>';
     chats.forEach(c => html += '<th style="text-align:center;font-size:10px">' + c.substring(0,4) + '</th>');
-    html += '<th>Всего msgs</th></tr></thead><tbody>';
+    html += '<th>Всего</th></tr></thead><tbody>';
     wl.forEach(name => {
       const p = r.players[name] || { chats: {}, total_msgs: 0 };
       html += '<tr><td><b>' + esc(name) + '</b>' + (name === 'Merami' ? ' ⭐' : '') + '</td>';
@@ -3663,8 +3497,7 @@ async function loadActivityDashboard(){
           else if (mins <= 59) { color = '#fbbf24'; symbol = mins + 'м'; }
           else { color = '#f87171'; symbol = mins + 'м'; }
         }
-        const title = `last: ${mins}м, msgs: ${info.msg_count}`;
-        html += `<td style="text-align:center;color:${color}" title="${title}">${symbol}</td>`;
+        html += `<td style="text-align:center;color:${color}">${symbol}</td>`;
       });
       html += '<td>' + (p.total_msgs || 0) + '</td></tr>';
     });
@@ -3711,7 +3544,6 @@ async function loadRainActivity(){
   } catch(e) { box.innerHTML = '<p class="hint">❌ ' + e.message + '</p>'; }
 }
 
-// === MODERATORS ===
 async function loadModerators(){
   const r = await fetch('/api/moderators').then(r=>r.json());
   const body = document.getElementById('modBody'); body.innerHTML = '';
@@ -3730,7 +3562,7 @@ async function loadModerators(){
       + '<td>'+(m.first_seen?fmtTime(m.first_seen):'—')+'</td>'
       + '<td>'+(m.last_seen?fmtTime(m.last_seen):'—')+'</td>'
       + '<td>'+chats+'</td>'
-      + '<td><button class="btn" onclick="loadModMsgs(\''+esc(m.username)+'\')">📜 Сообщения</button></td>';
+      + '<td><button class="btn" onclick="loadModMsgs(\''+esc(m.username)+'\')">📜</button></td>';
     body.appendChild(tr);
   });
 }
@@ -3743,56 +3575,25 @@ async function loadModMsgs(username){
       + '<span class="hint">'+fmtTime(m.ts)+' · '+esc(m.chat)+'</span> · '+esc(m.text||'') + '</div>').join('');
 }
 
-// === CONTROL / NGROK ===
-async function controlAction(action) {
-  if (!confirm('Команда: ' + action + '?')) return;
-  await fetch('/api/control/set', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action})}).then(r=>r.json());
-  alert('✅ Отправлено: ' + action);
-}
-let _lastNgrok = '';
-async function pollNgrok() {
-  try {
-    const r = await fetch('/api/ngrok_url').then(r=>r.json());
-    if (r.url && r.url !== _lastNgrok) {
-      _lastNgrok = r.url;
-      document.getElementById('ngrokUrl').textContent = '🌐 ngrok: ' + r.url;
-    }
-  } catch(e){}
-}
-function copyNgrok() {
-  if (!_lastNgrok) return;
-  if (navigator.clipboard) navigator.clipboard.writeText(_lastNgrok);
-  alert('Скопировано: ' + _lastNgrok);
-}
-
-// === ME ===
-function saveMeNick(){ const v = $('meNick').value.trim(); if(!v) return; localStorage.setItem('myNick', v); alert('✅ Сохранён: ' + v); }
+function saveMeNick(){ const v = $('meNick').value.trim(); if(!v) return; localStorage.setItem('myNick', v); alert('✅ '+v); }
 async function loadMe(){
   const un = $('meNick').value.trim(); if(!un) return;
   const s = $('meStatus'); if(s) s.textContent = '⏳...';
-  const topEl = $('meTop'); const actEl = $('meActivity');
-  if(topEl) topEl.innerHTML = ''; if(actEl) actEl.innerHTML = '';
   try {
     const d = await fetch('/api/player/activity?username=' + encodeURIComponent(un) + '&windows=15,25,60,1440').then(r=>r.json());
     const wins = d.windows || [15,25,60,1440];
     const lbl = w => w === 1440 ? '24ч' : (w === 60 ? '1ч' : (w + 'м'));
-    const lastInfo = d.minutes_ago_total !== null && d.minutes_ago_total !== undefined
-      ? 'Последнее сообщение: <b style="color:#8ab4f8">' + d.minutes_ago_total + ' мин назад</b>'
-      : '<span class="hint">Нет активности за сутки</span>';
-    if(topEl) topEl.innerHTML = '<div class="hint" style="font-size:13px;margin-top:10px">' + lastInfo + '</div>';
     const totalRow = wins.map(w => {
       const v = d.total[w] || 0; const col = v > 0 ? '#4ade80' : '#666';
-      return '<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:10px 16px;min-width:110px"><span class="hint" style="font-size:12px">За ' + lbl(w) + '</span><b style="display:block;font-size:22px;color:' + col + '">' + v + '</b></div>';
+      return '<div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:10px 16px"><span class="hint" style="font-size:12px">За ' + lbl(w) + '</span><b style="display:block;font-size:22px;color:' + col + '">' + v + '</b></div>';
     }).join('');
     const rows = (d.chats || []).map(c => {
       const cells = wins.map(w => { const v = c.counts[w] || 0; return '<td style="text-align:center;color:' + (v>0?'#4ade80':'#555') + '">'+v+'</td>'; }).join('');
-      const totalRecent = wins.reduce((a,w) => a + (c.counts[w]||0), 0);
-      const rowStyle = totalRecent === 0 ? 'style="opacity:0.45"' : '';
-      const ll = c.minutes_ago === null || c.minutes_ago === undefined ? '—' : (c.minutes_ago < 60 ? c.minutes_ago + 'м' : (c.minutes_ago < 1440 ? Math.floor(c.minutes_ago/60) + 'ч' : Math.floor(c.minutes_ago/1440) + 'д'));
-      return '<tr '+rowStyle+'><td><b>'+c.chat+'</b> <span class="hint">'+(c.total_msgs||0)+' всего</span></td>'+cells+'<td>'+ll+'</td></tr>';
+      const ll = c.minutes_ago === null ? '—' : (c.minutes_ago < 60 ? c.minutes_ago + 'м' : (c.minutes_ago < 1440 ? Math.floor(c.minutes_ago/60) + 'ч' : Math.floor(c.minutes_ago/1440) + 'д'));
+      return '<tr><td><b>'+c.chat+'</b></td>'+cells+'<td>'+ll+'</td></tr>';
     }).join('');
     const head = '<tr><th>Чат</th>'+wins.map(w => '<th style="text-align:center">'+lbl(w)+'</th>').join('')+'<th>Последнее</th></tr>';
-    if(actEl) actEl.innerHTML = '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">'+totalRow+'</div>'
+    $('meActivity').innerHTML = '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">'+totalRow+'</div>'
       + (rows ? '<table><thead>'+head+'</thead><tbody>'+rows+'</tbody></table>' : '<div class="hint">Нет чатов</div>');
     if(s) s.textContent = '✅';
     loadMeRains(); loadMeBets();
@@ -3805,7 +3606,7 @@ async function loadMeRains(){
   const el = $('meRains'); if(!el) return;
   const d = await fetch('/api/user/' + encodeURIComponent(un) + '/rains_received?days=' + days).then(r=>r.json());
   if(st) st.textContent = 'Найдено: ' + d.wins + ' | ' + fmtMoney(d.total_rub) + ' ₽ (~$' + fmtMoney(d.total_usd) + ')';
-  if(!d.items || !d.items.length){ el.innerHTML = '<div class="hint">Нет выигранных дождей</div>'; return; }
+  if(!d.items || !d.items.length){ el.innerHTML = '<div class="hint">Нет</div>'; return; }
   el.innerHTML = '<table><thead><tr><th>Время</th><th>Чат</th><th>От</th><th>Сумма</th><th>Доля ₽</th><th>Доля $</th></tr></thead><tbody>'
     + d.items.map(i => '<tr><td>'+fmtTime(i.ts)+'</td><td>'+esc(i.chat)+'</td><td><b>'+esc(i.sender)+'</b></td><td>'+esc(i.amount_text)+' '+esc(i.crypto_symbol||'')+' <span class="hint">(÷'+i.receivers_count+')</span></td><td style="color:#71d68a;font-weight:600">'+fmtMoney(i.share_rub)+' ₽</td><td style="color:#8ab4f8">$'+fmtMoney(i.share_usd)+'</td></tr>').join('') + '</tbody></table>';
 }
@@ -3819,57 +3620,74 @@ async function loadMeBets(){
 }
 (function initMe(){ const saved = localStorage.getItem('myNick'); if(saved && $('meNick')) $('meNick').value = saved; })();
 
-// === VAULT ===
-async function loadVault(){
-  const r = await fetch('/api/vault').then(r=>r.json());
-  const w = r.wager; const daysLeft = w.days_left; const hasWager = w.amount_required > 0;
-  $('vaultKpi').innerHTML = '<div>Аккаунт<b style="color:#8ab4f8">$'+fmtMoney(r.total_account_usd)+'</b></div>'
-    + '<div>Хранилище<b style="color:#71d68a">$'+fmtMoney(r.total_vault_usd)+'</b></div>'
-    + '<div>Всего<b>$'+fmtMoney(r.total_usd)+'</b></div>'
-    + (hasWager ? '<div>Вейджер<b style="color:'+(w.is_expired?'#f87171':(daysLeft<7?'#fbbf24':'#8ab4f8'))+'">$'+fmtMoney(w.amount_required)+'</b></div>' : '')
-    + (r.goal_usd > 0 ? '<div>Цель<b style="color:#8ab4f8">$'+fmtMoney(r.goal_usd)+'</b><span class="hint">'+esc(r.goal_text||'')+'</span></div>' : '')
-    + '<div>Доход 7д<b style="color:#71d68a">+$'+fmtMoney(r.week.income)+'</b></div>'
-    + '<div>Вейджер 7д<b style="color:#f87171">-$'+fmtMoney(r.week.wager_spend)+'</b></div>';
-  if(hasWager){
-    const dl = new Date(w.deadline_ts*1000).toLocaleString('ru-RU');
-    const exp = w.is_expired; const hrs = w.hours_left;
-    const leftText = exp ? '<span class="vault-danger">⚠️ ИСТЁК</span>' : (hrs < 24 ? '<span class="vault-warn">осталось '+hrs+'ч</span>' : 'осталось '+daysLeft+'д');
-    $('vaultWagerCard').innerHTML = '<h3>⚙️ Вейджер</h3><div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1e232e"><span>Требуется</span><span class="vault-amount">$'+fmtMoney(w.amount_required)+'</span></div><div style="display:flex;justify-content:space-between;padding:6px 0"><span>Дедлайн</span><span>'+dl+' · '+leftText+'</span></div>';
-  } else { $('vaultWagerCard').innerHTML = '<h3>⚙️ Вейджер</h3><p class="hint">Не задан</p>'; }
-  $('accBalances').innerHTML = (r.account||[]).length ? r.account.map(b=>'<div class="balance-row"><span class="balance-cur">'+esc(b.currency)+'</span><span><span class="vault-amount">'+fmtMoney(b.amount)+'</span> <span class="hint">≈$'+fmtMoney(b.amount_usd)+'</span> <button class="btn danger" style="margin-left:6px;padding:1px 5px;font-size:10px" onclick="delAccBalance(\''+esc(b.currency)+'\')">🗑</button></span></div>').join('') : '<p class="hint">Пусто</p>';
-  $('vaultBalances').innerHTML = (r.vault||[]).length ? r.vault.map(b=>'<div class="balance-row"><span class="balance-cur">'+esc(b.currency)+'</span><span><span class="vault-amount">'+fmtMoney(b.amount)+'</span> <span class="hint">≈$'+fmtMoney(b.amount_usd)+'</span> <button class="btn danger" style="margin-left:6px;padding:1px 5px;font-size:10px" onclick="delVaultBalance(\''+esc(b.currency)+'\')">🗑</button></span></div>').join('') : '<p class="hint">Пусто</p>';
-  $('accTotal').textContent = '$' + fmtMoney(r.total_account_usd);
-  $('vaultTotal').textContent = '$' + fmtMoney(r.total_vault_usd);
-  if(hasWager){ $('wgAmount').value = w.amount_required;
-    if(w.deadline_ts){ const d = new Date(w.deadline_ts*1000); const pad = n => String(n).padStart(2,'0');
-      $('wgDeadline').value = d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes()); } }
-  if(r.goal_usd > 0) $('goalUsd').value = r.goal_usd;
-  if(r.goal_text) $('goalText').value = r.goal_text;
-  const tr = await fetch('/api/vault/transactions?days=60&limit=200').then(r=>r.json());
-  $('txList').innerHTML = (tr.transactions||[]).map(t=>'<tr><td>'+fmtTime(t.ts)+'</td><td><span class="pill">'+esc(t.type)+'</span></td><td>'+esc(t.currency||'')+'</td><td>'+fmtMoney(t.amount)+'</td><td style="color:'+(t.amount_usd>=0?'#71d68a':'#f87171')+'">$'+fmtMoney(t.amount_usd)+'</td><td class="hint">'+esc(t.description||'')+'</td></tr>').join('') || '<tr><td colspan="6" class="hint">Нет</td></tr>';
+async function loadDb(){
+  try {
+    const [si, db] = await Promise.all([
+      fetch('/api/server_info').then(r=>r.json()),
+      fetch('/api/db_stats').then(r=>r.json()),
+    ]);
+    const started = new Date(si.started_at*1000);
+    const upMin = Math.round(si.uptime_sec / 60);
+    const ago = upMin < 60 ? upMin+'м' : Math.floor(upMin/60)+'ч '+(upMin%60)+'м';
+    $('dbDeploy').innerHTML = 'Старт: <b>'+started.toLocaleString('ru-RU')+'</b> ('+ago+' назад)<br>commit: <b>'+esc(si.git_commit)+'</b> · branch: '+esc(si.git_branch)+'<br>Сервис: '+esc(si.service_name);
+    const t = db.tables || {};
+    let html = '<table><thead><tr><th>Таблица</th><th>Строк</th></tr></thead><tbody>';
+    Object.keys(t).forEach(k => {
+      html += '<tr><td><b>'+esc(k)+'</b></td><td>' + (t[k] === null ? '—' : t[k]) + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    html += '<p style="margin-top:10px">Дождей: <b>'+db.rains+'</b> · Чаевых: <b>'+db.tips+'</b></p>';
+    $('dbStats').innerHTML = html;
+  } catch(e){ $('dbStats').innerHTML = '❌ '+e.message; }
 }
-async function setAccBalance(){ const c = $('accCur').value.trim().toUpperCase(); if(!c) return alert('Валюта'); const a = parseFloat($('accAmt').value)||0; if(!a) return alert('Сумма'); await fetch('/api/account/balance',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({currency:c,amount:a})}); $('accCur').value=''; $('accAmt').value=''; loadVault(); }
-async function delAccBalance(c){ if(!confirm('Удалить '+c+' с аккаунта?')) return; await fetch('/api/account/balance/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({currency:c})}); loadVault(); }
-async function delVaultBalance(c){ if(!confirm('Удалить '+c+' из хранилища?')) return; await fetch('/api/vault/balance/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({currency:c})}); loadVault(); }
-async function doTransfer(direction){ const c = $('accCur').value.trim().toUpperCase(); if(!c) return alert('Введи валюту'); const a = parseFloat($('accAmt').value)||0; if(!a) return alert('Введи сумму');
-  const r = await fetch('/api/transfer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({direction,currency:c,amount:a})});
-  const d = await r.json(); if(!r.ok){ alert('❌ '+(d.detail||'Ошибка')); return; } $('accCur').value=''; $('accAmt').value=''; loadVault(); }
-async function saveWager(){ const a = parseFloat($('wgAmount').value)||0; const dl = $('wgDeadline').value; let ts = 0; if(dl){ ts = new Date(dl).getTime()/1000; } await fetch('/api/vault/wager',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({amount_required:a,deadline_ts:ts})}); alert('✅ Сохранён'); loadVault(); }
-async function saveGoal(){ const g = parseFloat($('goalUsd').value)||0; const t = $('goalText').value.trim(); await fetch('/api/vault/goal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal_usd:g,goal_text:t})}); alert('✅ Сохранена'); loadVault(); }
-async function addTransaction(){ const t = $('txType').value; const c = $('txCurrency').value.trim().toUpperCase() || 'USDT'; const a = parseFloat($('txAmount').value)||0; const au = $('txAmountUsd').value ? parseFloat($('txAmountUsd').value) : 0; const d = $('txDesc').value.trim(); if(!a) return alert('Сумма'); await fetch('/api/vault/transaction',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:t,currency:c,amount:a,amount_usd:au,description:d})}); $('txAmount').value=''; $('txAmountUsd').value=''; $('txDesc').value=''; loadVault(); }
 
-// === AI ===
+let _lastNgrok = '';
+async function pollNgrok() {
+  try {
+    const r = await fetch('/api/ngrok_url').then(r=>r.json());
+    if (r.url && r.url !== _lastNgrok) {
+      _lastNgrok = r.url;
+      document.getElementById('ngrokUrl').textContent = '🌐 ' + r.url;
+    }
+  } catch(e){}
+}
+function copyNgrok() {
+  if (!_lastNgrok) return;
+  if (navigator.clipboard) navigator.clipboard.writeText(_lastNgrok);
+  alert('Скопировано: ' + _lastNgrok);
+}
+async function controlAction(action) {
+  if (!confirm('Команда: ' + action + '?')) return;
+  await fetch('/api/control/set', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action})});
+  alert('✅ Отправлено: ' + action);
+}
+async function pollDeployInfo() {
+  try {
+    const r = await fetch('/api/server_info').then(r=>r.json());
+    const el = document.getElementById('deployInfo');
+    const started = new Date(r.started_at * 1000);
+    const upMin = Math.round(r.uptime_sec / 60);
+    const ago = upMin < 60 ? upMin + 'м' : Math.floor(upMin/60) + 'ч ' + (upMin % 60) + 'м';
+    const dd = String(started.getDate()).padStart(2,'0');
+    const mm = String(started.getMonth()+1).padStart(2,'0');
+    const hh = String(started.getHours()).padStart(2,'0');
+    const mi = String(started.getMinutes()).padStart(2,'0');
+    el.textContent = '🚀 ' + dd + '.' + mm + ' ' + hh + ':' + mi + ' (' + ago + ')';
+    el.title = 'Commit: ' + r.git_commit;
+  } catch(e) {}
+}
+
 async function runAI(){
   const chat = $('aiChat').value; if(!chat){ alert('Выбери чат'); return; }
   const btn = event.target; btn.disabled=true; btn.textContent='⏳'; $('aiStatus').textContent = 'Отправляю...';
   const r = await fetch('/api/chat/request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat})}).then(r=>r.json());
   const taskId = r.task_id; if(!taskId){ alert('Ошибка'); btn.disabled=false; return; }
-  if(aiPollTimer) clearInterval(aiPollTimer); let tries = 0;
-  aiPollTimer = setInterval(async () => { tries++; const t = await fetch('/api/chat/task/'+taskId).then(r=>r.json());
-    if(t.status === 'pending' || t.status === 'reading'){ $('aiStatus').textContent = (tries*2)+'с'; }
-    else if(t.status === 'completed'){ clearInterval(aiPollTimer); aiPollTimer=null; $('aiStatus').textContent='✅'; btn.disabled=false; btn.textContent='🤖 Получить'; renderAIResult(t.result, chat); }
-    else if(t.status === 'failed'){ clearInterval(aiPollTimer); aiPollTimer=null; $('aiStatus').textContent='❌'; btn.disabled=false; btn.textContent='🤖 Получить'; }
-    if(tries > 60){ clearInterval(aiPollTimer); aiPollTimer=null; btn.disabled=false; btn.textContent='🤖 Получить'; }
+  let tries = 0;
+  const t = setInterval(async () => { tries++; const tt = await fetch('/api/chat/task/'+taskId).then(r=>r.json());
+    if(tt.status === 'pending' || tt.status === 'reading'){ $('aiStatus').textContent = (tries*2)+'с'; }
+    else if(tt.status === 'completed'){ clearInterval(t); $('aiStatus').textContent='✅'; btn.disabled=false; btn.textContent='🤖 Получить'; renderAIResult(tt.result, chat); }
+    else if(tt.status === 'failed'){ clearInterval(t); $('aiStatus').textContent='❌'; btn.disabled=false; btn.textContent='🤖 Получить'; }
+    if(tries > 60){ clearInterval(t); btn.disabled=false; btn.textContent='🤖 Получить'; }
   }, 2000);
 }
 function renderAIResult(result, chat){
@@ -3889,7 +3707,6 @@ function copyMsg(el, text){
 }
 async function loadAILatest(){ const chat = $('aiChat').value || null; const p = new URLSearchParams(); if(chat) p.set('chat',chat); const r = await fetch('/api/chat/latest?'+p).then(r=>r.json()); if(!r.task){ $('aiResult').innerHTML='<p class="hint">Нет</p>'; return; } renderAIResult(r.task.result, r.task.chat); $('aiStatus').textContent = 'Последний: '+fmtTime(r.task.completed_at); }
 
-// === PLAYERS ===
 async function loadPlayersTab(){
   const sum = await fetch('/api/players_by_chat').then(r=>r.json());
   const sEl = $('plChatsSummary');
@@ -3912,52 +3729,32 @@ async function loadPlayersTab(){
       + '<td data-v="'+x.msg_count+'" style="color:#8ab4f8;font-weight:bold">'+x.msg_count+'</td>'
       + '<td data-v="'+(x.last_seen||0)+'">'+(x.last_seen?fmtTime(x.last_seen):'—')+'</td>'
       + '<td>'+(online?'<span class="pill ok">🟢</span>':'<span class="pill">off</span>')+'</td>'
-      + '<td><button class="btn" onclick="relocatePlayer(\''+esc(x.username)+'\')">↗ Язык</button></td>';
+      + '<td></td>';
     body.appendChild(tr);
   });
 }
-async function relocatePlayer(username){ const nc = prompt('Куда переместить "'+username+'"?'); if(!nc) return; await fetch('/api/players/relocate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username, chat:nc.toUpperCase()})}); loadPlayersTab(); }
-
-let currentLangPlayer = null;
 async function loadLanguages(){
   const r = await fetch('/api/players_by_language').then(r=>r.json());
   const f = ($('langFilter').value || '').toLowerCase();
   const players = (r.players||[]).filter(p => !f || (p.username||'').toLowerCase().includes(f));
   const el = $('langGrid');
   if(!players.length){ el.innerHTML = '<p class="hint">Нет</p>'; return; }
-  el.innerHTML = players.slice(0,500).map(p=>'<div class="lang-card" style="cursor:pointer" onclick="openLangEdit(\''+esc(p.username).replace(/'/g,"&#39;")+'\')"><h4>'+esc(p.username)+'</h4>'
-    + '<div class="hint">Сообщений: '+(p.total_msgs||0)+' · Чатов: '+(p.chat_count||0)+' · <span style="color:#7cc4ff">✏️ редактировать</span></div>'
+  el.innerHTML = players.slice(0,500).map(p=>'<div class="lang-card"><h4>'+esc(p.username)+'</h4>'
+    + '<div class="hint">Сообщений: '+(p.total_msgs||0)+' · Чатов: '+(p.chat_count||0)+'</div>'
     + (p.chats||[]).map(c=>'<div class="player-row">'+esc(c)+'</div>').join('')+'</div>').join('');
 }
-async function openLangEdit(username){
-  currentLangPlayer = username;
-  $('langEditName').textContent = username;
-  const r = await fetch('/api/players_by_language').then(r=>r.json());
-  const player = (r.players||[]).find(p => p.username === username);
-  const activeChats = player ? (player.chats||[]) : [];
-  const allChats = r.all_chats || ALL_CHATS;
-  $('langCheckboxes').innerHTML = allChats.map(c => '<label style="display:flex;gap:6px;align-items:center;padding:6px;background:#10131a;border:1px solid #232a37;border-radius:6px;cursor:pointer"><input type="checkbox" value="'+esc(c)+'" '+(activeChats.includes(c)?'checked':'')+'> '+esc(c)+'</label>').join('');
-  $('langEditStatus').textContent = '';
-  $('langEditModal').classList.add('on');
-}
-async function saveLangEdit(){
-  if(!currentLangPlayer) return;
-  const chats = Array.from($('langCheckboxes').querySelectorAll('input:checked')).map(i => i.value);
-  const st = $('langEditStatus'); st.textContent = '⏳';
-  const r = await fetch('/api/players/set_chats',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:currentLangPlayer, chats: chats})});
-  if(r.ok){ st.textContent = '✅ Сохранено'; setTimeout(()=>{ $('langEditModal').classList.remove('on'); loadLanguages(); }, 500); }
-  else { st.textContent = '❌ Ошибка'; }
-}
 
-attachAutocomplete(document.getElementById('accCur'));
-attachAutocomplete(document.getElementById('txCurrency'));
+renderBulkChipsInit();
 
-renderBulkChips();
+function renderBulkChipsInit() {}
+
 loadChats();
 refreshStatus();
 pollNgrok();
-setInterval(refreshStatus, 3000);
-setInterval(pollNgrok, 5000);
+pollDeployInfo();
+setInterval(refreshStatus, 5000);
+setInterval(pollNgrok, 10000);
+setInterval(pollDeployInfo, 30000);
 </script></body></html>
 """
 
@@ -3985,7 +3782,7 @@ async def startup_event():
     threading.Thread(target=ticks_cleanup_thread, daemon=True).start()
     threading.Thread(target=promo_parser_thread, daemon=True).start()
     print(f"[PROMO] Поток @{PROMO_CHANNEL} запущен")
-    print("[STARTUP] 🚀 Все потоки запущены")
+    print(f"[STARTUP] 🚀 Сервер запущен, commit={SERVER_GIT_COMMIT}")
 
 
 if __name__ == "__main__":
