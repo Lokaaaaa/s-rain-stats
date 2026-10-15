@@ -722,26 +722,66 @@ def _enrich_receivers_info_from_db(chat_name, receivers_info):
     if not receivers_info:
         return
     now_ts = time.time()
+    for r in redef _enrich_receivers_info_from_db(chat_name, receivers_info, event_ts=None):
+    """Обогащает receivers_info данными из player_message_ticks.
+    Считает 'minutes_ago' ОТНОСИТЕЛЬНО event_ts (времени дождя), а не сейчас.
+    Берём последнее сообщение игрока ДО момента дождя (ts <= event_ts).
+    """
+    if not receivers_info:
+        return
+    if event_ts is None:
+        event_ts = time.time()
     for r in receivers_info:
         name = (r or {}).get("name")
         if not name:
             continue
+
+        # 1. Ищем последнее сообщение игрока ДО момента дождя
+        tick_ts = None
         try:
-            row = query_one("SELECT last_seen, msg_count FROM chat_players WHERE username=? AND chat=?",
-                            (name, chat_name))
+            tick = query_one(
+                """SELECT MAX(ts) AS last_before FROM player_message_ticks
+                   WHERE username=? AND chat=? AND ts <= ?""",
+                (name, chat_name, event_ts)
+            )
+            if tick and tick.get("last_before"):
+                tick_ts = float(tick["last_before"])
         except Exception:
-            continue
-        if row and row.get("last_seen"):
-            ls = float(row["last_seen"])
-            js_min = r.get("minutes_ago")
-            srv_min = int((now_ts - ls) / 60)
-            if js_min is None or srv_min < js_min:
-                r["last_msg_ts"] = ls
-                r["minutes_ago"] = srv_min
-                r["wrote_in_25min"] = srv_min <= 25
-                r["in_chat_only"] = False
-            if (row.get("msg_count") or 0) > (r.get("total_msgs") or 0):
+            pass
+
+        # 2. Если в тиках нет — фолбэк на chat_players.last_seen,
+        #    но только если оно МЕНЬШЕ event_ts (т.е. сообщение было до дождя)
+        if tick_ts is None:
+            try:
+                crow = query_one("SELECT last_seen, msg_count FROM chat_players WHERE username=? AND chat=?",
+                                 (name, chat_name))
+                if crow and crow.get("last_seen"):
+                    ls = float(crow["last_seen"])
+                    if ls <= event_ts:
+                        tick_ts = ls
+            except Exception:
+                pass
+
+        # 3. Считаем минуты назад ОТ ВРЕМЕНИ ДОЖДЯ
+        if tick_ts is not None:
+            min_ago = int((event_ts - tick_ts) / 60)
+            r["last_msg_ts"] = tick_ts
+            r["minutes_ago"] = min_ago
+            r["wrote_in_25min"] = min_ago <= 25
+            r["in_chat_only"] = False
+        else:
+            # Игрок вообще не писал до этого дождя — оставляем как есть
+            if r.get("minutes_ago") is None:
+                r["wrote_in_25min"] = False
+
+        # 4. Обновляем total_msgs если сервер знает больше
+        try:
+            row = query_one("SELECT msg_count FROM chat_players WHERE username=? AND chat=?",
+                            (name, chat_name))
+            if row and (row.get("msg_count") or 0) > (r.get("total_msgs") or 0):
                 r["total_msgs"] = row["msg_count"]
+        except Exception:
+            pass
 
 
 # ==================== API SCRIPT ====================
@@ -762,7 +802,7 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
     if dup:
         return {"ok": True, "dup": True}
     if event.type == "rain" and event.receivers_info:
-        _enrich_receivers_info_from_db(event.chat, event.receivers_info)
+        _enrich_receivers_info_from_db(event.chat, event.receivers_info, event_ts=ts_val)
     rub = event.amount_rub or 0.0
     usd = event.amount_usd or 0.0
     if rub == 0 or usd == 0:
@@ -796,7 +836,8 @@ async def events_batch(payload: dict, x_api_key: str = Header(default="")):
     for e in events:
         try:
             if e.get("type") == "rain" and e.get("receivers_info"):
-                _enrich_receivers_info_from_db(e.get("chat"), e.get("receivers_info"))
+                _enrich_receivers_info_from_db(e.get("chat"), e.get("receivers_info"),
+                                   event_ts=float(e.get("ts", time.time())))
             rub = float(e.get("amount_rub") or 0)
             usd = float(e.get("amount_usd") or 0)
             if rub == 0 or usd == 0:
@@ -1844,15 +1885,26 @@ async def api_rain_activity(hours: int = 24, limit: int = 100, chat: Optional[st
         my_rec = next((x for x in rinfo if x.get("name") == MY_NICK), None)
         my_minutes = my_rec.get("minutes_ago") if my_rec else None
         my_was_active = bool(my_rec and my_rec.get("wrote_in_25min"))
+
+        # Фолбэк — ищем последнее сообщение Merami ДО времени дождя
         if my_minutes is None:
-            try:
-                crow = query_one("SELECT last_seen FROM chat_players WHERE username=? AND chat=?",
-                                 (MY_NICK, r["chat"]))
-                if crow and crow.get("last_seen"):
-                    my_minutes = int((time.time() - float(crow["last_seen"])) / 60)
-                    my_was_active = my_minutes <= 60
-            except Exception:
-                pass
+            rain_ts = float(r.get("ts") or 0)
+            if rain_ts > 0:
+                try:
+                    tick = query_one(
+                        """SELECT MAX(ts) AS last_before FROM player_message_ticks
+                           WHERE username=? AND chat=? AND ts <= ?""",
+                        (MY_NICK, r["chat"], rain_ts)
+                    )
+                    if tick and tick.get("last_before"):
+                        tick_ts = float(tick["last_before"])
+                        my_minutes = int((rain_ts - tick_ts) / 60)
+                        my_was_active = my_minutes <= 60
+                    else:
+                        # Игрок вообще не писал до этого дождя
+                        my_was_active = False
+                except Exception:
+                    pass
 
         merami = {
             "won": won,
