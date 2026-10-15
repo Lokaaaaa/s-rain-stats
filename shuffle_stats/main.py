@@ -25,7 +25,6 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = "openai/gpt-oss-20b"
 MY_NICK = os.environ.get("MY_NICK", "Merami")
 
-# --- Инфо о деплое ---
 SERVER_START_TS = time.time()
 SERVER_GIT_COMMIT = (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "?"
 SERVER_GIT_BRANCH = os.environ.get("RENDER_GIT_BRANCH") or "-"
@@ -79,7 +78,7 @@ def _load_server_rates():
                 _server_rates = data.get("rates", {})
                 _server_rates_updated[0] = data.get("last_update", 0)
         except Exception as e:
-            print(f"[RATES] ⚠️ {e}")
+            print(f"[RATES] {e}")
 
 
 def _save_server_rates():
@@ -126,7 +125,7 @@ def _fetch_server_rates():
             _server_rates.update(new)
             _server_rates_updated[0] = time.time()
         _save_server_rates()
-        print(f"[RATES] 🔄 Обновлено {len(new)} курсов")
+        print(f"[RATES] Обновлено {len(new)} курсов")
     except Exception as e:
         print(f"[RATES] fetch: {e}")
 
@@ -453,8 +452,9 @@ def migrate_ts_once():
             execute("""UPDATE events SET ts = CAST(strftime('%s', created_at) AS REAL)
                        WHERE ts IS NULL AND created_at IS NOT NULL""")
         meta_set("ts_migrated_v1", "1")
+        print("[MIGRATE] ts миграция выполнена")
     except Exception as e:
-        print(f"[MIGRATE] ⚠️ {e}")
+        print(f"[MIGRATE] {e}")
 
 
 def dedup_thread():
@@ -719,8 +719,6 @@ def _recalc_amounts(amount_text, amount_type, crypto_symbol):
 
 
 def _enrich_receivers_info_from_db(chat_name, receivers_info):
-    """Обогащает receivers_info актуальным last_seen из chat_players.
-    Берём самое СВЕЖЕЕ (меньшее minutes_ago) из JS и БД."""
     if not receivers_info:
         return
     now_ts = time.time()
@@ -737,13 +735,11 @@ def _enrich_receivers_info_from_db(chat_name, receivers_info):
             ls = float(row["last_seen"])
             js_min = r.get("minutes_ago")
             srv_min = int((now_ts - ls) / 60)
-            # Берём самое свежее
             if js_min is None or srv_min < js_min:
                 r["last_msg_ts"] = ls
                 r["minutes_ago"] = srv_min
                 r["wrote_in_25min"] = srv_min <= 25
                 r["in_chat_only"] = False
-            # Обновляем total_msgs если сервер знает больше
             if (row.get("msg_count") or 0) > (r.get("total_msgs") or 0):
                 r["total_msgs"] = row["msg_count"]
 
@@ -900,18 +896,25 @@ async def add_bet(body: BetIn, x_api_key: str = Header(default="")):
 
 
 @app.post("/api/bets/clear_top")
-async def clear_bets_top():
-    meta_set("bets_top_cleared_at", time.time())
-    return {"ok": True}
-
-
-@app.post("/api/bets_to_rains/clear")
-async def clear_bets_to_rains(x_api_key: str = Header(default="")):
+async def clear_bets_top(hard: int = 0, x_api_key: str = Header(default="")):
+    """
+    Очищает "Топ отправителей ставок".
+    По умолчанию (hard=0): ставит timestamp, /api/bets_top_senders игнорирует ставки до него.
+    hard=1: реально удаляет все записи из таблицы bets.
+    """
     if x_api_key != API_KEY:
         raise HTTPException(401, "Invalid API key")
-    meta_set("bets_to_rains_cleared_at", time.time())
-    return {"ok": True}
-
+    now = time.time()
+    meta_set("bets_top_cleared_at", now)
+    deleted = 0
+    if hard == 1:
+        try:
+            cnt_before = (query_one("SELECT COUNT(*) AS c FROM bets") or {}).get("c", 0)
+            execute("DELETE FROM bets")
+            deleted = cnt_before
+        except Exception as e:
+            raise HTTPException(500, f"delete failed: {e}")
+    return {"ok": True, "cleared_at": now, "hard": bool(hard), "deleted": deleted}
 
 
 @app.post("/api/bets_to_rains/clear")
@@ -1181,16 +1184,12 @@ async def post_moderator_message(body: ModeratorMessageIn, x_api_key: str = Head
     if x_api_key != API_KEY:
         raise HTTPException(401, "Invalid API key")
     ts_val = body.ts or time.time()
-
-    # Дедупликация: не пишем то же самое сообщение от того же юзера в том же чате
-    # в течение 5 минут
     dup = query_one("""SELECT id FROM moderator_messages
                        WHERE username=? AND chat=? AND text=?
                        AND ABS(ts-?) < 300 LIMIT 1""",
                     (body.username, body.chat, body.text, ts_val))
     if dup:
         return {"ok": True, "dup": True}
-
     p = ph()
     execute(f"""INSERT INTO moderator_messages (ts,username,chat,text)
                 VALUES ({p},{p},{p},{p})""",
@@ -1840,7 +1839,6 @@ async def api_rain_activity(hours: int = 24, limit: int = 100, chat: Optional[st
         top20 = rinfo_sorted[:20]
         won = MY_NICK in recs
 
-        # Merami статус: ищем в receivers_info, если нет — в chat_players
         my_rec = next((x for x in rinfo if x.get("name") == MY_NICK), None)
         my_minutes = my_rec.get("minutes_ago") if my_rec else None
         my_was_active = bool(my_rec and my_rec.get("wrote_in_25min"))
@@ -1908,7 +1906,6 @@ async def api_db_stats():
             out[t] = r["c"] if r else 0
         except Exception:
             out[t] = None
-    # События по типам
     try:
         rains = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='rain'") or {}).get("c", 0)
         tips = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='tip'") or {}).get("c", 0)
@@ -2667,7 +2664,6 @@ async def page_home():
       <div class="card"><h3>Раздали всего</h3><div class="big">{fmt_rub(tr or 0)}</div></div>
       <div class="card"><h3>Чаевых</h3><div class="big">{tips}</div></div>
       <div class="card"><h3>Чаевых сумма</h3><div class="big">{fmt_rub(ttr or 0)}</div></div>
-      
     </div>
     <div class="grid" style="margin-top:16px">
       <div class="card"><h3>Последний деплой сервера</h3><div id="deployBlock" class="big" style="font-size:16px">—</div></div>
@@ -2676,6 +2672,7 @@ async def page_home():
     <script>
       function esc(s){{return (s==null?'':String(s)).replace(/[<>&"]/g,c=>({{'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}}[c]));}}
       function fmtR(v){{return (v||0).toFixed(0);}}
+      async function loadOnce() {{ const r = await fetch('/api/stats'); const d = await r.json(); renderRecent(d.recent); }}
       async function loadDeployInfo() {{
         try {{
           const r = await fetch('/api/server_info').then(r=>r.json());
@@ -2687,8 +2684,6 @@ async def page_home():
             + '<div class="muted" style="font-size:12px;margin-top:4px">commit: <b>' + (r.git_commit||'?') + '</b> · branch: ' + (r.git_branch||'-') + '</div>';
         }} catch(e) {{}}
       }}
-      async function loadOnce() {{ const r = await fetch('/api/stats'); const d = await r.json(); renderRecent(d.recent); }}
-
       function renderRecent(rows) {{
         const el = document.getElementById('recent'); if (!rows) return;
         el.innerHTML = rows.map(r => {{
@@ -2857,14 +2852,6 @@ input,select,textarea{background:#171a21;color:#e6e6e6;border:1px solid #2a2f3a;
 tr.rubric-row td{background:#2a2410 !important}
 .vault-card{background:#151821;border:1px solid #232a37;border-radius:8px;padding:14px 18px;margin-bottom:12px}
 .vault-card h3{margin:0 0 10px;font-size:13px;color:#8ab4f8;text-transform:uppercase}
-.hint-btn{display:inline-block;width:18px;height:18px;line-height:18px;text-align:center;border-radius:50%;
-  background:#1e88e5;color:#fff;font-size:12px;cursor:help;margin-left:8px;font-weight:bold;
-  position:relative;vertical-align:middle;flex-shrink:0;user-select:none;border:none;padding:0}
-.hint-btn:hover{background:#42a5f5}
-.hint-btn:hover::after{content:attr(data-hint);position:absolute;top:26px;left:-200px;width:420px;
-  background:#1a1f28;color:#e6e6e6;border:1px solid #2f3d55;border-radius:8px;padding:14px;
-  font-size:12px;font-weight:normal;line-height:1.6;z-index:1000;white-space:pre-wrap;
-  box-shadow:0 8px 30px rgba(0,0,0,.8);text-align:left;pointer-events:none}
 .calendar-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;max-width:560px}
 .cal-day{background:#10131a;border:1px solid #232a37;border-radius:6px;padding:6px;text-align:center;cursor:pointer;min-height:56px;font-size:11px}
 .cal-day:hover{border-color:#4a7ce0}
@@ -2940,6 +2927,7 @@ tr.rubric-row td{background:#2a2410 !important}
       <button class="btn" onclick="loadBets()">Фильтр</button>
       <button class="btn" onclick="loadBetsTop()">🏆 Топ</button>
       <button class="btn danger" onclick="clearBetsTop()">🗑 Очистить топ</button>
+      <button class="btn danger" onclick="clearBetsTopHard()">💥 Удалить всё</button>
     </div>
     <div id="betStats" style="margin-bottom:16px"></div>
     <table id="tbl-bets"><thead><tr>
@@ -3222,7 +3210,6 @@ async function refreshStatus(){
       else if(i.status==='waiting'||i.status==='rotating'||i.status==='busy') cls+=' warn';
       else if(['error','timeout','verify_error','chat_not_loaded'].includes(i.status)) cls+=' err';
       const upd = i.updated_at ? Math.round(now - i.updated_at)+'с' : '—';
-      // Список чатов для ротации
       let chatsCell = '<b>' + esc(i.current_chat||'—') + '</b>';
       const chats = i.chats || [];
       if (i.mode === 'rotation' && chats.length > 0) {
@@ -3328,12 +3315,24 @@ async function loadBetsTop(){
   if($('betRange').value) p.set('last_hours',$('betRange').value);
   const r = await fetch('/api/bets_top_senders?'+p).then(r=>r.json());
   const el = $('betStats');
-  if(!r.senders.length){ el.innerHTML = '<p class="hint">Пусто</p>'; return; }
+  if(!r.senders.length){ el.innerHTML = '<p class="hint">Пусто (после очистки топ обнулён)</p>'; return; }
   el.innerHTML = '<div class="kpi">' + r.senders.map(s=>'<div>'+esc(s.nickname)+'<b>'+s.cnt+' шт.</b><span class="hint">$'+fmtMoney(s.total_usd)+'</span></div>').join('') + '</div>';
 }
-async function clearBetsTop(){ if(!confirm('Очистить топ?')) return; await fetch('/api/bets/clear_top',{method:'POST'}); alert('OK'); loadBetsTop(); }
+async function clearBetsTop(){
+  if(!confirm('Очистить топ отправителей? (записи ставок останутся, но топ будет считать только новые)')) return;
+  const r = await fetch('/api/bets/clear_top',{method:'POST'}).then(r=>r.json());
+  if(r.ok){ alert('✅ Топ очищен (timestamp: '+new Date(r.cleared_at*1000).toLocaleTimeString('ru-RU')+')'); loadBetsTop(); }
+  else alert('❌ Ошибка');
+}
+async function clearBetsTopHard(){
+  if(!confirm('⚠️ УДАЛИТЬ ВСЕ ставки из БД? Это необратимо!')) return;
+  if(!confirm('Точно? Все данные таблицы bets будут удалены.')) return;
+  const r = await fetch('/api/bets/clear_top?hard=1',{method:'POST'}).then(r=>r.json());
+  if(r.ok){ alert('✅ Удалено записей: '+r.deleted); loadBets(); loadBetsTop(); }
+  else alert('❌ Ошибка');
+}
 async function clearBetsToRains(){
-  if(!confirm('Очистить историю Bets→Rains? Старые данные больше не будут учитываться.')) return;
+  if(!confirm('Очистить историю Bets→Rains?')) return;
   await fetch('/api/bets_to_rains/clear',{method:'POST'}).then(r=>r.json());
   alert('✅ Очищено');
   loadBetsToRains();
@@ -3755,10 +3754,6 @@ async function loadLanguages(){
     + (p.chats||[]).map(c=>'<div class="player-row">'+esc(c)+'</div>').join('')+'</div>').join('');
 }
 
-renderBulkChipsInit();
-
-function renderBulkChipsInit() {}
-
 loadChats();
 refreshStatus();
 pollNgrok();
@@ -3780,20 +3775,20 @@ async def startup_event():
     _load_server_rates()
     try:
         init_db()
-        print("[STARTUP] ✅ Таблицы БД готовы")
+        print("[STARTUP] Таблицы БД готовы")
     except Exception as e:
-        print(f"[STARTUP] ❌ Ошибка init_db: {e}")
+        print(f"[STARTUP] Ошибка init_db: {e}")
     try:
         migrate_ts_once()
-        print("[STARTUP] ✅ Миграция ts выполнена")
+        print("[STARTUP] Миграция ts выполнена")
     except Exception as e:
-        print(f"[STARTUP] ⚠️ migrate_ts_once: {e}")
+        print(f"[STARTUP] migrate_ts_once: {e}")
     threading.Thread(target=rates_refresh_thread, daemon=True).start()
     threading.Thread(target=dedup_thread, daemon=True).start()
     threading.Thread(target=ticks_cleanup_thread, daemon=True).start()
     threading.Thread(target=promo_parser_thread, daemon=True).start()
     print(f"[PROMO] Поток @{PROMO_CHANNEL} запущен")
-    print(f"[STARTUP] 🚀 Сервер запущен, commit={SERVER_GIT_COMMIT}")
+    print(f"[STARTUP] Сервер запущен, commit={SERVER_GIT_COMMIT}")
 
 
 if __name__ == "__main__":
