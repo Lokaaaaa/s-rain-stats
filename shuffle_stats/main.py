@@ -1,4 +1,9 @@
 import os, json, sqlite3, time, threading, re, hashlib
+
+import uuid
+import gc
+import tempfile
+
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import List, Optional
@@ -2220,72 +2225,379 @@ async def api_daily_report(date: str):
                         filename=f"shuffle_report_{date}.docx")
 
 
-# ==================== ПОЛНЫЙ ЭКСПОРТ/ИМПОРТ БД ====================
-@app.get("/api/full_export")
-async def full_export():
-    """Выгружает ВСЕ таблицы + аналитику в один xlsx (все данные, без потерь)."""
+# ==================== ФОНОВЫЙ ЭКСПОРТ + ИМПОРТ С ДОСТАВКОЙ В TG ====================
+EXPORT_BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
+try:
+    EXPORT_CHAT_ID = int(os.environ.get("YOUR_CHAT_ID") or 0)
+except Exception:
+    EXPORT_CHAT_ID = 0
+
+EXPORT_JOBS = {}
+EXPORT_JOBS_LOCK = threading.Lock()
+EXPORT_JOB_TTL = 3600
+
+
+def _tg_notify(text):
+    if not EXPORT_BOT_TOKEN or not EXPORT_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{EXPORT_BOT_TOKEN}/sendMessage",
+            json={"chat_id": EXPORT_CHAT_ID, "text": text,
+                  "parse_mode": "Markdown", "disable_web_page_preview": True},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[TG-NOTIFY] {e}")
+
+
+def _tg_send_doc(path, caption=""):
+    if not EXPORT_BOT_TOKEN or not EXPORT_CHAT_ID:
+        return False
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(
+                f"https://api.telegram.org/bot{EXPORT_BOT_TOKEN}/sendDocument",
+                data={"chat_id": EXPORT_CHAT_ID,
+                      "caption": (caption or "xlsx")[:1024],
+                      "parse_mode": "Markdown"},
+                files={"document": (os.path.basename(path), f)},
+                timeout=180,
+            )
+        return r.status_code == 200
+    except Exception as e:
+        print(f"[TG-DOC] {e}")
+        return False
+
+
+def _upload_to_0x0(path):
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(
+                "https://0x0.st",
+                files={"file": (os.path.basename(path), f)},
+                timeout=180,
+            )
+        if r.status_code == 200 and r.text.strip().startswith("http"):
+            return r.text.strip()
+        print(f"[0x0.st] HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[0x0.st] {e}")
+    return None
+
+
+def _set_job(job_id, **kw):
+    with EXPORT_JOBS_LOCK:
+        if job_id in EXPORT_JOBS:
+            EXPORT_JOBS[job_id].update(kw)
+            EXPORT_JOBS[job_id]["updated_at"] = time.time()
+
+
+def _cleanup_jobs():
+    now = time.time()
+    with EXPORT_JOBS_LOCK:
+        for jid in list(EXPORT_JOBS.keys()):
+            j = EXPORT_JOBS[jid]
+            if now - j.get("created_at", 0) > EXPORT_JOB_TTL:
+                p = j.get("path")
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+                del EXPORT_JOBS[jid]
+
+
+def _build_export_worker(job_id):
+    last = [0.0]
+
+    def progress(msg):
+        now = time.time()
+        if now - last[0] > 4:
+            last[0] = now
+            _tg_notify(msg)
+
+    try:
+        _set_job(job_id, status="building", progress=2, message="Подготовка...")
+        _tg_notify("📦 *Экспорт БД запущен*")
+
+        wb = Workbook()
+        wb.remove(wb.active)
+
+        ws_meta = wb.create_sheet(title="_metadata")
+        ws_meta.append(["key", "value"])
+        ws_meta.append(["exported_at", datetime.now(timezone.utc).isoformat()])
+        ws_meta.append(["server_commit", SERVER_GIT_COMMIT])
+
+        total = len(ALL_TABLES)
+        for i, t in enumerate(ALL_TABLES):
+            pct = 5 + int(75 * (i + 1) / total)
+            _set_job(job_id, progress=pct, message=f"Таблица {t} ({i+1}/{total})")
+            progress(f"📦 `{pct}%` — `{t}` ({i+1}/{total})")
+
+            ws = wb.create_sheet(title=t[:31])
+            try:
+                rows = query_all(f"SELECT * FROM {t}")
+            except Exception as e:
+                ws.append([f"ERROR: {e}"])
+                continue
+            if not rows:
+                ws.append(["(empty table)"])
+                continue
+            headers = list(rows[0].keys())
+            ws.append(headers)
+            for c in ws[1]:
+                c.font = Font(bold=True)
+                c.fill = PatternFill("solid", fgColor="D0D0D0")
+            for r in rows:
+                vals = []
+                for h in headers:
+                    v = r.get(h)
+                    if isinstance(v, (dict, list)):
+                        v = json.dumps(v, ensure_ascii=False)
+                    if isinstance(v, str) and len(v) > 32000:
+                        v = v[:32000] + "...(truncated)"
+                    vals.append(v)
+                ws.append(vals)
+            del rows
+            gc.collect()
+
+        _set_job(job_id, progress=85, message="Аналитика...")
+        progress("📦 `85%` — аналитика для графиков")
+        _add_analytics_sheets(wb)
+
+        _set_job(job_id, progress=95, message="Сохранение...")
+        progress("📦 `95%` — сохранение файла")
+
+        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"full_export_{ts_str}.xlsx"
+        path = os.path.join(tempfile.gettempdir(), fname)
+        wb.save(path)
+        del wb
+        gc.collect()
+        size = os.path.getsize(path)
+        size_str = _human_size(size)
+
+        _set_job(job_id, status="ready", progress=100,
+                 path=path, filename=fname, size=size, message=f"Готово ({size_str})")
+
+        if size <= 45 * 1024 * 1024:
+            progress(f"📦 `100%` — отправляю в TG ({size_str})")
+            ok = _tg_send_doc(path, caption=f"📦 Экспорт БД · {size_str}")
+            _set_job(job_id, delivered=("telegram" if ok else "failed"))
+        else:
+            progress(f"📦 `100%` — {size_str} > 45MB, загружаю на 0x0.st...")
+            url = _upload_to_0x0(path)
+            if url:
+                _tg_notify(
+                    f"📦 *Экспорт БД готов*\n\n"
+                    f"📎 Размер: `{size_str}`\n"
+                    f"🔗 [Скачать]({url})\n\n"
+                    f"_Ссылка живёт ~30 дней. Скачай и сохрани локально._"
+                )
+                _set_job(job_id, delivered="0x0", cloud_url=url)
+            else:
+                _set_job(job_id, status="error", error="cloud upload failed")
+                _tg_notify(f"⚠️ Файл `{size_str}` готов, но облако недоступно. Попробуй ещё раз.")
+    except MemoryError:
+        _set_job(job_id, status="error", error="OOM")
+        _tg_notify("❌ *Экспорт: OOM* — БД больше 512 МБ RAM Render")
+    except Exception as e:
+        _set_job(job_id, status="error", error=str(e)[:200])
+        _tg_notify(f"❌ *Экспорт упал*: `{str(e)[:120]}`")
+
+
+@app.post("/api/full_export/start")
+def full_export_start(x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
     if not HAS_XLSX:
         raise HTTPException(503, "openpyxl не установлен на сервере")
-    wb = Workbook()
-    wb.remove(wb.active)
+    _cleanup_jobs()
+    job_id = str(uuid.uuid4())
+    with EXPORT_JOBS_LOCK:
+        EXPORT_JOBS[job_id] = {
+            "job_id": job_id, "status": "queued",
+            "created_at": time.time(), "updated_at": time.time(),
+        }
+    threading.Thread(target=_build_export_worker, args=(job_id,), daemon=True).start()
+    return {"ok": True, "job_id": job_id,
+            "message": "Экспорт запущен. Прогресс и файл придут в Telegram."}
 
-    # Metadata
-    ws_meta = wb.create_sheet(title="_metadata")
-    ws_meta.append(["key", "value"])
-    for c in ws_meta[1]: c.font = Font(bold=True)
-    ws_meta.append(["exported_at", datetime.now(timezone.utc).isoformat()])
-    ws_meta.append(["exported_ts", time.time()])
-    ws_meta.append(["server_commit", SERVER_GIT_COMMIT])
-    ws_meta.append(["use_postgres", USE_POSTGRES])
-    ws_meta.append(["format_version", "1"])
-    ws_meta.append(["INSTRUCTION",
-                    "Для восстановления: /api/full_import, mode=replace, confirm=REPLACE. "
-                    "Формат сохраняет id (связи целы). Data loss: НЕТ."])
-    ws_meta.column_dimensions['A'].width = 25
-    ws_meta.column_dimensions['B'].width = 90
 
-    # Все таблицы
-    for t in ALL_TABLES:
-        ws = wb.create_sheet(title=t[:31])
+@app.get("/api/full_export/status/{job_id}")
+def full_export_status(job_id: str):
+    with EXPORT_JOBS_LOCK:
+        j = dict(EXPORT_JOBS.get(job_id, {}))
+    if not j:
+        raise HTTPException(404, "job not found")
+    j.pop("path", None)
+    return j
+
+
+def _import_worker(job_id, tmp_path, mode):
+    try:
+        _set_job(job_id, status="building", message="Открываю файл...")
+        _tg_notify(f"📤 *Импорт БД* (mode=`{mode}`) — старт")
+        wb = load_workbook(tmp_path, read_only=True, data_only=True)
+
+        if mode == "replace":
+            _set_job(job_id, message="Очистка таблиц...")
+            _tg_notify("📤 Очищаю таблицы...")
+            for t in ALL_TABLES:
+                try:
+                    execute(f"DELETE FROM {t}")
+                except Exception:
+                    pass
+
+        sheets = [s for s in wb.sheetnames
+                  if not s.startswith("_") and s in ALL_TABLES]
+        total = len(sheets)
+        stats = {}
+
+        for i, sheet_name in enumerate(sheets):
+            pct = 5 + int(90 * (i + 1) / total)
+            _set_job(job_id, progress=pct, message=f"{sheet_name} ({i+1}/{total})")
+            _tg_notify(f"📤 `{pct}%` — `{sheet_name}`")
+            ws = wb[sheet_name]
+            rows_iter = ws.iter_rows(values_only=True)
+            try:
+                headers = next(rows_iter)
+            except StopIteration:
+                stats[sheet_name] = {"inserted": 0, "skipped": 0}
+                continue
+            headers = [str(h) if h is not None else "" for h in headers]
+            if not headers or headers[0] in ("(empty table)", "(empty)"):
+                stats[sheet_name] = {"inserted": 0, "skipped": 0}
+                continue
+            cols_clean = [h for h in headers if h]
+            if not cols_clean:
+                continue
+            cols_str = ",".join(cols_clean)
+
+            if USE_POSTGRES:
+                ph_str = ",".join(["%s"] * len(cols_clean))
+                sql = (f"INSERT INTO {sheet_name} ({cols_str}) "
+                       f"VALUES ({ph_str}) ON CONFLICT DO NOTHING")
+            else:
+                ph_str = ",".join(["?"] * len(cols_clean))
+                sql = (f"INSERT OR IGNORE INTO {sheet_name} ({cols_str}) "
+                       f"VALUES ({ph_str})")
+
+            bool_cols_in_pg = {"is_top"} if USE_POSTGRES else set()
+            id_idx = cols_clean.index("id") if "id" in cols_clean else -1
+
+            inserted = 0
+            skipped = 0
+            conn = get_db()
+            try:
+                cur = conn.cursor()
+                for row in rows_iter:
+                    if row is None or all(v is None for v in row):
+                        continue
+                    try:
+                        vals = []
+                        for idx, h in enumerate(headers):
+                            if not h:
+                                vals.append(None)
+                                continue
+                            v = row[idx] if idx < len(row) else None
+                            if isinstance(v, datetime):
+                                v = v.isoformat()
+                            elif hasattr(v, "isoformat") and not isinstance(v, (str, bytes)):
+                                try:
+                                    v = v.isoformat()
+                                except Exception:
+                                    pass
+                            if h in bool_cols_in_pg and v is not None and not isinstance(v, bool):
+                                try:
+                                    v = bool(int(v))
+                                except Exception:
+                                    v = bool(v)
+                            vals.append(v)
+                        if id_idx >= 0 and vals[id_idx] is None:
+                            skipped += 1
+                            continue
+                        cur.execute(sql, tuple(vals))
+                        inserted += 1
+                    except Exception:
+                        skipped += 1
+                conn.commit()
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                stats[sheet_name] = {"inserted": inserted, "skipped": skipped,
+                                     "error": str(e)[:200]}
+                continue
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+            stats[sheet_name] = {"inserted": inserted, "skipped": skipped}
+
+        if USE_POSTGRES:
+            for t in SERIAL_TABLES:
+                try:
+                    execute(f"SELECT setval(pg_get_serial_sequence('{t}','id'), "
+                            f"COALESCE((SELECT MAX(id) FROM {t}), 1), "
+                            f"(SELECT MAX(id) IS NOT NULL FROM {t}))")
+                except Exception:
+                    pass
+
+        _set_job(job_id, status="ready", progress=100, message="Готово")
+        summary = "\n".join(
+            f"`{k}`: +{v.get('inserted',0)} / skip {v.get('skipped',0)}"
+            + (f" ⚠ `{v.get('error','')[:60]}`" if v.get("error") else "")
+            for k, v in stats.items()
+        )
+        _tg_notify(f"✅ *Импорт завершён* (mode=`{mode}`)\n\n{summary}")
+    except Exception as e:
+        _set_job(job_id, status="error", error=str(e)[:200])
+        _tg_notify(f"❌ *Импорт упал*: `{str(e)[:120]}`")
+    finally:
         try:
-            rows = query_all(f"SELECT * FROM {t}")
-        except Exception as e:
-            ws.append([f"ERROR: {e}"])
-            ws_meta.append([f"rows_{t}", 0])
-            continue
-        ws_meta.append([f"rows_{t}", len(rows)])
-        if not rows:
-            ws.append(["(empty table)"])
-            continue
-        headers = list(rows[0].keys())
-        ws.append(headers)
-        for c in ws[1]:
-            c.font = Font(bold=True)
-            c.fill = PatternFill("solid", fgColor="D0D0D0")
-        for r in rows:
-            vals = []
-            for h in headers:
-                v = r.get(h)
-                if isinstance(v, (dict, list)):
-                    v = json.dumps(v, ensure_ascii=False)
-                if isinstance(v, str) and len(v) > 32000:
-                    v = v[:32000] + "...(truncated)"
-                vals.append(v)
-            ws.append(vals)
-        for i, h in enumerate(headers, 1):
-            ws.column_dimensions[get_column_letter(i)].width = min(50, max(12, len(str(h)) + 4))
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
-    # Аналитика
-    _add_analytics_sheets(wb)
 
-    path = os.path.join(SCREENSHOT_DIR,
-                        f"full_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-    wb.save(path)
-    return FileResponse(
-        path,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=os.path.basename(path),
-    )
+@app.post("/api/full_import/start")
+async def full_import_start(
+    file: UploadFile = File(...),
+    mode: str = Form("merge"),
+    confirm: str = Form(""),
+    x_api_key: str = Header(default=""),
+):
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
+    if not HAS_XLSX:
+        raise HTTPException(503, "openpyxl не установлен")
+    if mode not in ("merge", "replace"):
+        raise HTTPException(400, "mode must be merge or replace")
+    if mode == "replace" and confirm != "REPLACE":
+        raise HTTPException(400, "Для replace требуется confirm=REPLACE")
+
+    content = await file.read()
+    tmp_path = os.path.join(tempfile.gettempdir(),
+                            f"import_{int(time.time())}.xlsx")
+    with open(tmp_path, "wb") as f:
+        f.write(content)
+
+    _cleanup_jobs()
+    job_id = str(uuid.uuid4())
+    with EXPORT_JOBS_LOCK:
+        EXPORT_JOBS[job_id] = {
+            "job_id": job_id, "status": "queued",
+            "created_at": time.time(), "updated_at": time.time(),
+        }
+    threading.Thread(target=_import_worker,
+                     args=(job_id, tmp_path, mode), daemon=True).start()
+    return {"ok": True, "job_id": job_id,
+            "message": "Импорт запущен. Прогресс придёт в Telegram."}
 
 
 @app.post("/api/full_import")
@@ -3587,8 +3899,9 @@ tr.bet-row.chat:hover td{background:rgba(197,138,249,.12)}
       <b>ни одна запись не теряется</b>.
     </p>
     <div class="row-flex">
-      <a href="/api/full_export" class="btn green" style="text-decoration:none;display:inline-block">📥 Скачать всё (.xlsx)</a>
-    </div>
+  <button class="btn green" onclick="startExport()">📥 Экспорт → в Telegram</button>
+  <span class="hint" id="exportStatus"></span>
+</div>
 
     <hr style="border:none;border-top:1px solid #2a2f3a;margin:14px 0">
     <h4 style="margin:0 0 8px;font-size:13px;color:#aab">📤 Импорт из xlsx (для переезда на новую БД)</h4>
@@ -3599,6 +3912,7 @@ tr.bet-row.chat:hover td{background:rgba(197,138,249,.12)}
         <option value="replace">🔄 Заменить всё (replace)</option>
       </select>
       <button class="btn blue" onclick="doImport()">📤 Импорт</button>
+      <button class="btn" onclick="startExportStatusLast()">🔄 Проверить статус</button>
       <span class="hint" id="importStatus"></span>
     </div>
     <p class="hint">
@@ -4001,51 +4315,76 @@ async function loadIntentsStats(){
 
 async function doImport(){
   const f = document.getElementById('importFile').files[0];
-  if (!f) { alert('Выбери .xlsx файл'); return; }
+  if (!f) { alert('Выбери .xlsx'); return; }
   const mode = document.getElementById('importMode').value;
   let apiKey = localStorage.getItem('apiKey') || '';
   if (!apiKey) {
-    apiKey = prompt('X-API-Key (из env API_KEY на сервере):', 'CHANGE_ME_SECRET_KEY');
+    apiKey = prompt('X-API-Key:', 'CHANGE_ME_SECRET_KEY');
     if (!apiKey) return;
     localStorage.setItem('apiKey', apiKey);
   }
-  if (mode === 'replace' && !confirm('⚠️ УДАЛИТЬ ВСЕ ДАННЫЕ и заменить содержимым файла?')) return;
-  if (!confirm('Импортировать "'+f.name+'" ('+mode+')? Может занять несколько минут.')) return;
+  if (mode === 'replace' && !confirm('⚠️ УДАЛИТЬ ВСЕ ДАННЫЕ и заменить?')) return;
 
   const st = document.getElementById('importStatus');
-  st.textContent = '⏳ Загрузка... не закрывай вкладку';
+  st.textContent = '⏳ Загрузка файла...';
   const fd = new FormData();
   fd.append('file', f);
   fd.append('mode', mode);
   fd.append('confirm', mode === 'replace' ? 'REPLACE' : '');
 
   try {
-    const r = await fetch('/api/full_import', {method:'POST', body: fd,
-      headers:{'X-API-Key': apiKey}});
+    const r = await fetch('/api/full_import/start', {
+      method: 'POST', body: fd, headers: {'X-API-Key': apiKey}
+    });
     if (r.status === 401) {
       localStorage.removeItem('apiKey');
       st.textContent = '❌ Неверный API key';
-      alert('❌ Неверный X-API-Key. Введи заново при следующем импорте.');
       return;
     }
     const d = await r.json();
     if (d.ok) {
-      const lines = Object.entries(d.stats).map(([t,s])=>
-        t + ': +' + (s.inserted||0) + ' / skip ' + (s.skipped||0)
-        + (s.error ? ' ⚠ ' + s.error : '')
-      ).join('\n');
-      st.textContent = '✅ Импорт завершён';
-      alert('✅ Импорт завершён ('+mode+'):\n\n' + lines);
-      refreshStatus();
-      loadCalendar();
+      st.textContent = '✅ Загрузка принята. Дальнейший прогресс придёт в Telegram.';
     } else {
-      st.textContent = '❌ ' + (d.detail || 'ошибка');
-      alert('❌ ' + (d.detail || 'ошибка'));
+      st.textContent = '❌ ' + (d.error || d.detail || 'ошибка');
     }
   } catch(e) {
     st.textContent = '❌ ' + e.message;
-    alert('❌ Ошибка: ' + e.message);
   }
+}
+
+async function startExport(){
+  let apiKey = localStorage.getItem('apiKey') || '';
+  if (!apiKey) {
+    apiKey = prompt('X-API-Key:', 'CHANGE_ME_SECRET_KEY');
+    if (!apiKey) return;
+    localStorage.setItem('apiKey', apiKey);
+  }
+  const st = document.getElementById('exportStatus');
+  st.textContent = '⏳ Отправляю...';
+  try {
+    const r = await fetch('/api/full_export/start', {
+      method: 'POST',
+      headers: {'X-API-Key': apiKey}
+    });
+    if (r.status === 401) {
+      localStorage.removeItem('apiKey');
+      st.textContent = '❌ Неверный API key';
+      return;
+    }
+    const d = await r.json();
+    if (d.ok) {
+      st.textContent = '✅ Экспорт запущен. Прогресс и файл придут в Telegram.';
+    } else {
+      st.textContent = '❌ ' + (d.error || 'ошибка');
+    }
+  } catch(e) {
+    st.textContent = '❌ ' + e.message;
+  }
+}
+
+async function startExportStatusLast(){
+  // просто напоминание — статус теперь в TG
+  alert('Статус и файл приходят в Telegram-бот. Ничего больше делать не нужно.');
 }
 
 function exportChartImage(canvasId){
