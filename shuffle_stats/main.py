@@ -200,7 +200,7 @@ def _human_size(n):
     return f"{n:.2f} PB"
 
 def _add_analytics_sheets(wb):
-    """Дополнительные листы для графиков (считаются на лету из events/bets)."""
+    """Аналитика для графиков. Без стилизации — совместимо с write_only."""
     try:
         day_expr = ("to_char(to_timestamp(ts),'YYYY-MM-DD')" if USE_POSTGRES
                     else "strftime('%Y-%m-%d',ts,'unixepoch')")
@@ -214,13 +214,9 @@ def _add_analytics_sheets(wb):
                              GROUP BY day ORDER BY day ASC""")
         ws = wb.create_sheet(title="_analytics_daily")
         ws.append(["date", "events", "rains", "tips", "total_rub", "total_usd"])
-        for c in ws[1]: c.font = Font(bold=True)
         for r in rows:
             ws.append([r["day"], r["events"], r["rains"], r["tips"],
                        round(r["total_rub"] or 0, 2), round(r["total_usd"] or 0, 2)])
-        ws.column_dimensions['A'].width = 14
-        for col in "BCDEF":
-            ws.column_dimensions[col].width = 12
     except Exception as e:
         print(f"[EXPORT analytics_daily] {e}")
 
@@ -232,7 +228,6 @@ def _add_analytics_sheets(wb):
                              FROM events WHERE ts IS NOT NULL GROUP BY h ORDER BY h ASC""")
         ws = wb.create_sheet(title="_analytics_hourly")
         ws.append(["hour", "events", "total_rub"])
-        for c in ws[1]: c.font = Font(bold=True)
         buckets = {h: {"c": 0, "rub": 0} for h in range(24)}
         for r in rows:
             if r["h"] is not None:
@@ -251,7 +246,6 @@ def _add_analytics_sheets(wb):
                             FROM events GROUP BY chat ORDER BY total DESC""")
         ws = wb.create_sheet(title="_analytics_by_chat")
         ws.append(["chat", "total", "rains", "tips", "total_rub"])
-        for c in ws[1]: c.font = Font(bold=True)
         for r in rows:
             ws.append([r["chat"], r["total"], r["rains"], r["tips"], round(r["rub"] or 0, 2)])
     except Exception as e:
@@ -264,7 +258,6 @@ def _add_analytics_sheets(wb):
                             GROUP BY sender ORDER BY rub DESC LIMIT 500""")
         ws = wb.create_sheet(title="_analytics_top_senders")
         ws.append(["#", "nickname", "rain_count", "total_rub"])
-        for c in ws[1]: c.font = Font(bold=True)
         for i, r in enumerate(rows, 1):
             ws.append([i, r["sender"], r["cnt"], round(r["rub"] or 0, 2)])
     except Exception as e:
@@ -290,7 +283,6 @@ def _add_analytics_sheets(wb):
         arr = sorted(agg.items(), key=lambda x: -x[1]["rub"])[:500]
         ws = wb.create_sheet(title="_analytics_top_receivers")
         ws.append(["#", "nickname", "win_count", "total_rub"])
-        for c in ws[1]: c.font = Font(bold=True)
         for i, (n, d) in enumerate(arr, 1):
             ws.append([i, n, d["count"], round(d["rub"], 2)])
     except Exception as e:
@@ -304,7 +296,6 @@ def _add_analytics_sheets(wb):
                             ORDER BY cnt DESC""")
         ws = wb.create_sheet(title="_analytics_bets_by_chat")
         ws.append(["source", "chat", "count", "total_usd", "total_rub"])
-        for c in ws[1]: c.font = Font(bold=True)
         for r in rows:
             ws.append([r["source"], r["chat"], r["cnt"],
                        round(r["usd"] or 0, 2), round(r["rub"] or 0, 2)])
@@ -318,7 +309,6 @@ def _add_analytics_sheets(wb):
                             FROM intents GROUP BY sender ORDER BY matched DESC""")
         ws = wb.create_sheet(title="_analytics_intents")
         ws.append(["nickname", "total", "matched", "avg_ai_percent"])
-        for c in ws[1]: c.font = Font(bold=True)
         for r in rows:
             ws.append([r["nickname"], r["total"], r["matched"] or 0, r["avg_pct"] or 0])
     except Exception as e:
@@ -2315,6 +2305,7 @@ def _cleanup_jobs():
 
 
 def _build_export_worker(job_id):
+    """Стриминговый экспорт: Workbook(write_only) + чтение из БД кусками."""
     last = [0.0]
 
     def progress(msg):
@@ -2322,34 +2313,62 @@ def _build_export_worker(job_id):
         if now - last[0] > 4:
             last[0] = now
             _tg_notify(msg)
-    
-    # heartbeat каждые 15 сек — видно, жив ли поток
+
+    def _serialize(v):
+        if isinstance(v, (dict, list)):
+            return json.dumps(v, ensure_ascii=False)
+        if isinstance(v, datetime):
+            return v.isoformat()
+        if hasattr(v, "isoformat") and not isinstance(v, (str, bytes)):
+            try:
+                return v.isoformat()
+            except Exception:
+                pass
+        if isinstance(v, str) and len(v) > 32000:
+            return v[:32000] + "...(truncated)"
+        return v
+
+    # heartbeat каждые 15 сек
     import threading as _th
     _stop_hb = _th.Event()
 
     def _heartbeat():
         while not _stop_hb.is_set():
             try:
-                import psutil
-                rss = round(psutil.Process().memory_info().rss / 1024 / 1024, 1)
-                _tg_notify(f"💓 Экспорт жив · RAM {rss} MB")
+                rss = -1
+                try:
+                    with open("/proc/self/status") as f:
+                        for line in f:
+                            if line.startswith("VmRSS:"):
+                                rss = round(int(line.split()[1]) / 1024, 1)
+                                break
+                except Exception:
+                    pass
+                
+                if rss > 0:
+                    _tg_notify(f"💓 Экспорт жив · RAM {rss} MB")
+                else:
+                    _tg_notify("💓 Экспорт жив")
             except Exception:
-                _tg_notify("💓 Экспорт жив")
+                pass
             _stop_hb.wait(15)
 
     _th.Thread(target=_heartbeat, daemon=True).start()
 
     try:
         _set_job(job_id, status="building", progress=2, message="Подготовка...")
-        _tg_notify("📦 *Экспорт БД запущен*")
+        _tg_notify("📦 *Экспорт БД запущен* (стриминг)")
 
-        wb = Workbook()
-        wb.remove(wb.active)
+        # ГЛАВНОЕ: write_only — ячейки сразу пишутся на диск, память не растет!
+        wb = Workbook(write_only=True)
 
         ws_meta = wb.create_sheet(title="_metadata")
         ws_meta.append(["key", "value"])
         ws_meta.append(["exported_at", datetime.now(timezone.utc).isoformat()])
+        ws_meta.append(["exported_ts", time.time()])
         ws_meta.append(["server_commit", SERVER_GIT_COMMIT])
+        ws_meta.append(["use_postgres", USE_POSTGRES])
+        ws_meta.append(["format_version", "1"])
 
         total = len(ALL_TABLES)
         for i, t in enumerate(ALL_TABLES):
@@ -2358,34 +2377,43 @@ def _build_export_worker(job_id):
             progress(f"📦 `{pct}%` — `{t}` ({i+1}/{total})")
 
             ws = wb.create_sheet(title=t[:31])
+            
             try:
-                rows = query_all(f"SELECT * FROM {t}")
+                conn = get_db()
+                cur = conn.cursor()
+                offset = 0
+                limit = 2000
+                headers = None
+                
+                # Читаем таблицу кусками по 2000 строк, чтобы не перегружать RAM
+                while True:
+                    cur.execute(f"SELECT * FROM {t} LIMIT {limit} OFFSET {offset}")
+                    rows = cur.fetchall()
+                    if not rows:
+                        break
+                    
+                    if headers is None:
+                        headers = [d[0] for d in cur.description]
+                        ws.append(headers)
+                        
+                    for row in rows:
+                        ws.append([_serialize(v) for v in row])
+                        
+                    offset += limit
+                    del rows
+                    gc.collect()
+                    
+                cur.close()
+                conn.close()
             except Exception as e:
+                print(f"[EXPORT {t}] {type(e).__name__}: {e}")
+                progress(f"📦 ⚠️ `{t}` — ошибка: `{str(e)[:80]}`")
                 ws.append([f"ERROR: {e}"])
-                continue
-            if not rows:
-                ws.append(["(empty table)"])
-                continue
-            headers = list(rows[0].keys())
-            ws.append(headers)
-            for c in ws[1]:
-                c.font = Font(bold=True)
-                c.fill = PatternFill("solid", fgColor="D0D0D0")
-            for r in rows:
-                vals = []
-                for h in headers:
-                    v = r.get(h)
-                    if isinstance(v, (dict, list)):
-                        v = json.dumps(v, ensure_ascii=False)
-                    if isinstance(v, str) and len(v) > 32000:
-                        v = v[:32000] + "...(truncated)"
-                    vals.append(v)
-                ws.append(vals)
-            del rows
+
             gc.collect()
 
         _set_job(job_id, progress=85, message="Аналитика...")
-        progress("📦 `85%` — аналитика для графиков")
+        progress("📦 `85%` — аналитика")
         _add_analytics_sheets(wb)
 
         _set_job(job_id, progress=95, message="Сохранение...")
@@ -2401,29 +2429,29 @@ def _build_export_worker(job_id):
         size_str = _human_size(size)
 
         _set_job(job_id, status="ready", progress=100,
-                 path=path, filename=fname, size=size, message=f"Готово ({size_str})")
+                 path=path, filename=fname, size=size,
+                 message=f"Готово ({size_str})")
 
         if size <= 45 * 1024 * 1024:
             progress(f"📦 `100%` — отправляю в TG ({size_str})")
             ok = _tg_send_doc(path, caption=f"📦 Экспорт БД · {size_str}")
             _set_job(job_id, delivered=("telegram" if ok else "failed"))
         else:
-            progress(f"📦 `100%` — {size_str} > 45MB, загружаю на 0x0.st...")
+            progress(f"📦 `100%` — {size_str} > 45MB, на 0x0.st...")
             url = _upload_to_0x0(path)
             if url:
                 _tg_notify(
                     f"📦 *Экспорт БД готов*\n\n"
                     f"📎 Размер: `{size_str}`\n"
-                    f"🔗 [Скачать]({url})\n\n"
-                    f"_Ссылка живёт ~30 дней. Скачай и сохрани локально._"
+                    f"🔗 [Скачать]({url})"
                 )
                 _set_job(job_id, delivered="0x0", cloud_url=url)
             else:
                 _set_job(job_id, status="error", error="cloud upload failed")
-                _tg_notify(f"⚠️ Файл `{size_str}` готов, но облако недоступно. Попробуй ещё раз.")
+                _tg_notify(f"⚠️ Файл `{size_str}` готов, но 0x0.st не ответил.")
     except MemoryError:
         _set_job(job_id, status="error", error="OOM")
-        _tg_notify("❌ *Экспорт: OOM* — БД больше 512 МБ RAM Render")
+        _tg_notify("❌ *Экспорт: OOM* — память кончилась.")
     except Exception as e:
         _set_job(job_id, status="error", error=str(e)[:200])
         _tg_notify(f"❌ *Экспорт упал*: `{str(e)[:120]}`")
