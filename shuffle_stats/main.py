@@ -17,6 +17,16 @@ try:
 except ImportError:
     HAS_DOCX = False
 
+# ===== NEW: XLSX для полного экспорта/импорта БД =====
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    HAS_XLSX = True
+except ImportError:
+    HAS_XLSX = False
+    print("[STARTUP] ⚠️ openpyxl не установлен — экспорт xlsx недоступен")
+
 DB_PATH = os.environ.get("DB_PATH", "shuffle.db")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 USE_POSTGRES = bool(DATABASE_URL)
@@ -156,6 +166,158 @@ def rates_refresh_thread():
             _fetch_server_rates()
         except Exception:
             pass
+
+
+# ==================== ЭКСПОРТ/ИМПОРТ/INFO ====================
+ALL_TABLES = [
+    "events", "bets", "intents", "bulk_alerts", "player_activity",
+    "chat_players", "player_message_ticks", "moderator_messages",
+    "moderators", "promocodes", "chat_tasks", "player_profiles",
+    "account_balances", "vault_balances", "vault_transactions",
+    "wager_state", "vault_meta", "meta",
+]
+
+# Только эти таблицы имеют SERIAL/AUTOINCREMENT id (для reset sequence после импорта)
+SERIAL_TABLES = [
+    "events", "bets", "intents", "bulk_alerts", "player_activity",
+    "chat_players", "moderator_messages", "promocodes", "chat_tasks",
+    "player_profiles", "vault_transactions",
+]
+
+def _human_size(n):
+    if n is None:
+        return "—"
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024.0:
+            return f"{n:.2f} {unit}"
+        n /= 1024.0
+    return f"{n:.2f} PB"
+
+def _add_analytics_sheets(wb):
+    """Дополнительные листы для графиков (считаются на лету из events/bets)."""
+    try:
+        day_expr = ("to_char(to_timestamp(ts),'YYYY-MM-DD')" if USE_POSTGRES
+                    else "strftime('%Y-%m-%d',ts,'unixepoch')")
+        rows = query_all(f"""SELECT {day_expr} AS day,
+                             SUM(CASE WHEN type='rain' THEN 1 ELSE 0 END) AS rains,
+                             SUM(CASE WHEN type='tip' THEN 1 ELSE 0 END) AS tips,
+                             COUNT(*) AS events,
+                             COALESCE(SUM(amount_rub),0) AS total_rub,
+                             COALESCE(SUM(amount_usd),0) AS total_usd
+                             FROM events WHERE ts IS NOT NULL
+                             GROUP BY day ORDER BY day ASC""")
+        ws = wb.create_sheet(title="_analytics_daily")
+        ws.append(["date", "events", "rains", "tips", "total_rub", "total_usd"])
+        for c in ws[1]: c.font = Font(bold=True)
+        for r in rows:
+            ws.append([r["day"], r["events"], r["rains"], r["tips"],
+                       round(r["total_rub"] or 0, 2), round(r["total_usd"] or 0, 2)])
+        ws.column_dimensions['A'].width = 14
+        for col in "BCDEF":
+            ws.column_dimensions[col].width = 12
+    except Exception as e:
+        print(f"[EXPORT analytics_daily] {e}")
+
+    try:
+        hour_expr = ("CAST(EXTRACT(HOUR FROM to_timestamp(ts)) AS INTEGER)" if USE_POSTGRES
+                     else "CAST(strftime('%H', ts, 'unixepoch') AS INTEGER)")
+        rows = query_all(f"""SELECT {hour_expr} AS h, COUNT(*) AS c,
+                             COALESCE(SUM(amount_rub),0) AS rub
+                             FROM events WHERE ts IS NOT NULL GROUP BY h ORDER BY h ASC""")
+        ws = wb.create_sheet(title="_analytics_hourly")
+        ws.append(["hour", "events", "total_rub"])
+        for c in ws[1]: c.font = Font(bold=True)
+        buckets = {h: {"c": 0, "rub": 0} for h in range(24)}
+        for r in rows:
+            if r["h"] is not None:
+                buckets[int(r["h"])] = {"c": r["c"], "rub": r["rub"] or 0}
+        for h in range(24):
+            ws.append([f"{h:02d}:00", buckets[h]["c"], round(buckets[h]["rub"], 2)])
+    except Exception as e:
+        print(f"[EXPORT analytics_hourly] {e}")
+
+    try:
+        rows = query_all("""SELECT chat,
+                            SUM(CASE WHEN type='rain' THEN 1 ELSE 0 END) AS rains,
+                            SUM(CASE WHEN type='tip' THEN 1 ELSE 0 END) AS tips,
+                            COUNT(*) AS total,
+                            COALESCE(SUM(amount_rub),0) AS rub
+                            FROM events GROUP BY chat ORDER BY total DESC""")
+        ws = wb.create_sheet(title="_analytics_by_chat")
+        ws.append(["chat", "total", "rains", "tips", "total_rub"])
+        for c in ws[1]: c.font = Font(bold=True)
+        for r in rows:
+            ws.append([r["chat"], r["total"], r["rains"], r["tips"], round(r["rub"] or 0, 2)])
+    except Exception as e:
+        print(f"[EXPORT analytics_by_chat] {e}")
+
+    try:
+        rows = query_all("""SELECT sender, COUNT(*) AS cnt,
+                            COALESCE(SUM(amount_rub),0) AS rub
+                            FROM events WHERE type='rain'
+                            GROUP BY sender ORDER BY rub DESC LIMIT 500""")
+        ws = wb.create_sheet(title="_analytics_top_senders")
+        ws.append(["#", "nickname", "rain_count", "total_rub"])
+        for c in ws[1]: c.font = Font(bold=True)
+        for i, r in enumerate(rows, 1):
+            ws.append([i, r["sender"], r["cnt"], round(r["rub"] or 0, 2)])
+    except Exception as e:
+        print(f"[EXPORT analytics_top_senders] {e}")
+
+    try:
+        rows = query_all("""SELECT receivers, amount_rub FROM events
+                            WHERE type='rain' AND receivers IS NOT NULL""")
+        agg = {}
+        for r in rows:
+            try:
+                recs = json.loads(r.get("receivers") or "[]")
+            except Exception:
+                recs = []
+            if not recs:
+                continue
+            per = (r.get("amount_rub") or 0) / len(recs)
+            for n in recs:
+                if n not in agg:
+                    agg[n] = {"count": 0, "rub": 0.0}
+                agg[n]["count"] += 1
+                agg[n]["rub"] += per
+        arr = sorted(agg.items(), key=lambda x: -x[1]["rub"])[:500]
+        ws = wb.create_sheet(title="_analytics_top_receivers")
+        ws.append(["#", "nickname", "win_count", "total_rub"])
+        for c in ws[1]: c.font = Font(bold=True)
+        for i, (n, d) in enumerate(arr, 1):
+            ws.append([i, n, d["count"], round(d["rub"], 2)])
+    except Exception as e:
+        print(f"[EXPORT analytics_top_receivers] {e}")
+
+    try:
+        rows = query_all("""SELECT source, chat, COUNT(*) AS cnt,
+                            COALESCE(SUM(amount_usd),0) AS usd,
+                            COALESCE(SUM(amount_rub),0) AS rub
+                            FROM bets GROUP BY source, chat
+                            ORDER BY cnt DESC""")
+        ws = wb.create_sheet(title="_analytics_bets_by_chat")
+        ws.append(["source", "chat", "count", "total_usd", "total_rub"])
+        for c in ws[1]: c.font = Font(bold=True)
+        for r in rows:
+            ws.append([r["source"], r["chat"], r["cnt"],
+                       round(r["usd"] or 0, 2), round(r["rub"] or 0, 2)])
+    except Exception as e:
+        print(f"[EXPORT analytics_bets] {e}")
+
+    try:
+        rows = query_all("""SELECT sender AS nickname, COUNT(*) AS total,
+                            SUM(CASE WHEN matched_rain_id IS NOT NULL THEN 1 ELSE 0 END) AS matched,
+                            ROUND(AVG(percent),0) AS avg_pct
+                            FROM intents GROUP BY sender ORDER BY matched DESC""")
+        ws = wb.create_sheet(title="_analytics_intents")
+        ws.append(["nickname", "total", "matched", "avg_ai_percent"])
+        for c in ws[1]: c.font = Font(bold=True)
+        for r in rows:
+            ws.append([r["nickname"], r["total"], r["matched"] or 0, r["avg_pct"] or 0])
+    except Exception as e:
+        print(f"[EXPORT analytics_intents] {e}")
 
 
 # ==================== БАЗА ====================
@@ -2058,6 +2220,314 @@ async def api_daily_report(date: str):
                         filename=f"shuffle_report_{date}.docx")
 
 
+# ==================== ПОЛНЫЙ ЭКСПОРТ/ИМПОРТ БД ====================
+@app.get("/api/full_export")
+async def full_export():
+    """Выгружает ВСЕ таблицы + аналитику в один xlsx (все данные, без потерь)."""
+    if not HAS_XLSX:
+        raise HTTPException(503, "openpyxl не установлен на сервере")
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # Metadata
+    ws_meta = wb.create_sheet(title="_metadata")
+    ws_meta.append(["key", "value"])
+    for c in ws_meta[1]: c.font = Font(bold=True)
+    ws_meta.append(["exported_at", datetime.now(timezone.utc).isoformat()])
+    ws_meta.append(["exported_ts", time.time()])
+    ws_meta.append(["server_commit", SERVER_GIT_COMMIT])
+    ws_meta.append(["use_postgres", USE_POSTGRES])
+    ws_meta.append(["format_version", "1"])
+    ws_meta.append(["INSTRUCTION",
+                    "Для восстановления: /api/full_import, mode=replace, confirm=REPLACE. "
+                    "Формат сохраняет id (связи целы). Data loss: НЕТ."])
+    ws_meta.column_dimensions['A'].width = 25
+    ws_meta.column_dimensions['B'].width = 90
+
+    # Все таблицы
+    for t in ALL_TABLES:
+        ws = wb.create_sheet(title=t[:31])
+        try:
+            rows = query_all(f"SELECT * FROM {t}")
+        except Exception as e:
+            ws.append([f"ERROR: {e}"])
+            ws_meta.append([f"rows_{t}", 0])
+            continue
+        ws_meta.append([f"rows_{t}", len(rows)])
+        if not rows:
+            ws.append(["(empty table)"])
+            continue
+        headers = list(rows[0].keys())
+        ws.append(headers)
+        for c in ws[1]:
+            c.font = Font(bold=True)
+            c.fill = PatternFill("solid", fgColor="D0D0D0")
+        for r in rows:
+            vals = []
+            for h in headers:
+                v = r.get(h)
+                if isinstance(v, (dict, list)):
+                    v = json.dumps(v, ensure_ascii=False)
+                if isinstance(v, str) and len(v) > 32000:
+                    v = v[:32000] + "...(truncated)"
+                vals.append(v)
+            ws.append(vals)
+        for i, h in enumerate(headers, 1):
+            ws.column_dimensions[get_column_letter(i)].width = min(50, max(12, len(str(h)) + 4))
+
+    # Аналитика
+    _add_analytics_sheets(wb)
+
+    path = os.path.join(SCREENSHOT_DIR,
+                        f"full_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+    wb.save(path)
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=os.path.basename(path),
+    )
+
+
+@app.post("/api/full_import")
+async def full_import(
+    file: UploadFile = File(...),
+    mode: str = Form("merge"),
+    confirm: str = Form(""),
+    x_api_key: str = Header(default=""),
+):
+    """Импорт xlsx. mode=merge — добавить; mode=replace — очистить + залить."""
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Invalid API key")
+    if not HAS_XLSX:
+        raise HTTPException(503, "openpyxl не установлен на сервере")
+    if mode not in ("merge", "replace"):
+        raise HTTPException(400, "mode must be merge or replace")
+    if mode == "replace" and confirm != "REPLACE":
+        raise HTTPException(400, "Для replace требуется confirm=REPLACE")
+
+    content = await file.read()
+    if len(content) > 800 * 1024 * 1024:
+        raise HTTPException(400, "Файл слишком большой (>800 MB)")
+
+    tmp_path = os.path.join(SCREENSHOT_DIR, f"import_{int(time.time())}.xlsx")
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+        wb = load_workbook(tmp_path, read_only=True, data_only=True)
+    except Exception as e:
+        raise HTTPException(400, f"Не удалось открыть xlsx: {e}")
+
+    stats = {}
+    try:
+        # Replace: очистка
+        if mode == "replace":
+            for t in ALL_TABLES:
+                try:
+                    execute(f"DELETE FROM {t}")
+                except Exception:
+                    pass
+            print("[IMPORT] ✅ Все таблицы очищены")
+
+        # Импорт по листам
+        for sheet_name in wb.sheetnames:
+            if sheet_name.startswith("_") or sheet_name not in ALL_TABLES:
+                continue
+            ws = wb[sheet_name]
+            rows_iter = ws.iter_rows(values_only=True)
+            try:
+                headers = next(rows_iter)
+            except StopIteration:
+                stats[sheet_name] = {"inserted": 0, "skipped": 0, "note": "empty"}
+                continue
+            headers = [str(h) if h is not None else "" for h in headers]
+            if not headers or headers[0] in ("(empty table)", "(empty)"):
+                stats[sheet_name] = {"inserted": 0, "skipped": 0, "note": "empty"}
+                continue
+
+            cols_clean = [h for h in headers if h]
+            if not cols_clean:
+                continue
+            cols_str = ",".join(cols_clean)
+
+            if USE_POSTGRES:
+                ph_str = ",".join(["%s"] * len(cols_clean))
+                sql = f"INSERT INTO {sheet_name} ({cols_str}) VALUES ({ph_str}) ON CONFLICT DO NOTHING"
+            else:
+                ph_str = ",".join(["?"] * len(cols_clean))
+                sql = f"INSERT OR IGNORE INTO {sheet_name} ({cols_str}) VALUES ({ph_str})"
+
+            bool_cols_in_pg = {"is_top"} if USE_POSTGRES else set()
+            id_idx = cols_clean.index("id") if "id" in cols_clean else -1
+
+            inserted = 0
+            skipped = 0
+            conn = get_db()
+            try:
+                cur = conn.cursor()
+                for row in rows_iter:
+                    if row is None or all(v is None for v in row):
+                        continue
+                    try:
+                        vals = []
+                        for i, h in enumerate(headers):
+                            if not h:
+                                vals.append(None)
+                                continue
+                            v = row[i] if i < len(row) else None
+                            if isinstance(v, datetime):
+                                v = v.isoformat()
+                            elif hasattr(v, "isoformat") and not isinstance(v, (str, bytes)):
+                                try:
+                                    v = v.isoformat()
+                                except Exception:
+                                    pass
+                            if h in bool_cols_in_pg and v is not None and not isinstance(v, bool):
+                                try:
+                                    v = bool(int(v))
+                                except Exception:
+                                    v = bool(v)
+                            vals.append(v)
+                        # Пропускаем строки с NULL id (невалидны в PRIMARY KEY)
+                        if id_idx >= 0 and vals[id_idx] is None:
+                            skipped += 1
+                            continue
+                        cur.execute(sql, tuple(vals))
+                        inserted += 1
+                    except Exception:
+                        skipped += 1
+                conn.commit()
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                stats[sheet_name] = {"inserted": inserted, "skipped": skipped,
+                                     "error": str(e)[:200]}
+                continue
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+            stats[sheet_name] = {"inserted": inserted, "skipped": skipped}
+            print(f"[IMPORT] {sheet_name}: +{inserted} / skip {skipped}")
+
+        # Reset sequences (PG)
+        if USE_POSTGRES:
+            for t in SERIAL_TABLES:
+                try:
+                    execute(
+                        f"SELECT setval(pg_get_serial_sequence('{t}','id'), "
+                        f"COALESCE((SELECT MAX(id) FROM {t}), 1), "
+                        f"(SELECT MAX(id) IS NOT NULL FROM {t}))"
+                    )
+                except Exception:
+                    pass
+            print("[IMPORT] ✅ Sequences сброшены")
+
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+    return {"ok": True, "mode": mode, "stats": stats}
+
+
+@app.get("/api/db_info")
+async def api_db_info():
+    """Инфо о БД: размер, таблицы, процесс, диск, Render."""
+    info = {
+        "use_postgres": USE_POSTGRES,
+        "db_type": "PostgreSQL" if USE_POSTGRES else "SQLite",
+        "db_size_bytes": 0,
+        "db_size_human": "0 B",
+        "tables": [],
+        "process": {},
+        "disk": {},
+        "render": {
+            "service_name": SERVER_SERVICE_NAME,
+            "git_commit": SERVER_GIT_COMMIT,
+            "git_branch": SERVER_GIT_BRANCH,
+        },
+        "uptime_sec": int(time.time() - SERVER_START_TS),
+        "now_ts": time.time(),
+    }
+
+    # Размер БД
+    try:
+        if USE_POSTGRES:
+            r = query_one("SELECT pg_database_size(current_database()) AS s")
+            size = int(r["s"]) if r else 0
+        else:
+            size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+        info["db_size_bytes"] = size
+        info["db_size_human"] = _human_size(size)
+    except Exception as e:
+        info["db_size_error"] = str(e)[:120]
+
+    # Таблицы: row count + size
+    for t in ALL_TABLES:
+        entry = {"name": t, "rows": None, "size_bytes": None, "size_human": None}
+        try:
+            entry["rows"] = (query_one(f"SELECT COUNT(*) AS c FROM {t}") or {}).get("c", 0)
+        except Exception:
+            pass
+        if USE_POSTGRES:
+            try:
+                r = query_one("SELECT pg_total_relation_size(?) AS s", (t,))
+                if r and r.get("s") is not None:
+                    entry["size_bytes"] = int(r["s"])
+                    entry["size_human"] = _human_size(int(r["s"]))
+            except Exception:
+                pass
+        info["tables"].append(entry)
+
+    # Процесс
+    try:
+        import psutil
+        proc = psutil.Process()
+        m = proc.memory_info()
+        info["process"]["rss_bytes"] = m.rss
+        info["process"]["rss_human"] = _human_size(m.rss)
+        info["process"]["vms_bytes"] = m.vms
+        info["process"]["vms_human"] = _human_size(m.vms)
+        info["process"]["num_threads"] = proc.num_threads()
+        try:
+            info["process"]["cpu_percent"] = proc.cpu_percent(interval=0.1)
+        except Exception:
+            pass
+    except Exception:
+        # Fallback Linux /proc
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        kb = int(line.split()[1])
+                        info["process"]["rss_bytes"] = kb * 1024
+                        info["process"]["rss_human"] = _human_size(kb * 1024)
+                    elif line.startswith("Threads:"):
+                        info["process"]["num_threads"] = int(line.split()[1])
+        except Exception:
+            pass
+
+    # Диск
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage(os.path.dirname(os.path.abspath(__file__)))
+        info["disk"] = {
+            "total_bytes": total, "total_human": _human_size(total),
+            "used_bytes": used, "used_human": _human_size(used),
+            "free_bytes": free, "free_human": _human_size(free),
+            "used_pct": round(used / total * 100, 1) if total else 0,
+        }
+    except Exception:
+        pass
+
+    return info
+
+
 # ==================== API UI ====================
 @app.get("/api/rates")
 async def api_rates():
@@ -3097,16 +3567,50 @@ tr.bet-row.chat:hover td{background:rgba(197,138,249,.12)}
   
 </div>
   <div id="tab-calendar" style="display:none">
-    <div class="vault-card">
-      <h3>📅 Календарь</h3>
-      <div class="row-flex">
-        <input type="date" id="docxDate">
-        <button class="btn green" onclick="downloadDocx()">📄 Скачать docx</button>
-      </div>
-      <div class="calendar-grid" id="calGrid"></div>
+  <div class="vault-card">
+    <h3>📅 Календарь</h3>
+    <div class="row-flex">
+      <input type="date" id="docxDate">
+      <button class="btn green" onclick="downloadDocx()">📄 Скачать отчёт за день (.docx)</button>
     </div>
-    <div id="calDetail"></div>
+    <div class="calendar-grid" id="calGrid"></div>
   </div>
+
+  <!-- НОВОЕ: полный экспорт / импорт -->
+  <div class="vault-card">
+    <h3>📦 Полный экспорт / импорт БД</h3>
+    <p class="hint">
+      XLSX содержит <b>ВСЕ</b> таблицы: events, bets, intents, bulk_alerts, chat_players,
+      player_message_ticks, moderator_messages, moderators, promocodes, chat_tasks,
+      player_profiles, account_balances, vault_balances, vault_transactions, wager_state,
+      meta + аналитические листы для графиков. Связи через <code>id</code> сохраняются —
+      <b>ни одна запись не теряется</b>.
+    </p>
+    <div class="row-flex">
+      <a href="/api/full_export" class="btn green" style="text-decoration:none;display:inline-block">📥 Скачать всё (.xlsx)</a>
+    </div>
+
+    <hr style="border:none;border-top:1px solid #2a2f3a;margin:14px 0">
+    <h4 style="margin:0 0 8px;font-size:13px;color:#aab">📤 Импорт из xlsx (для переезда на новую БД)</h4>
+    <div class="row-flex">
+      <input type="file" id="importFile" accept=".xlsx">
+      <select id="importMode">
+        <option value="merge">➕ Добавить (merge)</option>
+        <option value="replace">🔄 Заменить всё (replace)</option>
+      </select>
+      <button class="btn blue" onclick="doImport()">📤 Импорт</button>
+      <span class="hint" id="importStatus"></span>
+    </div>
+    <p class="hint">
+      💡 <b>Переезд на новую БД:</b> скачай xlsx → создай новый Postgres на Render →
+      поменяй DATABASE_URL → импорт с «Заменить всё». Всё восстановится.
+      <br>♻️ <b>Бесконечный free-cycle:</b> каждые 90 дней (когда БД истекает) — повторяй
+      экспорт→новая БД→импорт. Потерь нет.
+    </p>
+  </div>
+
+  <div id="calDetail"></div>
+</div>
 
   <div id="tab-chart" style="display:none">
     <div class="row-flex">
@@ -3114,6 +3618,9 @@ tr.bet-row.chat:hover td{background:rgba(197,138,249,.12)}
       <select id="cChat"><option value="">Все чаты</option></select>
       <select id="cRange"><option value="">Всё время</option><option value="1">1 час</option><option value="24" selected>24 часа</option><option value="168">7 дней</option><option value="720">Месяц</option></select>
       <button class="btn" onclick="loadChart()">Обновить</button>
+      <button class="btn green" onclick="window.location.href='/api/full_export'">📦 Экспорт всех данных (.xlsx)</button>
+<button class="btn blue" onclick="exportChartImage('hourCount')">📸 «Кол-во»</button>
+<button class="btn blue" onclick="exportChartImage('hourSum')">📸 «Сумма»</button>
     </div>
     <div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:16px;margin-bottom:16px"><canvas id="hourCount" height="90"></canvas></div>
     <div style="background:#151821;border:1px solid #232a37;border-radius:8px;padding:16px"><canvas id="hourSum" height="90"></canvas></div>
@@ -3209,15 +3716,15 @@ tr.bet-row.chat:hover td{background:rgba(197,138,249,.12)}
     <div id="langGrid" class="lang-grid"></div></div>
 
   <div id="tab-db" style="display:none">
-    <div class="vault-card">
-      <h3>🚀 Деплой</h3>
-      <div id="dbDeploy">—</div>
-    </div>
-    <div class="vault-card">
-      <h3>🗄 База данных</h3>
-      <div id="dbStats">—</div>
-    </div>
+  <div class="vault-card">
+    <h3>🚀 Деплой / сервис</h3>
+    <div id="dbDeploy">—</div>
   </div>
+  <div class="vault-card">
+    <h3>📊 Размер БД и ресурсы</h3>
+    <div id="dbStats">—</div>
+  </div>
+</div>
 </main>
 
 <script>
@@ -3492,6 +3999,64 @@ async function loadIntentsStats(){
   }).join('') + '</div>';
 }
 
+async function doImport(){
+  const f = document.getElementById('importFile').files[0];
+  if (!f) { alert('Выбери .xlsx файл'); return; }
+  const mode = document.getElementById('importMode').value;
+  let apiKey = localStorage.getItem('apiKey') || '';
+  if (!apiKey) {
+    apiKey = prompt('X-API-Key (из env API_KEY на сервере):', 'CHANGE_ME_SECRET_KEY');
+    if (!apiKey) return;
+    localStorage.setItem('apiKey', apiKey);
+  }
+  if (mode === 'replace' && !confirm('⚠️ УДАЛИТЬ ВСЕ ДАННЫЕ и заменить содержимым файла?')) return;
+  if (!confirm('Импортировать "'+f.name+'" ('+mode+')? Может занять несколько минут.')) return;
+
+  const st = document.getElementById('importStatus');
+  st.textContent = '⏳ Загрузка... не закрывай вкладку';
+  const fd = new FormData();
+  fd.append('file', f);
+  fd.append('mode', mode);
+  fd.append('confirm', mode === 'replace' ? 'REPLACE' : '');
+
+  try {
+    const r = await fetch('/api/full_import', {method:'POST', body: fd,
+      headers:{'X-API-Key': apiKey}});
+    if (r.status === 401) {
+      localStorage.removeItem('apiKey');
+      st.textContent = '❌ Неверный API key';
+      alert('❌ Неверный X-API-Key. Введи заново при следующем импорте.');
+      return;
+    }
+    const d = await r.json();
+    if (d.ok) {
+      const lines = Object.entries(d.stats).map(([t,s])=>
+        t + ': +' + (s.inserted||0) + ' / skip ' + (s.skipped||0)
+        + (s.error ? ' ⚠ ' + s.error : '')
+      ).join('\n');
+      st.textContent = '✅ Импорт завершён';
+      alert('✅ Импорт завершён ('+mode+'):\n\n' + lines);
+      refreshStatus();
+      loadCalendar();
+    } else {
+      st.textContent = '❌ ' + (d.detail || 'ошибка');
+      alert('❌ ' + (d.detail || 'ошибка'));
+    }
+  } catch(e) {
+    st.textContent = '❌ ' + e.message;
+    alert('❌ Ошибка: ' + e.message);
+  }
+}
+
+function exportChartImage(canvasId){
+  const c = document.getElementById(canvasId);
+  if (!c) return;
+  const link = document.createElement('a');
+  link.download = canvasId + '_' + new Date().toISOString().slice(0,10) + '.png';
+  link.href = c.toDataURL('image/png');
+  link.click();
+}
+
 async function loadCalendar(){
   const r = await fetch('/api/days?days=60').then(r=>r.json());
   const grid = $('calGrid'); grid.innerHTML = '';
@@ -3518,6 +4083,7 @@ async function loadCalendar(){
   const docxInp = $('docxDate');
   if (docxInp && !docxInp.value) docxInp.value = new Date().toISOString().slice(0,10);
 }
+
 async function loadDayDetail(date){
   const el = $('calDetail');
   el.innerHTML = '<div class="vault-card">⏳ Загрузка...</div>';
@@ -3786,23 +4352,57 @@ async function loadMeBets(){
 
 async function loadDb(){
   try {
-    const [si, db] = await Promise.all([
+    const [si, info] = await Promise.all([
       fetch('/api/server_info').then(r=>r.json()),
-      fetch('/api/db_stats').then(r=>r.json()),
+      fetch('/api/db_info').then(r=>r.json()),
     ]);
     const started = new Date(si.started_at*1000);
     const upMin = Math.round(si.uptime_sec / 60);
     const ago = upMin < 60 ? upMin+'м' : Math.floor(upMin/60)+'ч '+(upMin%60)+'м';
-    $('dbDeploy').innerHTML = 'Старт: <b>'+started.toLocaleString('ru-RU')+'</b> ('+ago+' назад)<br>commit: <b>'+esc(si.git_commit)+'</b> · branch: '+esc(si.git_branch)+'<br>Сервис: '+esc(si.service_name);
-    const t = db.tables || {};
-    let html = '<table><thead><tr><th>Таблица</th><th>Строк</th></tr></thead><tbody>';
-    Object.keys(t).forEach(k => {
-      html += '<tr><td><b>'+esc(k)+'</b></td><td>' + (t[k] === null ? '—' : t[k]) + '</td></tr>';
+    document.getElementById('dbDeploy').innerHTML =
+      '<div class="kpi">'
+      + '<div>Старт<b style="font-size:13px">'+started.toLocaleString('ru-RU')+'</b><span class="hint">'+ago+' назад</span></div>'
+      + '<div>Commit<b style="font-size:13px">'+esc(si.git_commit)+'</b><span class="hint">'+esc(si.git_branch)+'</span></div>'
+      + '<div>Сервис<b style="font-size:13px">'+esc(si.service_name)+'</b></div>'
+      + '</div>';
+
+    const proc = info.process || {};
+    const disk = info.disk || {};
+    const rowsTotal = (info.tables||[]).reduce((s,t)=>s+(t.rows||0),0);
+    let html = '<div class="kpi">'
+      + '<div>Тип БД<b>'+esc(info.db_type||'—')+'</b></div>'
+      + '<div>Размер БД<b style="color:#8ab4f8">'+esc(info.db_size_human||'—')+'</b></div>'
+      + '<div>Всего строк<b>'+rowsTotal.toLocaleString('ru-RU')+'</b></div>'
+      + '<div>RSS процесса<b>'+esc(proc.rss_human||'—')+'</b><span class="hint">'+(proc.num_threads||0)+' потоков</span></div>';
+    if (disk.total_bytes) {
+      const pct = disk.used_pct || 0;
+      const color = pct > 90 ? '#e07a7a' : (pct > 70 ? '#e0c66a' : '#71d68a');
+      html += '<div>Диск<b style="color:'+color+'">'+pct+'%</b><span class="hint">'+disk.used_human+' / '+disk.total_human+'</span></div>';
+    }
+    html += '</div>';
+
+    html += '<h4 style="margin:14px 0 6px;color:#8ab4f8">Таблицы (сортировка по строкам)</h4>';
+    html += '<table><thead><tr><th>Таблица</th><th>Строк</th><th>Размер</th></tr></thead><tbody>';
+    (info.tables||[]).slice().sort((a,b)=>(b.rows||0)-(a.rows||0)).forEach(t=>{
+      html += '<tr><td><b>'+esc(t.name)+'</b></td>'
+        + '<td>'+(t.rows!=null?t.rows.toLocaleString('ru-RU'):'—')+'</td>'
+        + '<td>'+(t.size_human||'—')+'</td></tr>';
     });
     html += '</tbody></table>';
-    html += '<p style="margin-top:10px">Дождей: <b>'+db.rains+'</b> · Чаевых: <b>'+db.tips+'</b></p>';
-    $('dbStats').innerHTML = html;
-  } catch(e){ $('dbStats').innerHTML = '❌ '+e.message; }
+
+    html += '<div style="margin-top:16px;padding:12px 14px;background:#1a2332;border-left:3px solid #4a7ce0;border-radius:6px;font-size:12px;line-height:1.7">'
+      + '<b style="color:#7cc4ff">📊 Render free tier — что важно знать:</b><br>'
+      + '• Free PostgreSQL <b>истекает через 90 дней</b> с момента создания.<br>'
+      + '• <b>Не теряй данные</b>: до истечения — вкладка Календарь → «📥 Скачать всё (.xlsx)».<br>'
+      + '• После создания новой БД → «📤 Импорт» → режим <b>replace</b>. Всё восстановится 1:1.<br>'
+      + '• <b>Бесконечный цикл</b>: экспорт → новая БД → импорт каждые 90 дней. Данные не теряются.<br>'
+      + '• Free web-сервис засыпает через 15 мин простоя — просыпается за ~30 сек при запросе.'
+      + '</div>';
+
+    document.getElementById('dbStats').innerHTML = html;
+  } catch(e){
+    document.getElementById('dbStats').innerHTML = '❌ '+e.message;
+  }
 }
 
 let _lastNgrok = '';
