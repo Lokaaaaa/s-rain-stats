@@ -334,7 +334,13 @@ def get_db():
         if "sslmode" not in url:
             sep = "&" if "?" in url else "?"
             url += f"{sep}sslmode=require"
-        return psycopg2.connect(url)
+        # Жёсткие таймауты: коннект 10с, statement 120с
+        conn = psycopg2.connect(
+            url,
+            connect_timeout=10,
+            options="-c statement_timeout=120000",  # 120 сек максимум на запрос
+        )
+        return conn
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -2316,6 +2322,22 @@ def _build_export_worker(job_id):
         if now - last[0] > 4:
             last[0] = now
             _tg_notify(msg)
+    
+    # heartbeat каждые 15 сек — видно, жив ли поток
+    import threading as _th
+    _stop_hb = _th.Event()
+
+    def _heartbeat():
+        while not _stop_hb.is_set():
+            try:
+                import psutil
+                rss = round(psutil.Process().memory_info().rss / 1024 / 1024, 1)
+                _tg_notify(f"💓 Экспорт жив · RAM {rss} MB")
+            except Exception:
+                _tg_notify("💓 Экспорт жив")
+            _stop_hb.wait(15)
+
+    _th.Thread(target=_heartbeat, daemon=True).start()
 
     try:
         _set_job(job_id, status="building", progress=2, message="Подготовка...")
@@ -2405,6 +2427,8 @@ def _build_export_worker(job_id):
     except Exception as e:
         _set_job(job_id, status="error", error=str(e)[:200])
         _tg_notify(f"❌ *Экспорт упал*: `{str(e)[:120]}`")
+    finally:
+        _stop_hb.set()
 
 
 @app.post("/api/full_export/start")
@@ -3386,6 +3410,44 @@ async def api_bets_top_senders(last_hours: Optional[int] = None):
                         FROM bets WHERE ts>=? GROUP BY sender
                         ORDER BY total_usd DESC LIMIT 30""", (since,))
     return {"senders": rows, "cleared_at": cleared, "since": since}
+
+
+@app.get("/api/debug/export_probe")
+def debug_export_probe():
+    """Быстро проверяет каждую таблицу: count + время select + снимает RAM."""
+    import psutil
+    out = {"tables": [], "process": {}}
+    proc = psutil.Process()
+
+    for t in ALL_TABLES:
+        entry = {"table": t}
+        t0 = time.time()
+        try:
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute(f"SELECT COUNT(*) FROM {t}")
+            count = cur.fetchone()[0]
+            t_count = time.time() - t0
+
+            t0 = time.time()
+            cur.execute(f"SELECT * FROM {t} LIMIT 1")
+            _ = cur.fetchall()
+            t_probe = time.time() - t0
+
+            entry["count"] = count
+            entry["count_time_ms"] = int(t_count * 1000)
+            entry["probe_time_ms"] = int(t_probe * 1000)
+            entry["rss_after_mb"] = round(proc.memory_info().rss / 1024 / 1024, 1)
+            cur.close()
+            conn.close()
+        except Exception as e:
+            entry["error"] = f"{type(e).__name__}: {e}"
+            entry["rss_after_mb"] = round(proc.memory_info().rss / 1024 / 1024, 1)
+        out["tables"].append(entry)
+
+    out["process"]["rss_mb"] = round(proc.memory_info().rss / 1024 / 1024, 1)
+    out["process"]["limit_mb"] = 512
+    return out
 
 
 @app.get("/api/health")
