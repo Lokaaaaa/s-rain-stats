@@ -3482,6 +3482,20 @@ def fmt_rub(x):
         return "0 ₽"
 
 
+from fastapi import Response
+
+# Render health check — HEAD / должен отвечать 200 БЕЗ обращения к БД
+@app.head("/")
+def head_root():
+    return Response(status_code=200)
+
+
+# Render health check для /api/health
+@app.head("/api/health")
+def head_health():
+    return Response(status_code=200)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def page_home():
     t = (query_one("SELECT COUNT(*) AS c FROM events WHERE type='rain'") or {}).get("c", 0)
