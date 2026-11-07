@@ -950,12 +950,13 @@ async def add_event(event: EventIn, x_api_key: str = Header(default="")):
         raise HTTPException(400, "type must be rain or tip")
     ts_val = event.ts if event.ts else time.time()
     created = event.created_at or datetime.fromtimestamp(ts_val, tz=timezone.utc).isoformat()
+    # Убрали проверку на amount_text и увеличили окно до 30 минут (1800 секунд)
     dup = query_one("""SELECT id FROM events
-                       WHERE type=? AND chat=? AND sender=? AND receivers=? AND amount_text=?
-                       AND ts IS NOT NULL AND ABS(ts-?)<30 LIMIT 1""",
+                       WHERE type=? AND chat=? AND sender=? AND receivers=?
+                       AND ts IS NOT NULL AND ABS(ts-?)<1800 LIMIT 1""",
                     (event.type, event.chat, event.sender,
                      json.dumps(event.receivers or [], ensure_ascii=False),
-                     event.amount_text, ts_val))
+                     ts_val))
     if dup:
         return {"ok": True, "dup": True}
     if event.type == "rain" and event.receivers_info:
@@ -992,6 +993,18 @@ async def events_batch(payload: dict, x_api_key: str = Header(default="")):
     inserted = 0
     for e in events:
         try:
+            # --- ЗАЩИТА ОТ ДУБЛЕЙ НА СЕРВЕРЕ ---
+            ts_val = float(e.get("ts", time.time()))
+            dup = query_one("""SELECT id FROM events
+                               WHERE type=? AND chat=? AND sender=? AND receivers=?
+                               AND ts IS NOT NULL AND ABS(ts-?)<1800 LIMIT 1""",
+                            (e.get("type"), e.get("chat"), e.get("sender"),
+                             json.dumps(e.get("receivers", []), ensure_ascii=False),
+                             ts_val))
+            if dup:
+                continue # Пропускаем дубль, идем к следующему событию
+            # -----------------------------------
+
             if e.get("type") == "rain" and e.get("receivers_info"):
                 _enrich_receivers_info_from_db(e.get("chat"), e.get("receivers_info"),
                                    event_ts=float(e.get("ts", time.time())))
